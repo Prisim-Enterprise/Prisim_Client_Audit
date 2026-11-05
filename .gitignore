@@ -9,3 +9,6 @@ build/
 *.log
 .DS_Store
 .vscode/
+
+# Database dumps (contain client data)
+backups/
