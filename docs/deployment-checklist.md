@@ -126,13 +126,19 @@ on, which does not exist until the frontend is built.
 A platform admin has **no** admin privileges until they hold an `aal2`
 session, meaning they signed in with password **and** a verified TOTP code. The
 frontend MFA screen doesn't exist yet, and the Dashboard can't enroll a factor
-on a user's behalf. The first admin therefore needs the temporary enrollment
-utility described in [Appendix A](#appendix-a-proposed-temporary-mfa-bootstrap-utility).
+on a user's behalf.
 
-**Status: proposed, not implemented.** Until it exists and is approved, Phase
-F3 (bootstrap and verify the first admin) cannot be completed. Deploying 0002
-does not depend on it: tables, RLS and `service_role` work without a platform
-admin.
+The temporary utility in [Appendix A](#appendix-a-temporary-mfa-bootstrap-utility)
+is **hard-limited to the local stack**. It rehearses and proves the enrollment
+flow locally, but it cannot reach the hosted project. Enrolling the first
+**hosted** admin therefore needs one of:
+- the frontend MFA enrollment and step-up screen, or
+- a separately reviewed and approved hosted-capable version of the tool (a
+  code change, not a flag).
+
+Until one exists, Phase F3 (bootstrap and verify the first admin) cannot be
+completed. Deploying 0002 does not depend on it: tables, RLS and
+`service_role` work without a platform admin.
 
 ## Phase D: Read-only checks on hosted 🔍
 
@@ -415,7 +421,8 @@ If any row is `f`, do not continue. Recover with a forward fix
 
 ### F3. Bootstrap and verify the first platform admin ⚠️
 
-Requires C1, plus TOTP enrollment by that staff member (C2 / Appendix A).
+Requires C1, plus TOTP enrollment by that staff member through a hosted-capable
+path (C2). The Appendix A utility is local-only and cannot be used here.
 
 ```sql
 INSERT INTO public.platform_admins (user_id, note)
@@ -425,7 +432,8 @@ WHERE email = 'admin@your-domain.example';
 -- expect: INSERT 0 1 (0 means the e-mail did not match; do not retry blindly)
 ```
 
-Then the staff member checks their own access (Appendix A, `verify` mode):
+Then the staff member checks their own access, with the same checks as the
+local utility's `verify` mode (Appendix A):
 - signed in with a password only: `get_my_context()` returns
   `is_platform_admin: false`, `platform_admin_mfa_required: true`
 - after entering a TOTP code (`aal2`): `is_platform_admin: true`
@@ -578,9 +586,40 @@ previously in `security.md`.
 
 ---
 
-## Appendix A: Proposed temporary MFA bootstrap utility
+## Appendix A: Temporary MFA bootstrap utility
 
-**Status: design only. Not implemented, not approved for hosted use.**
+**Status: implemented in `scripts/mfa-enroll.mjs`, LOCAL STACK ONLY. Tested
+automatically by `npm run test:mfa` (part of `npm run db:test`). It cannot
+be used against the hosted project.**
+
+```bash
+node scripts/mfa-enroll.mjs enroll --local
+node scripts/mfa-enroll.mjs verify --local
+```
+
+Hard limits. No flag, prompt or environment variable changes them:
+- Only `http://127.0.0.1` or `http://localhost` (any port) is accepted, and
+  every request is sent to `127.0.0.1`, so `localhost` is never looked up in
+  DNS or the hosts file. Every other URL is refused before anything is sent or
+  the password is asked for.
+- `--local` must be given explicitly; without it the script exits.
+- `npm run check:secrets` fails if the script contains a hosted Supabase
+  domain or any other non-local URL.
+
+The implementation also:
+- refuses to run unless both input and output are an interactive terminal, so
+  a password can't be piped in and the TOTP secret can't be redirected to a file
+- refuses HTTP redirects, so credentials are never forwarded
+- never deletes a verified factor: before cleanup it re-reads the factor's
+  status, and a factor the server has verified is always kept
+- stops at the next request on Ctrl+C, then still cleans up and signs out
+- signs out only this session (`scope=local`), not the user's other sessions
+- shows server-supplied factor names as plain text (no terminal control codes)
+- exits with 0 (success), 1 (failed), 2 (usage or refused input), 3 (`verify`:
+  aal2 reached but not a platform admin) or 130 (interrupted)
+
+Making it hosted-capable later is a code change that needs its own security
+review and approval. It is not a configuration switch.
 
 ### Problem
 
@@ -594,7 +633,7 @@ user.
 A single Node script, `scripts/mfa-enroll.mjs`. It uses **only Node 22
 built-ins** (`fetch`, `readline`) and adds no dependencies. It is run by the
 staff member themselves, on their own trusted machine, and calls the standard
-Supabase Auth endpoints as that user. The same flow is already proven locally
+Supabase Auth endpoints of the **local** stack as that user. The same flow is already proven locally
 by `scripts/auth-api.test.mjs`, which enrolls TOTP and reaches `aal2` against
 the local stack.
 
@@ -602,7 +641,7 @@ the local stack.
 
 | Input | How it is obtained | Stored? |
 |---|---|---|
-| Project URL (public) | Prompt (shown) | No |
+| Local API URL (`http://127.0.0.1:54321`) | Prompt (shown) | No |
 | Publishable / anon key (public) | Prompt (shown) | No |
 | Staff e-mail | Prompt (shown) | No |
 | Staff password | Prompt, **hidden input** | No; held in memory for one request |
@@ -613,7 +652,7 @@ the local stack.
 - No command-line arguments or environment variables for credentials, so they
   never reach shell history.
 - Nothing is written to disk: no logs, no token files, no QR image files.
-- It requires `https://` for anything that isn't `127.0.0.1`/`localhost`.
+- It accepts only `127.0.0.1` / `localhost`. Every other host is refused.
 - It never computes TOTP codes itself. The secret is shown once for the
   authenticator app and then discarded. The test script computes codes only
   because it runs against throwaway local users.
@@ -643,32 +682,136 @@ the local stack.
 8. Cleanup: `POST /auth/v1/logout` revokes the session and refresh token, and
    in-memory values are cleared.
 
-### `verify` mode (used in F3)
+### `verify` mode
 
 Sign in (`aal1`), then print `get_my_context` and expect
 `platform_admin_mfa_required: true` for a listed admin. Challenge and verify
 with a fresh code from the app, print `get_my_context` again and expect
-`is_platform_admin: true`, then log out. This is the evidence for F3.
+`is_platform_admin: true`, then log out. On hosted, F3 requires the same
+three observations from whichever hosted-capable path is used.
 
 ### Lost device / backup factor
 
-Supabase TOTP has no recovery codes. While still `aal2`, the utility may
-enroll a **second** TOTP factor on another device (Supabase limits the number of
+Supabase TOTP has no recovery codes. A **second** TOTP factor on another
+device (not implemented in this utility: `enroll` stops if a verified factor
+exists) can be enrolled from an `aal2` session (Supabase limits the number of
 factors per user; the local default is 10). Once a user has a verified factor,
 Supabase Auth requires an `aal2` session to enroll another.
 If every factor is lost, the project owner removes that user's factors
 (Dashboard user actions, or a reviewed hosted SQL write on `auth.mfa_factors`)
 and the user enrolls again. That counts as a hosted write and needs approval.
 
-### Verification before any hosted use
+### Manual test in a real terminal 🖥️
 
-1. Implement it, review it, and add it to `npm run check:secrets` coverage
-   (it must contain no keys).
-2. Rehearse locally: create a user in local Studio, run `enroll` and `verify`
-   against `http://127.0.0.1:54321`, and insert that user into the local
-   `platform_admins`. Expect the same results as `scripts/auth-api.test.mjs`.
-3. Get approval for hosted use. It is a hosted write to that user's own
-   `auth.mfa_factors`, made through the Auth API with their own credentials.
+The automated tests drive the real terminal code through a simulated terminal
+(`npm run test:mfa`). This manual run checks the parts only a real console
+and a real authenticator app can show. Everything is local.
+
+Use PowerShell, Windows Terminal or the VS Code terminal. Git Bash (mintty) is
+not a real terminal for Node: the script refuses to run there. Use
+`winpty node …` if you must use it.
+
+The prompts read raw keystrokes: Enter submits, Backspace deletes, arrow keys
+are ignored, Ctrl+C cancels.
+
+**Terminal check after every run:** type `echo ok` and press Enter. The
+characters must appear as you type and `ok` must print. If typing is
+invisible, the terminal was left in raw mode: record it as a failure, then
+close the tab (or run `stty sane` in a Unix shell).
+
+**Setup**
+0. `node --version` must print `v22.x`.
+1. `npm run db:start`, then `npx supabase status`. Note the **API URL**
+   (`http://127.0.0.1:54321`) and the **Publishable** key.
+2. Local Studio (`http://127.0.0.1:54323`) → Authentication → Users → Add user
+   → Create new user: `mfa-manual@example.com`, a password, **Auto confirm**.
+3. Keep this query open in the local Studio SQL editor; it is used to check
+   each step:
+   ```sql
+   SELECT
+     (SELECT string_agg(f.status::text, ',') FROM auth.mfa_factors f WHERE f.user_id = u.id) AS factors,
+     (SELECT count(*) FROM auth.sessions s WHERE s.user_id = u.id) AS sessions,
+     EXISTS (SELECT 1 FROM public.platform_admins p WHERE p.user_id = u.id) AS platform_admin
+   FROM auth.users u WHERE u.email = 'mfa-manual@example.com';
+   ```
+   Expected now: `factors` empty, `sessions` 0, `platform_admin` false.
+
+Exit codes: PowerShell `$LASTEXITCODE`, bash `echo $?`.
+
+**Refusals** (nothing is sent; no password prompt appears)
+
+| # | Do | Expect |
+|---|---|---|
+| 1 | `node scripts/mfa-enroll.mjs enroll` | "--local is required", exit 2 |
+| 2 | `node scripts/mfa-enroll.mjs enroll --local --password abc123` | "Unexpected argument #3 (value not shown)", exit 2; `abc123` not printed |
+| 3 | `echo x \| node scripts/mfa-enroll.mjs enroll --local` | "run this in an interactive terminal", exit 2 |
+| 4 | `enroll --local`, URL `https://example.com` | "only the local stack … Nothing was sent", exit 2, no further prompts |
+| 5 | `enroll --local`, correct URL, key `sb_secret_x` (made up) | "Refused: that is a secret key", exit 2, no e-mail or password prompt |
+
+**Hidden password and wrong codes → cleanup**
+
+**Ctrl+C at the password prompt**
+
+5a. `node scripts/mfa-enroll.mjs enroll --local`. Enter the URL, key and
+    e-mail. At "Your password (hidden):" type a few characters (nothing
+    appears), then press **Ctrl+C**. Expect "Interrupted.", exit 130, and no
+    "Signed in" line, because nothing was sent. Do the terminal check.
+
+6. `node scripts/mfa-enroll.mjs enroll --local`. Enter the URL, the publishable
+   key and the e-mail. The URL, key and e-mail are visible as you type. At
+   "Your password (hidden):", type the password with one deliberate typo
+   corrected by Backspace: **no characters or asterisks appear**, and the
+   cursor does not move. Press Enter.
+7. Expect "Signed in (aal1)", then the one-time block with the `otpauth://` URI
+   and the Secret. Do not add it to the app this time.
+8. Enter `12345`: "That is not a 6-digit code." Then enter `000000` twice.
+   Expect "Verification failed after 3 attempts", "Removed the unverified
+   factor.", "Signed out.", exit 1. Query: `factors` empty, `sessions` 0.
+   The digits you typed are visible. Do the terminal check.
+
+**Ctrl+C → cleanup**
+
+9. Run `enroll --local` again up to the code prompt, type `12`, then press
+   **Ctrl+C**. Expect "Interrupted.", "Removed the unverified factor.",
+   "Signed out.", exit 130. Query: `factors` empty, `sessions` 0. Do the
+   terminal check.
+
+**Successful enrollment and aal2**
+
+10. Run `enroll --local` again. In the authenticator app choose "enter a setup
+    key": account `PRISIM local test`, key = the **Secret** shown, time-based.
+    Check that the secret appears exactly once in the output.
+11. Enter the current 6-digit code. Expect "Authenticator verified. Session is
+    aal2." (the script checked the token's `aal` claim), then
+    `get_my_context: is_platform_admin=false, platform_admin_mfa_required=false`,
+    "Signed out.", exit 0. Query: `factors` = `verified`, `sessions` 0.
+    Do the terminal check.
+12. Run `enroll --local` once more: "already enrolled … Use verify mode", exit 1.
+    No secret is shown. Query: still one `verified` factor.
+
+**Verify mode**
+
+13. `node scripts/mfa-enroll.mjs verify --local`, valid code. Expect
+    "Platform-admin MFA check: FAIL" (not an admin yet), exit 3.
+14. In the local Studio SQL editor:
+    `INSERT INTO public.platform_admins (user_id, note) SELECT id, 'manual MFA test' FROM auth.users WHERE email = 'mfa-manual@example.com';`
+15. `verify --local` again, with a code from a **new** 30-second window. Expect
+    `aal1 … is_platform_admin=false, platform_admin_mfa_required=true`, then
+    `aal2 … is_platform_admin=true`, "Platform-admin MFA check: PASS", exit 0.
+16. `verify --local` with `111111` three times: "Verification failed after 3
+    attempts", exit 1. Query: the factor is **still `verified`** (verify mode
+    never deletes factors), `sessions` 0.
+
+**Finish**
+
+17. Clear the terminal and its scrollback (Windows Terminal: Ctrl+Shift+K or
+    "Clear buffer"; VS Code: "Terminal: Clear"). Delete the
+    `PRISIM local test` entry from the authenticator app.
+18. Delete the local user in Studio (Users → Delete user), which also removes
+    its factors and the `platform_admins` row, or run `npm run db:reset`.
+
+Record the results. The tool is then complete for local use. It still cannot
+enroll the first hosted admin (see C2).
 
 ### Removal
 
