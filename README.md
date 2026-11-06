@@ -8,9 +8,11 @@ reports.
 - **Client users** belong to one or more tenants and only ever see their own
   tenant's data, with permissions set by their tenant role.
 
-> **Status:** foundation stage. The database schema exists; the hardening
-> migration `20261105120000_security_hardening.sql` is **proposed, pending
-> approval**. The frontend and Edge Functions are not built yet.
+> **Status:** foundation stage. The hardening migration
+> `20261105120000_security_hardening.sql` is approved and committed but **not
+> yet applied** to the hosted project (see
+> [docs/deployment-checklist.md](docs/deployment-checklist.md)). The frontend
+> and Edge Functions are not built yet.
 
 ## Stack
 
@@ -33,6 +35,8 @@ for the limits that implies.
 ├── docs/
 │   ├── architecture.md       System design, request flows, roles
 │   ├── database-schema.md    Tables, relationships, RLS matrix
+│   ├── deployment-checklist.md  Authoritative hosted deployment and go-live procedure
+│   ├── edge-function-contract.md  Mandatory rules for Edge Functions
 │   └── security.md           Threat model, secrets, operational rules
 ├── frontend/                 React app (not yet scaffolded)
 │   └── .env.example          Public frontend environment variables
@@ -56,7 +60,7 @@ for the limits that implies.
 npm install                 # installs the Supabase CLI locally
 npm run db:start            # starts local Supabase in Docker (first run downloads images)
 npm run db:reset            # rebuilds the local DB from migrations + seed.sql
-npm run db:test             # runs pgTAP tests in supabase/tests/database
+npm run db:test             # secret scan + pgTAP tests + Auth API test (local only)
 npm run db:lint             # static checks on database functions
 npm run db:stop             # stops local Supabase
 ```
@@ -83,8 +87,8 @@ environment variables are listed in [frontend/.env.example](frontend/.env.exampl
 2. Add a new file `supabase/migrations/<YYYYMMDDHHMMSS>_<name>.sql`.
 3. Validate locally: `npm run db:reset && npm run db:test`.
 4. Get the change reviewed and approved.
-5. A maintainer applies it to the hosted project. See
-   [docs/security.md](docs/security.md#applying-migrations-to-production).
+5. A maintainer applies it to the hosted project by following
+   [docs/deployment-checklist.md](docs/deployment-checklist.md).
 
 The npm scripts never touch the hosted database. There is intentionally no
 `db push` script.

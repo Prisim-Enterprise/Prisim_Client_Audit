@@ -6,9 +6,9 @@ explains the schema; if it disagrees with the migrations, the migrations win.
 | Migration | Status | Purpose |
 |---|---|---|
 | `202611050001_initial_schema.sql` | **Applied to hosted. Frozen.** | Core tables, indexes, `is_tenant_member`, read-only RLS |
-| `20261105120000_security_hardening.sql` | **Proposed, pending approval** | Roles, platform admins, Vault tokens, invitations, storage, integrity, explicit grants |
+| `20261105120000_security_hardening.sql` | **Approved and committed. Not yet applied to hosted.** Apply only via [deployment-checklist.md](deployment-checklist.md). | Roles, platform admins, Vault tokens, invitations, storage, integrity, explicit grants |
 
-Items marked *(0002)* below are introduced by the proposed hardening migration.
+Items marked *(0002)* below are introduced by the hardening migration.
 
 ## Schemas
 

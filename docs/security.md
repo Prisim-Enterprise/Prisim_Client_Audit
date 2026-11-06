@@ -85,11 +85,17 @@ which can reveal the key, to a minimum.
 ## Authentication settings
 
 `supabase/config.toml` configures **only the local stack**. The required
-hosted Auth, Storage and API settings, a read-only data pre-flight, and the
-pre- and post-push checks are in
-[deployment-checklist.md](deployment-checklist.md). MFA (TOTP) must be
-enabled on the hosted project: platform-admin privileges require it, and the
-database enforces this.
+hosted Auth, Storage and API settings are in
+[deployment-checklist.md](deployment-checklist.md), Phase B. Key points:
+
+- Public sign-up is off. Staff accounts are created by the project owner
+  (checklist C1); clients join only through invitations.
+- "Confirm email" must be on. Invitations are bound to a **confirmed** e-mail
+  address (checklist P2 covers existing unconfirmed users).
+- MFA (TOTP) must be enabled. Platform-admin privileges require an `aal2`
+  session, and the database enforces this.
+- Leaked-password protection is **plan-dependent**. Enable it if the plan
+  offers it; otherwise record that it isn't available. Never assume it is on.
 
 ## Frontend notes
 
@@ -100,66 +106,26 @@ database enforces this.
   `platform_admin_mfa_required: true`, prompt for the TOTP code
   (`supabase.auth.mfa.challengeAndVerify`) before showing admin screens.
 
-## Bootstrapping the first platform administrator
+## Platform administrators
 
-After migration 0002 is applied, a project owner runs this once in the
-Dashboard SQL editor (replace the e-mail):
+Rows in `public.platform_admins` are managed only through SQL by a project
+owner. Staff need TOTP before the grant has any effect. The bootstrap SQL,
+the TOTP requirement and the verification steps are in
+[deployment-checklist.md](deployment-checklist.md), F3 and Appendix A. Grants
+and removals are recorded in `audit_logs`.
 
-```sql
-INSERT INTO public.platform_admins (user_id, note)
-SELECT id, 'Initial PRISIM administrator'
-FROM auth.users
-WHERE email = 'admin@your-domain.example';
-```
+## Deploying migrations and going live
 
-Remove an administrator with
-`DELETE FROM public.platform_admins WHERE user_id = '<uuid>';`. Both actions
-are recorded in `audit_logs`. The new admin has no admin privileges until they
-have enrolled TOTP and signed in with it.
+[deployment-checklist.md](deployment-checklist.md) is the single,
+authoritative procedure. It covers:
+- local validation
+- the read-only hosted pre-flights
+- backup, with its known gaps, and a restore rehearsal
+- the deploy command
+- post-deploy security verification
+- recovery: forward-fix migrations, and the limits of restores
+- the pre-go-live checklist
 
-## Applying migrations to production
-
-Only a maintainer applies migrations, and only after review and approval.
-
-```bash
-# 1. Validate locally (requires Docker Desktop)
-npm run db:start
-npm run db:reset          # applies all migrations + seed to the LOCAL database
-npm run db:test           # all pgTAP tests + the Auth API integration test must pass
-npm run db:lint
-
-# Supabase CLI v3 targets the LOCAL database unless --remote is passed.
-# Every command below that touches the hosted project says --remote explicitly.
-
-# 2. Inspect the hosted project (read-only)
-npx supabase migration list --remote     # remote should list only 202611050001 as applied
-npx supabase db push --remote --dry-run  # must list only the new migration(s)
-
-# 3. Back up the hosted schema and data (free plan has no managed backups)
-npx supabase db dump --remote -f backups/schema.sql
-npx supabase db dump --remote --data-only -f backups/data.sql
-#    keep backups/ out of git; it contains client data
-
-# 4. Apply
-npx supabase db push --remote
-
-# 5. Verify
-npx supabase migration list --remote
-npx supabase db lint --remote
-#    Dashboard -> Advisors -> Security and Performance: resolve new warnings
-```
-
-Never use `--include-seed` with `db push`, never run `supabase db reset --remote`
-(it wipes the hosted database), and never paste `seed.sql` into the hosted SQL
-editor.
-
-## Pre-go-live checklist
-
-- [ ] Migration 0002 applied; all pgTAP tests pass locally
-- [ ] Dashboard Auth settings match the table above
-- [ ] First platform admin bootstrapped; MFA enrolled
-- [ ] Security Advisor shows no errors
-- [ ] Edge Function secrets set; none present in the frontend bundle
-      (search the built `dist/` for `service_role` and `sb_secret_`)
-- [ ] Production SMTP configured
-- [ ] Cloudflare Pages env vars contain only `VITE_*` public values
+Its "Hard rules" list the commands that must never be run against the hosted
+project, including `db reset --remote`, `migration repair`,
+`test db --remote` and `--include-seed`.

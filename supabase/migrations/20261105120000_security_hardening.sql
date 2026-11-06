@@ -4,9 +4,9 @@
 -- PostgreSQL 17 / Supabase
 -- =====================================================
 --
--- STATUS: PROPOSED - pending approval. Do not apply to the hosted project
--- until it has been reviewed and validated locally with:
---     npx supabase db reset && npx supabase test db
+-- STATUS: Approved. Apply to the hosted project only by following
+-- docs/deployment-checklist.md (local validation: npm run db:test).
+-- Once applied to hosted, never edit this file; correct it with a new migration.
 --
 -- Builds on 202611050001_initial_schema.sql (already applied; never edit it).
 -- Hosted prerequisites and Edge Function rules: docs/deployment-checklist.md
