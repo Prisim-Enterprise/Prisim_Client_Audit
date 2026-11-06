@@ -7,8 +7,11 @@
     "db:stop": "supabase stop",
     "db:status": "supabase status",
     "db:reset": "supabase db reset",
-    "db:test": "supabase test db",
-    "db:lint": "supabase db lint"
+    "db:test": "node scripts/check-secrets.mjs && supabase test db && node scripts/auth-api.test.mjs",
+    "db:test:sql": "supabase test db",
+    "db:test:auth": "node scripts/auth-api.test.mjs",
+    "db:lint": "supabase db lint",
+    "check:secrets": "node scripts/check-secrets.mjs"
   },
   "devDependencies": {
     "supabase": "^3.0.0"

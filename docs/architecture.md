@@ -60,17 +60,28 @@ Tenant role hierarchy (`private.tenant_role_rank`):
 | viewer | 10 | Read dashboards, audit scores, reports. |
 | client | 10 | Same as viewer (default role). |
 
-Tenant users have no direct write access in the database apart from their own
-profile name and avatar. Tenant-scoped changes, such as inviting or removing
-members or connecting ad accounts, go through Edge Functions. Those functions
-check the caller's role server-side and then write with `service_role`. Writes
-are kept in functions because rules like "an admin cannot promote someone to
-owner" or "never remove the last owner" are much easier to get right in code
-than in RLS.
+Tenant users have no direct table write access in the database apart from
+their own profile name and avatar. Member management (invite, resend, revoke,
+change role, deactivate) goes through SQL RPCs: `create_invitation`,
+`revoke_invitation`, `change_member_role` and `deactivate_member`. These are
+called with the **user's own JWT**, either from the browser or from an Edge
+Function that forwards the user's `Authorization` header. The RPCs enforce
+rules like "an admin cannot promote someone to owner" and "never remove the
+last owner" in SQL, and the audit trail records the real actor.
+
+`service_role` is reserved for work no user can do directly: Vault token
+RPCs, creating OAuth connections, starting syncs, scheduled jobs and
+invitation expiry. When that work is done for a user, the user first calls
+`begin_privileged_action` with their own JWT, and the service-role RPC must
+present the returned action id. The audit log then records the initiating
+user (`user_id`) and `actor_role = service_role`. Background work is recorded
+as `service_role` only. Rules for server code are in
+[edge-function-contract.md](edge-function-contract.md).
 
 Platform admins can write business tables directly through the Data API, and
-RLS checks `private.is_platform_admin()`. Hard deletes of tenants and changes
-to `platform_admins` are not possible through the API.
+RLS checks `private.is_platform_admin()`, which requires an MFA-verified
+(`aal2`) session. Hard deletes of tenants and changes to `platform_admins` are
+not possible through the API.
 
 ## Key request flows
 

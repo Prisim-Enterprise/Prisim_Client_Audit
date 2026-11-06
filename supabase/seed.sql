@@ -74,6 +74,8 @@ INSERT INTO public.audit_scores (tenant_id, audit_date, platform, score, finding
 --   -- 20261105120000 hardening migration):
 --   INSERT INTO public.platform_admins (user_id)
 --   SELECT id FROM auth.users WHERE email = 'staff@prisim.local';
+--   -- Admin privileges need an aal2 session: enroll TOTP for that user and
+--   -- sign in with it (local Studio users have no MFA by default).
 --
 --   -- Give a client user access to Acme Dental:
 --   INSERT INTO public.tenant_memberships (tenant_id, user_id, role, status)
