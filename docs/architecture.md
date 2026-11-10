@@ -42,6 +42,24 @@ Decisions:
   with the user's JWT, and RLS decides what is visible. Frontend route guards
   are only for user experience.
 
+## Development and operations
+
+The hosted Supabase project is the normal backend for development and
+production. Routine frontend development runs Vite locally and connects to
+that hosted project with `VITE_SUPABASE_URL` and the public
+`VITE_SUPABASE_PUBLISHABLE_KEY`; `VITE_APP_URL` and `VITE_APP_ENV` describe the
+frontend origin/environment. The URL and key are public browser configuration,
+not secrets. Never put a service-role key, database password or provider
+secret in a `VITE_*` variable.
+
+Docker and the local Supabase stack are not part of routine frontend
+development. They remain optional tools for isolated database/migration
+validation; database tests and local reset scripts target only that stack.
+Database changes must be delivered as reviewed, ordered migrations. Applying
+migrations, changing hosted settings, or performing any other production
+operation requires explicit authorization and follows
+[deployment-checklist.md](deployment-checklist.md).
+
 ## Tenancy and roles
 
 | Concept | Where | Notes |
@@ -61,21 +79,21 @@ Tenant role hierarchy (`private.tenant_role_rank`):
 | client | 10 | Same as viewer (default role). |
 
 Tenant users have no direct table write access in the database apart from
-their own profile name and avatar. Member management (invite, resend, revoke,
-change role, deactivate) goes through SQL RPCs: `create_invitation`,
-`revoke_invitation`, `change_member_role` and `deactivate_member`. These are
-called with the **user's own JWT**, either from the browser or from an Edge
-Function that forwards the user's `Authorization` header. The RPCs enforce
-rules like "an admin cannot promote someone to owner" and "never remove the
-last owner" in SQL, and the audit trail records the real actor.
+their own profile name and avatar. Revoke, role change and deactivation go
+through SQL RPCs called with the **user's own JWT**. Invitation creation is
+restricted to an AAL2 platform administrator and runs through the
+`invite-tenant-member` Edge Function; its service RPC stores only a token hash.
+The SQL RPCs enforce role rules and "never remove the last owner", and the
+audit trail records the initiating actor.
 
 `service_role` is reserved for work no user can do directly: Vault token
-RPCs, creating OAuth connections, starting syncs, scheduled jobs and
-invitation expiry. When that work is done for a user, the user first calls
-`begin_privileged_action` with their own JWT, and the service-role RPC must
-present the returned action id. The audit log then records the initiating
-user (`user_id`) and `actor_role = service_role`. Background work is recorded
-as `service_role` only. Rules for server code are in
+RPCs, invitation hash storage, creating OAuth connections, starting syncs,
+scheduled jobs and invitation expiry. When that work is done for a user, the
+Edge Function first calls `begin_privileged_action` with the user's own JWT,
+and the service-role RPC must present the returned action id. OAuth actions
+are bound to the exact connection they create. The audit log then records the
+initiating user (`user_id`) and `actor_role = service_role`. Background work
+is recorded as `service_role` only. Rules for server code are in
 [edge-function-contract.md](edge-function-contract.md).
 
 Platform admins can write business tables directly through the Data API, and
@@ -93,18 +111,20 @@ not possible through the API.
 3. Router: platform admins → `/admin/*`; tenant users → `/app/:tenantSlug/*`;
    suspended tenant → explanatory page.
 
-### Invitation
+### Invitation (AAL2 platform administrator only)
 
-1. A platform admin, or a tenant owner/admin, calls the `invite-user` Edge
-   Function with `{ tenant_id, email, role }`.
-2. The function verifies the caller's role, generates a random token, stores
-   only its SHA-256 hash in `tenant_invitations`, and sends the e-mail with
-   Supabase Auth `inviteUserByEmail` (new user) or a sign-in link (existing user).
-3. The invitee sets a password, signs in, and the frontend calls
+1. A platform admin calls `invite-tenant-member` with `{ tenantId, email, role }`.
+2. The function verifies the caller JWT, obtains an `invitation.create`
+   action with AAL2 enforced in SQL, generates a random token, hashes it
+   before database storage, and sends via Supabase Auth SMTP.
+3. New users receive an Auth invitation; existing users receive an OTP
+   sign-in link. The function returns only invitation ID and expiry.
+4. The invitee signs in, confirms email, and the frontend calls
    `rpc('accept_invitation', { p_token })`.
-4. `accept_invitation` checks the token, expiry, confirmed e-mail match and
+5. `accept_invitation` checks the token, expiry, confirmed e-mail match and
    tenant status, then creates the membership. It never downgrades an existing
-   role.
+   role. The acceptance page removes the invitation query token from browser
+   history immediately.
 
 ### Ad-platform connection (planned)
 
@@ -130,19 +150,20 @@ not possible through the API.
 with `service_role`, and sets `reports.status = 'ready'`. Users download it
 via the Storage API; the storage policies check the tenant folder.
 
-## Frontend structure (planned, not yet built)
+## Frontend structure
 
 ```
 frontend/src/
-  app/            router, providers (QueryClient, Auth, Tenant)
-  lib/            supabase client, typed RPC helpers, env validation
-  features/
-    auth/         sign-in, reset password, accept invite, MFA
-    admin/        tenants, members, invitations, connections, audit log
-    portal/       dashboard, campaigns, audit scores, reports
-  components/ui/  shadcn/ui components
-  types/          generated database types (supabase gen types)
+  app/            router, query/auth providers, route guards
+  components/     accessible shared UI, authentication shell, portal layout
+  context/        authenticated user, memberships and tenant selection
+  lib/            Supabase client, public env validation, auth contracts
+  pages/           login/recovery/reset/invitation/MFA and portal dashboards
+  styles.css       Tailwind-based application styles
 ```
+
+The existing frontend is an authentication foundation. Business features and
+Edge Functions listed as planned above are not implied to be implemented.
 
 Because some columns are protected by column-level grants
 (`oauth_connections`, `tenant_invitations`), queries on those tables must list

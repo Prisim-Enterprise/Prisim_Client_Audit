@@ -4,8 +4,8 @@
 -- PostgreSQL 17 / Supabase
 -- =====================================================
 --
--- STATUS: Approved. Apply to the hosted project only by following
--- docs/deployment-checklist.md (local validation: npm run db:test).
+-- STATUS: Not approved for production application. Follow
+-- docs/deployment-checklist.md; read-only preflight does not replace local tests.
 -- Once applied to hosted, never edit this file; correct it with a new migration.
 --
 -- Builds on 202611050001_initial_schema.sql (already applied; never edit it).
@@ -24,7 +24,7 @@
 --   7.  OAuth tokens moved to Supabase Vault (legacy columns locked to NULL)
 --   8.  Profile auto-creation, e-mail sync and updated_at triggers
 --   9.  Missing indexes and CHECK constraints
---   10. Tenant invitation workflow (DB-generated hashed tokens, strict status
+--   10. Tenant invitation workflow (Edge-generated token hashes, strict status
 --       transitions) and member-management RPCs that authorize in SQL
 --   11. Private `reports` storage bucket (forced private) with tenant-folder
 --       policies
@@ -576,7 +576,7 @@ CREATE TABLE private.privileged_actions (
     actor_id UUID NOT NULL,
     actor_authority TEXT NOT NULL,
     action TEXT NOT NULL
-        CHECK (action IN ('oauth.connect', 'oauth.disconnect', 'sync.start', 'report.generate')),
+        CHECK (action IN ('oauth.connect', 'oauth.disconnect', 'sync.start', 'report.generate', 'invitation.create')),
     target_id UUID,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at TIMESTAMPTZ NOT NULL DEFAULT (NOW() + INTERVAL '15 minutes'),
@@ -608,7 +608,7 @@ BEGIN
        OR v_act.action <> p_action
        OR v_act.tenant_id IS DISTINCT FROM p_tenant_id
        OR v_act.expires_at <= NOW()
-       OR (v_act.target_id IS NOT NULL AND v_act.target_id IS DISTINCT FROM p_target_id)
+       OR v_act.target_id IS DISTINCT FROM p_target_id
     THEN
         RAISE EXCEPTION 'Privileged action is invalid or has expired' USING ERRCODE = '42501';
     END IF;
@@ -1015,37 +1015,87 @@ CREATE TRIGGER protect_last_owner
 BEFORE UPDATE OR DELETE ON public.tenant_memberships
 FOR EACH ROW EXECUTE FUNCTION private.protect_last_owner();
 
+-- A platform administrator can be removed only if another administrator
+-- remains. The advisory lock serializes concurrent removals, including
+-- cascades from deleting an Auth user.
+CREATE FUNCTION private.protect_last_platform_admin()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_remaining INTEGER;
+BEGIN
+    IF TG_OP = 'UPDATE' AND NEW.user_id = OLD.user_id THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM pg_advisory_xact_lock(1347176781, 1);
+    SELECT count(*) INTO v_remaining
+    FROM public.platform_admins pa
+    WHERE pa.user_id <> OLD.user_id;
+
+    IF v_remaining = 0 THEN
+        RAISE EXCEPTION 'At least one platform administrator must remain' USING ERRCODE = '23514';
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+CREATE TRIGGER protect_last_platform_admin
+BEFORE UPDATE OR DELETE ON public.platform_admins
+FOR EACH ROW EXECUTE FUNCTION private.protect_last_platform_admin();
+
+CREATE FUNCTION private.protect_platform_admin_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = ''
+AS $$
+BEGIN
+    RAISE EXCEPTION 'Platform administrators cannot be truncated' USING ERRCODE = '23514';
+END;
+$$;
+
+CREATE TRIGGER protect_platform_admin_truncate
+BEFORE TRUNCATE ON public.platform_admins
+FOR EACH STATEMENT EXECUTE FUNCTION private.protect_platform_admin_truncate();
+
 REVOKE ALL ON FUNCTION
     private.member_manager_role(UUID),
-    private.protect_last_owner()
+    private.protect_last_owner(),
+    private.protect_last_platform_admin(),
+    private.protect_platform_admin_truncate()
 FROM PUBLIC;
 
--- Creates an invitation and returns the raw token ONCE. Only its SHA-256
--- hash is stored. The token is 256 bits from the database CSPRNG, so its
--- strength never depends on the caller. Re-inviting the same e-mail replaces
--- the previous pending invitation (resend).
-CREATE FUNCTION public.create_invitation(p_tenant_id UUID, p_email TEXT, p_role TEXT DEFAULT 'client')
-RETURNS TABLE (invitation_id UUID, invitation_token TEXT, invitation_expires_at TIMESTAMPTZ)
+-- The invite Edge Function generates a 256-bit token with Web Crypto. This
+-- service_role-only RPC receives only the token hash and never returns it.
+-- Re-inviting the same e-mail replaces the previous pending invitation.
+CREATE FUNCTION public.create_invitation(
+    p_action_id UUID, p_tenant_id UUID, p_email TEXT,
+    p_role TEXT DEFAULT 'client', p_token_hash TEXT DEFAULT NULL)
+RETURNS TABLE (invitation_id UUID, invitation_expires_at TIMESTAMPTZ)
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
-    v_uid UUID := (SELECT auth.uid());
-    v_manager TEXT;
+    v_uid UUID;
     v_email TEXT := lower(btrim(p_email));
-    v_token TEXT;
     v_id UUID;
     v_expires TIMESTAMPTZ;
 BEGIN
-    v_manager := private.member_manager_role(p_tenant_id);
+    v_uid := private.use_privileged_action(p_action_id, 'invitation.create', p_tenant_id, NULL);
+    IF NOT EXISTS (SELECT 1 FROM public.platform_admins pa WHERE pa.user_id = v_uid) THEN
+        RAISE EXCEPTION 'Not allowed' USING ERRCODE = '42501';
+    END IF;
 
     IF private.tenant_role_rank(p_role) = 0 THEN
         RAISE EXCEPTION 'Unknown role' USING ERRCODE = '22023';
     END IF;
-    IF v_manager = 'admin' AND private.tenant_role_rank(p_role) >= private.tenant_role_rank('admin') THEN
-        RAISE EXCEPTION 'Only owners can invite owners or admins' USING ERRCODE = '42501';
+    IF p_token_hash IS NULL OR p_token_hash !~ '^[0-9a-f]{64}$' THEN
+        RAISE EXCEPTION 'Invalid invitation token hash' USING ERRCODE = '22023';
     END IF;
     IF NOT EXISTS (SELECT 1 FROM public.tenants t WHERE t.id = p_tenant_id AND t.status = 'active') THEN
         RAISE EXCEPTION 'Tenant is not active' USING ERRCODE = '22023';
@@ -1057,18 +1107,54 @@ BEGIN
         RAISE EXCEPTION 'Too many invitations, try again later' USING ERRCODE = '53400';
     END IF;
 
+    -- Prevent concurrent resends from racing on uq_invitations_pending_email.
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_tenant_id::TEXT || ':' || v_email, 0));
+
     -- Close any earlier pending invitation for this address (expired or not).
     UPDATE public.tenant_invitations i
     SET status = CASE WHEN i.expires_at <= NOW() THEN 'expired' ELSE 'revoked' END
     WHERE i.tenant_id = p_tenant_id AND i.email = v_email AND i.status = 'pending';
 
-    v_token := encode(extensions.gen_random_bytes(32), 'hex');
-
     INSERT INTO public.tenant_invitations (tenant_id, email, role, token_hash, invited_by)
-    VALUES (p_tenant_id, v_email, p_role, encode(sha256(convert_to(v_token, 'UTF8')), 'hex'), v_uid)
+    VALUES (p_tenant_id, v_email, p_role, p_token_hash, v_uid)
     RETURNING id, expires_at INTO v_id, v_expires;
 
-    RETURN QUERY SELECT v_id, v_token, v_expires;
+    UPDATE private.privileged_actions
+    SET target_id = v_id
+    WHERE id = p_action_id AND target_id IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Privileged action is invalid or has expired' USING ERRCODE = '42501';
+    END IF;
+    RETURN QUERY SELECT v_id, v_expires;
+END;
+$$;
+
+-- Delivery failures revoke the just-created invitation. The same still-valid
+-- action ties the cancellation and audit entry to its initiating administrator.
+CREATE FUNCTION public.fail_invitation_delivery(p_action_id UUID, p_invitation_id UUID)
+RETURNS VOID
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+DECLARE
+    v_inv public.tenant_invitations%ROWTYPE;
+    v_actor UUID;
+BEGIN
+    SELECT * INTO v_inv
+    FROM public.tenant_invitations i
+    WHERE i.id = p_invitation_id
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Invitation delivery could not be cancelled' USING ERRCODE = '42501';
+    END IF;
+
+    v_actor := private.use_privileged_action(p_action_id, 'invitation.create', v_inv.tenant_id, p_invitation_id);
+    IF v_inv.invited_by IS DISTINCT FROM v_actor OR v_inv.status <> 'pending' THEN
+        RAISE EXCEPTION 'Invitation delivery could not be cancelled' USING ERRCODE = '42501';
+    END IF;
+    UPDATE public.tenant_invitations SET status = 'revoked' WHERE id = v_inv.id;
 END;
 $$;
 
@@ -1205,8 +1291,12 @@ BEGIN
     IF v_uid IS NULL THEN
         RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
     END IF;
-    IF p_action IS NULL OR p_action NOT IN ('oauth.connect', 'oauth.disconnect', 'sync.start', 'report.generate') THEN
+    IF p_action IS NULL OR p_action NOT IN ('oauth.connect', 'oauth.disconnect', 'sync.start', 'report.generate', 'invitation.create') THEN
         RAISE EXCEPTION 'Unknown action' USING ERRCODE = '22023';
+    END IF;
+
+    IF p_action = 'invitation.create' AND NOT private.is_platform_admin() THEN
+        RAISE EXCEPTION 'Not allowed' USING ERRCODE = '42501';
     END IF;
 
     IF private.is_platform_admin() THEN
@@ -1239,7 +1329,7 @@ BEGIN
             RAISE EXCEPTION 'Unknown report' USING ERRCODE = '22023';
         END IF;
     ELSIF p_target_id IS NOT NULL THEN
-        RAISE EXCEPTION 'oauth.connect takes no target' USING ERRCODE = '22023';
+        RAISE EXCEPTION 'This action takes no target' USING ERRCODE = '22023';
     END IF;
 
     IF (SELECT count(*) FROM private.privileged_actions a
@@ -1410,6 +1500,13 @@ BEGIN
     INSERT INTO public.oauth_connections (tenant_id, provider, status)
     VALUES (p_tenant_id, p_provider, 'pending')
     RETURNING id INTO v_id;
+
+    UPDATE private.privileged_actions
+    SET target_id = v_id
+    WHERE id = p_action_id AND target_id IS NULL;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Privileged action is invalid or has expired' USING ERRCODE = '42501';
+    END IF;
     RETURN v_id;
 END;
 $$;
@@ -1618,6 +1715,11 @@ TO authenticated;
 -- Profiles: users may change only their display fields.
 GRANT UPDATE (full_name, avatar_url) ON public.profiles TO authenticated;
 
+-- platform_admins remains an owner-managed bootstrap table; neither the
+-- browser roles nor service_role can assign or revoke staff privileges.
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER
+    ON public.platform_admins FROM anon, authenticated, service_role;
+
 -- OAuth connections: token columns are never readable through the API.
 GRANT SELECT (id, tenant_id, provider, provider_account_id, account_name,
               token_expires_at, scopes, status, created_at, updated_at)
@@ -1643,7 +1745,6 @@ GRANT EXECUTE ON FUNCTION
     public.get_my_context(),
     public.get_tenant_sync_status(UUID),
     public.accept_invitation(TEXT),
-    public.create_invitation(UUID, TEXT, TEXT),
     public.revoke_invitation(UUID),
     public.change_member_role(UUID, UUID, TEXT),
     public.deactivate_member(UUID, UUID),
@@ -1651,6 +1752,8 @@ GRANT EXECUTE ON FUNCTION
 TO authenticated;
 
 GRANT EXECUTE ON FUNCTION
+    public.create_invitation(UUID, UUID, TEXT, TEXT, TEXT),
+    public.fail_invitation_delivery(UUID, UUID),
     public.store_oauth_tokens(UUID, TEXT, TEXT, TIMESTAMPTZ, UUID),
     public.get_oauth_tokens(UUID),
     public.delete_oauth_tokens(UUID, UUID),
@@ -1734,8 +1837,10 @@ COMMENT ON FUNCTION public.get_tenant_sync_status(UUID) IS
     'Sanitized per-provider sync status for tenant members. No error details.';
 COMMENT ON FUNCTION public.accept_invitation(TEXT) IS
     'Accept a tenant invitation using the raw token from the invite e-mail.';
-COMMENT ON FUNCTION public.create_invitation(UUID, TEXT, TEXT) IS
-    'Owner/admin (or aal2 platform admin) creates an invitation; returns the raw token once.';
+COMMENT ON FUNCTION public.create_invitation(UUID, UUID, TEXT, TEXT, TEXT) IS
+    'service_role only. Stores a token hash for an invitation authorized by an aal2 platform-admin action; never returns a token.';
+COMMENT ON FUNCTION public.fail_invitation_delivery(UUID, UUID) IS
+    'service_role only. Revokes an undelivered invitation and attributes the audit event to its initiating administrator.';
 COMMENT ON FUNCTION public.revoke_invitation(UUID) IS
     'Owner/admin (or aal2 platform admin) revokes a pending invitation.';
 COMMENT ON FUNCTION public.change_member_role(UUID, UUID, TEXT) IS
@@ -1745,7 +1850,7 @@ COMMENT ON FUNCTION public.deactivate_member(UUID, UUID) IS
 COMMENT ON FUNCTION public.expire_stale_invitations() IS
     'service_role only. Marks overdue pending invitations as expired.';
 COMMENT ON FUNCTION public.begin_privileged_action(UUID, TEXT, UUID) IS
-    'Manager+ (or aal2 platform admin) authorizes a service_role workflow; returns an action id for attribution.';
+    'Manager+ (or aal2 platform admin) authorizes a service_role workflow; invitation.create is restricted to aal2 platform admins.';
 COMMENT ON FUNCTION public.store_oauth_tokens(UUID, TEXT, TEXT, TIMESTAMPTZ, UUID) IS
     'service_role only. Stores/rotates OAuth tokens in Supabase Vault. Pass an oauth.connect action id for user-initiated connects.';
 COMMENT ON FUNCTION public.get_oauth_tokens(UUID) IS

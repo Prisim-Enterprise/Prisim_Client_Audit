@@ -15,7 +15,7 @@ written down in the function's README.
 | Client | Created with | Use it for |
 |---|---|---|
 | **User client** | Publishable/anon key + the caller's `Authorization: Bearer <user JWT>` header | **Every tenant-scoped read or write made on behalf of a user**, and `begin_privileged_action` (§4). RLS and the SQL RPCs authorize the request, and the audit trail records the real actor (`auth.uid()`). |
-| **Service client** | `service_role` / secret key | Only work a user cannot do directly: the Vault token RPCs, `create_oauth_connection`, `start_sync_job`, scheduled syncs, `expire_stale_invitations()`. |
+| **Service client** | `service_role` / secret key | Only work a user cannot do directly: invitation hash storage and SMTP-triggering Auth Admin calls, the Vault token RPCs, `create_oauth_connection`, `start_sync_job`, scheduled syncs, `expire_stale_invitations()`. |
 
 - MUST NOT use the service client for a change that a user client plus an RPC
   can perform.
@@ -101,8 +101,7 @@ Rules:
 
 | Operation | How |
 |---|---|
-| Invite | User client → `rpc('create_invitation', { p_tenant_id, p_email, p_role })`. The database checks the caller's role (owner: any role; admin: manager/viewer/client), the tenant status and a 30-per-hour limit per inviter, and generates a 256-bit token. |
-| Resend | Call `create_invitation` again. The old pending invitation is revoked, so its token stops working. |
+| Invite/resend | Browser → `invite-tenant-member` Edge Function. It verifies the user JWT, calls `begin_privileged_action` with the user's JWT (AAL2 platform admin only), generates a 256-bit token with Web Crypto, and calls the service-role `create_invitation` RPC to store only its hash. The database checks tenant status, the action/actor and a 30-per-hour limit; a new pending invitation revokes the previous one. |
 | Revoke | User client → `rpc('revoke_invitation', { p_invitation_id })` |
 | Change role | User client → `rpc('change_member_role', …)` |
 | Remove member | User client → `rpc('deactivate_member', …)`. This also revokes their pending invitations. |
@@ -113,18 +112,28 @@ Every tenant always keeps at least one active owner. A database trigger
 enforces this for every role, including platform admins and `service_role`.
 Expect error `23514` and show a clear message.
 
-The invite function MUST:
-- send the returned `invitation_token` only inside the e-mail, as a link to
-  the frontend accept page, e.g. `https://<site>/accept-invite#token=<token>`.
-  Prefer the URL fragment: it is not sent to servers or included in `Referer`.
-- respond to the browser with `invitation_id` and `invitation_expires_at` only,
-  **never the token**;
-- never log the token, the full link or the e-mail body;
-- apply its own per-IP rate limit (§9), on top of the database limit.
+The `invite-tenant-member` function MUST:
+- keep the raw token only in Edge Function memory and the outbound Auth email
+  redirect; hash it with SHA-256 before calling the service RPC, which accepts
+  only the hash and returns no token;
+- deliver new-user invitations with `auth.admin.inviteUserByEmail` and use
+  `auth.signInWithOtp({ shouldCreateUser: false })` for an existing Auth user,
+  both through Supabase Auth's configured SMTP;
+- respond with `invitation_id` and `invitation_expires_at` only, never the
+  token, email body, or provider error;
+- never log the token, redirect URL, email, or request body;
+- call `fail_invitation_delivery` to revoke the pending row if Auth email
+  delivery fails. If cleanup also fails, surface an explicit server error;
+- rely on database actor rate limits and configured Supabase Auth/gateway
+  throttling. Do not claim a per-IP limit unless an actual shared limiter is
+  deployed.
 
-The accept page MUST read the token from the fragment, POST it to
-`accept_invitation`, then remove it from the address bar with
-`history.replaceState`.
+The email redirect uses `/accept-invite?token=<token>` because Supabase Auth
+returns its own session in the URL fragment. The page MUST extract and remove
+the invitation query parameter immediately with `history.replaceState`, then
+POST the token to `accept_invitation`. The token is necessarily present in the
+recipient's email link and browser navigation, but is never returned by an
+RPC, sent to the database, or included in logs/referrers.
 
 ## 6. OAuth connect (Meta, Google)
 

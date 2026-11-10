@@ -56,6 +56,8 @@ SELECT ok(has_function_privilege('service_role', 'public.get_oauth_tokens(uuid)'
 -- -----------------------------------------------------
 SELECT ok(NOT has_table_privilege('authenticated', 'public.tenants', 'DELETE'), 'tenants cannot be deleted through the API');
 SELECT ok(NOT has_table_privilege('authenticated', 'public.platform_admins', 'INSERT'), 'platform admins cannot be granted through the API');
+SELECT ok(NOT has_table_privilege('authenticated', 'public.platform_admins', 'UPDATE, DELETE'), 'platform admins cannot be changed through the API');
+SELECT ok(NOT has_table_privilege('service_role', 'public.platform_admins', 'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'), 'platform-admin bootstrap is not exposed to service_role');
 SELECT ok(NOT has_column_privilege('authenticated', 'public.profiles', 'email', 'UPDATE'), 'profile email is read-only');
 SELECT ok(has_column_privilege('authenticated', 'public.profiles', 'full_name', 'UPDATE'), 'profile full_name is updatable');
 SELECT ok(NOT has_table_privilege('authenticated', 'public.audit_logs', 'INSERT'), 'authenticated cannot write audit logs');
@@ -63,6 +65,13 @@ SELECT ok(NOT has_table_privilege('service_role', 'public.audit_logs', 'UPDATE')
 SELECT ok(NOT has_table_privilege('service_role', 'public.audit_logs', 'DELETE'), 'audit logs are append-only (no DELETE)');
 SELECT ok(NOT has_table_privilege('service_role', 'public.audit_logs', 'INSERT'), 'audit logs are trigger-written only (service_role has no INSERT)');
 SELECT ok(NOT has_table_privilege('authenticated', 'public.tenant_invitations', 'INSERT, UPDATE, DELETE'), 'invitations are changed only through RPCs');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.create_invitation(uuid,uuid,text,text,text)', 'EXECUTE'),
+    'authenticated cannot call the raw-token invitation RPC');
+SELECT ok(has_function_privilege('service_role', 'public.create_invitation(uuid,uuid,text,text,text)', 'EXECUTE'),
+    'service_role can call the invitation hash-storage RPC');
+SELECT ok(position('token' IN pg_get_function_result(
+    'public.create_invitation(uuid,uuid,text,text,text)'::regprocedure)) = 0,
+    'invitation RPC response does not contain a token field');
 SELECT ok(NOT has_column_privilege('authenticated', 'public.daily_metrics', 'source_payload', 'SELECT'), 'daily_metrics.source_payload is hidden from the API');
 SELECT ok(NOT has_table_privilege('authenticated', 'public.sync_logs', 'INSERT'), 'authenticated cannot write sync logs');
 
@@ -73,6 +82,7 @@ SELECT has_table('public', 'platform_admins', 'platform_admins exists');
 SELECT has_table('public', 'tenant_invitations', 'tenant_invitations exists');
 SELECT has_table('private', 'oauth_credentials', 'private.oauth_credentials exists');
 SELECT has_trigger('auth', 'users', 'on_auth_user_created', 'profile trigger on auth.users');
+SELECT has_trigger('public', 'platform_admins', 'protect_last_platform_admin', 'last platform administrator is protected');
 SELECT is((SELECT public FROM storage.buckets WHERE id = 'reports'), FALSE, 'reports bucket exists and is private');
 SELECT ok(EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'daily_metrics_account_campaign_date_key'), 'new daily_metrics unique key exists');
 SELECT ok(NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'daily_metrics_ad_account_id_campaign_id_metric_date_key'), 'old daily_metrics unique key removed');

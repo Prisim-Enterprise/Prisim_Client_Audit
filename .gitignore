@@ -2,9 +2,11 @@
 **/node_modules/
 dist/
 build/
+*.tsbuildinfo
 .env
 .env.*
 !.env.example
+!.env.*.example
 .supabase/
 *.log
 .DS_Store

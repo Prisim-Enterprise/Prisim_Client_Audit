@@ -45,7 +45,6 @@ SELECT results_eq(
         ('accept_invitation(text)'),
         ('begin_privileged_action(uuid,text,uuid)'),
         ('change_member_role(uuid,uuid,text)'),
-        ('create_invitation(uuid,text,text)'),
         ('deactivate_member(uuid,uuid)'),
         ('get_my_context()'),
         ('get_tenant_sync_status(uuid)'),
@@ -77,9 +76,11 @@ SELECT results_eq(
          AND NOT has_function_privilege('authenticated', oid, 'EXECUTE')
        ORDER BY 1 $$,
     $$ VALUES
+        ('create_invitation(uuid,uuid,text,text,text)'),
         ('create_oauth_connection(uuid,uuid,text)'),
         ('delete_oauth_tokens(uuid,uuid)'),
         ('expire_stale_invitations()'),
+        ('fail_invitation_delivery(uuid,uuid)'),
         ('get_oauth_tokens(uuid)'),
         ('start_sync_job(uuid,uuid,text)'),
         ('store_oauth_tokens(uuid,text,text,timestamp with time zone,uuid)') $$,

@@ -57,7 +57,7 @@ child to point at a parent in another tenant:
 | `platform_admins` (0002) | `user_id` PK; managed via SQL only |
 | `tenant_memberships` | unique `(tenant_id, user_id)`; `role` owner/admin/manager/viewer/client; `status` active/inactive/invited; the last active owner of a tenant cannot be deactivated, downgraded, removed or moved by any role (trigger `protect_last_owner`, 0002) |
 | `private.privileged_actions` (0002) | User-initiated authorizations for service_role workflows (`oauth.connect`, `oauth.disconnect`, `sync.start`, `report.generate`); actor from `auth.uid()`; 15-minute expiry; source of audit attribution for service_role work. Not accessible to any API role. |
-| `tenant_invitations` (0002) | `email` lower-case; `token_hash` SHA-256 hex of a DB-generated 256-bit token; one pending invite per `(tenant_id, email)`; default expiry 7 days; status only pending → accepted/revoked/expired; other columns immutable (trigger) |
+| `tenant_invitations` (0002) | `email` lower-case; `token_hash` SHA-256 hex of a 256-bit Edge-generated token; one pending invite per `(tenant_id, email)`; default expiry 7 days; status only pending → accepted/revoked/expired; other columns immutable (trigger) |
 | `oauth_connections` | `provider` meta/google; `status` pending/connected/expired/revoked/error. `encrypted_*_token` columns are **deprecated and must be NULL** (0002) |
 | `private.oauth_credentials` (0002) | Vault secret ids for access/refresh tokens; secrets are purged on delete |
 | `ad_accounts` | unique `(tenant_id, provider, external_account_id)`; `status` checked (0002); ISO currency (0002) |
@@ -79,11 +79,12 @@ child to point at a parent in another tenant:
 | `public.get_my_context()` (0002) | authenticated | Caller's platform-admin flag, `platform_admin_mfa_required`, and memberships (with tenant status) |
 | `public.get_tenant_sync_status(uuid)` (0002) | authenticated | Per-provider last status and last successful sync, no error details |
 | `public.accept_invitation(text)` (0002) | authenticated | Accept an invite by raw token |
-| `public.create_invitation(uuid, text, text)` (0002) | authenticated (owner/admin, aal2 platform admin) | Create/resend an invitation; returns the raw token once |
+| `public.create_invitation(uuid, uuid, text, text, text)` (0002) | service_role only, with an `invitation.create` action from an AAL2 platform admin | Store an invitation token hash; returns invitation id and expiry only |
+| `public.fail_invitation_delivery(uuid, uuid)` (0002) | service_role only | Revoke an invitation when Auth SMTP delivery fails |
 | `public.revoke_invitation(uuid)` (0002) | authenticated (owner/admin, aal2 platform admin) | Revoke a pending invitation |
 | `public.change_member_role(uuid, uuid, text)` (0002) | authenticated (owner/admin, aal2 platform admin) | Change a member's role; keeps one active owner |
 | `public.deactivate_member(uuid, uuid)` (0002) | authenticated (owner/admin, aal2 platform admin) | Deactivate a member and revoke their pending invitations |
-| `public.begin_privileged_action(uuid, text, uuid)` (0002) | authenticated (manager+, aal2 platform admin) | Authorize a service_role workflow; returns an action id |
+| `public.begin_privileged_action(uuid, text, uuid)` (0002) | authenticated (manager+, aal2 platform admin; invitation creation is platform-admin-only) | Authorize a service_role workflow; returns an action id |
 | `public.expire_stale_invitations()` (0002) | service_role | Mark overdue pending invitations expired (run daily) |
 | `public.create_oauth_connection(uuid, uuid, text)` (0002) | service_role | Create a pending connection for an `oauth.connect` action |
 | `public.start_sync_job(uuid, uuid, text)` (0002) | service_role | Queue a sync for a `sync.start` action (one queued/running job per connection) |

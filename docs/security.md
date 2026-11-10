@@ -31,7 +31,7 @@ pre-flight) and [edge-function-contract.md](edge-function-contract.md)
 | Stolen staff password | `private.is_platform_admin()` requires JWT `aal = 'aal2'`. An aal1 session of a listed admin has no admin privileges (DB, Storage and RPCs). |
 | Suspended client keeps access | All helpers require `tenants.status = 'active'` and an `active` membership |
 | OAuth token theft | Tokens encrypted in Supabase Vault; mapping table in the non-exposed `private` schema; token RPCs executable by `service_role` only; legacy public token columns locked to NULL; secrets purged on delete or re-point |
-| Invitation token theft or guessing | 256-bit tokens generated in the database. Only the SHA-256 hash is stored, and that column is not selectable. The invite is bound to a confirmed e-mail, single use, 7-day expiry, one generic error. Status can only go pending → accepted/revoked/expired. Resend and deactivation revoke older tokens. |
+| Invitation token theft or guessing | 256-bit tokens generated with Web Crypto inside the protected invite Edge Function. The service RPC stores only the SHA-256 hash and returns no token; the hash column is not selectable. The invite is bound to a confirmed e-mail, single use, 7-day expiry, one generic error. Status can only go pending → accepted/revoked/expired. Resend and deactivation revoke older tokens. |
 | Internal error leakage | `sync_jobs` / `sync_logs` visible to platform admins only; clients use `get_tenant_sync_status()`; `daily_metrics.source_payload` is not selectable through the API |
 | Report file leakage | Private bucket, forced private by the migration even if it already existed. The read policy checks that the first path segment is a tenant the caller can access. A DB constraint keeps `reports.storage_path` inside the tenant folder. |
 | Audit tampering or forgery | `audit_logs` is written only by the audit trigger. No role, including `service_role`, has INSERT/UPDATE/DELETE/TRUNCATE. Triggers reject UPDATE/DELETE/TRUNCATE even for the table owner. No foreign keys, so deleting users or tenants never rewrites audit rows. The actor comes from the JWT (`user_id`, `actor_role`). |
@@ -53,6 +53,13 @@ pre-flight) and [edge-function-contract.md](edge-function-contract.md)
 Git protections: `.gitignore` excludes `.env*` (except `.env.example`),
 `supabase/.temp/` and `.env.keys`. Before committing, check `git diff --cached`
 for anything that looks like a key.
+
+Routine frontend development uses Vite against the hosted Supabase project.
+`frontend/.env.local` may contain only the public project URL, publishable/anon
+key, frontend URL and environment label; all `VITE_*` values are shipped to
+the browser. The file is git-ignored, but that does not make its values
+private. Docker/local Supabase is only for optional database validation, not a
+requirement for frontend work.
 
 If a secret leaks: rotate it immediately (Dashboard → Project Settings → API
 keys / Database password; regenerate provider app secrets), redeploy Edge
@@ -99,6 +106,10 @@ hosted Auth, Storage and API settings are in
 
 ## Frontend notes
 
+- The local Vite app uses the hosted project via the public variables in
+  `frontend/.env.example`. The exact local frontend URL must be allowed in
+  Supabase Auth redirect URLs; never use a service-role or database credential
+  in frontend configuration.
 - Select explicit columns on `daily_metrics` and `oauth_connections`. Column
   grants hide `source_payload` and the legacy token columns, so `select('*')`
   is rejected.

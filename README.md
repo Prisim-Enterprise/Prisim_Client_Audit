@@ -8,11 +8,10 @@ reports.
 - **Client users** belong to one or more tenants and only ever see their own
   tenant's data, with permissions set by their tenant role.
 
-> **Status:** foundation stage. The hardening migration
-> `20261105120000_security_hardening.sql` is approved and committed but **not
-> yet applied** to the hosted project (see
-> [docs/deployment-checklist.md](docs/deployment-checklist.md)). The frontend
-> and Edge Functions are not built yet.
+> **Status:** frontend authentication foundation and local remediation for
+> migration `20261105120000_security_hardening.sql` are present. Migration 0002
+> is pending in production and remains **NO-GO** pending local database tests
+> and final review.
 
 ## Stack
 
@@ -38,8 +37,9 @@ for the limits that implies.
 │   ├── deployment-checklist.md  Authoritative hosted deployment and go-live procedure
 │   ├── edge-function-contract.md  Mandatory rules for Edge Functions
 │   └── security.md           Threat model, secrets, operational rules
-├── frontend/                 React app (not yet scaffolded)
-│   └── .env.example          Public frontend environment variables
+├── frontend/                 React + TypeScript + Vite application
+│   ├── .env.example          Public frontend environment variables
+│   └── src/                  Authentication, routes, layouts and shared UI
 ├── supabase/
 │   ├── config.toml           Local development stack configuration
 │   ├── migrations/           Ordered SQL migrations (source of truth)
@@ -48,50 +48,69 @@ for the limits that implies.
 └── package.json              Supabase CLI (dev dependency) and local scripts
 ```
 
-## Prerequisites
+## Frontend development
 
 - Node.js 20+ (22 recommended)
-- Docker Desktop, only for running the local Supabase stack and database tests
-- Access to the Supabase project (for maintainers who apply migrations)
+- A publishable (or legacy anon) key for the PRISIM production Supabase project
+- Docker and the Supabase CLI are **not required** for frontend development
 
-## Local development
+Local Vite and production frontend builds use the existing production
+Supabase project. Local development must use an authorized test account; do
+not exercise writes against real client accounts.
 
 ```bash
-npm install                 # installs the Supabase CLI locally
-npm run db:start            # starts local Supabase in Docker (first run downloads images)
-npm run db:reset            # rebuilds the local DB from migrations + seed.sql
-npm run db:test             # secret scan + pgTAP tests + Auth API test (local only)
-npm run db:lint             # static checks on database functions
-npm run db:stop             # stops local Supabase
+cd frontend
+npm install
+Copy-Item .env.example .env.local  # PowerShell; set the public key in this ignored file
+npm run dev
+npm run build
+npm run build:production  # production build; explicit mode and production project only
+npm run typecheck
+npm run test
 ```
 
-Local services after `db:start`:
+`npm run dev` starts the Vite frontend and requires the production URL and
+public key in ignored `frontend/.env.local`.
 
-| Service | URL |
-|---|---|
-| API | http://127.0.0.1:54321 |
-| Studio | http://127.0.0.1:54323 |
-| Mail catcher (invite / reset e-mails) | http://127.0.0.1:54324 |
+## Optional local database and migration validation
 
-Signups are disabled (invite-only). Create local users in Studio, then link
-them to demo tenants with the snippet at the bottom of
-[supabase/seed.sql](supabase/seed.sql).
+Docker Desktop is needed only for local database tests. Migration reset is
+gated until migration 0002 is approved for local testing:
 
-Frontend setup will be documented here once it is scaffolded. Its
-environment variables are listed in [frontend/.env.example](frontend/.env.example).
+```bash
+npm install                 # at repository root; installs the Supabase CLI
+npm run db:start            # local Supabase in Docker
+npm run db:local:verify     # reset without seed, lint, and run pgTAP; requires owner approval env gate
+npm run db:stop
+```
+
+The local API, Studio and mail catcher are available at
+`http://127.0.0.1:54321`, `http://127.0.0.1:54323` and
+`http://127.0.0.1:54324` after `db:start`. Local signups are disabled; use
+Studio and the local seed instructions when a local-stack test is required.
+
+The frontend does not implement self-registration. Staff routes require the
+database-reported platform-admin state and a TOTP-verified (`aal2`) session.
+Client routes require a membership returned by `get_my_context()`; PostgreSQL
+RLS remains the authorization boundary. Migration
+`20261105120000_security_hardening.sql` must be applied for the frontend
+context and MFA-gated admin behavior to work. The migration is not applied by
+frontend startup or build.
 
 ## Database change workflow
 
 1. Never edit a migration that has been applied to the hosted project
    (`202611050001_initial_schema.sql` is applied and frozen).
 2. Add a new file `supabase/migrations/<YYYYMMDDHHMMSS>_<name>.sql`.
-3. Validate locally: `npm run db:reset && npm run db:test`.
-4. Get the change reviewed and approved.
-5. A maintainer applies it to the hosted project by following
+3. Validate with the database tests against the local stack; Docker is needed
+   for that validation. Do not use database tests as routine frontend tests.
+4. Get the migration reviewed and explicit approval for hosted application.
+5. An authorized maintainer applies it to the hosted project by following
    [docs/deployment-checklist.md](docs/deployment-checklist.md).
 
-The npm scripts never touch the hosted database. There is intentionally no
-`db push` script.
+Hosted production operations, including applying migrations, require explicit
+authorization. Do not use database commands against production except for
+explicitly approved read-only checks or an approved migration deployment.
 
 ## Security essentials
 

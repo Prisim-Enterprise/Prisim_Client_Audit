@@ -112,11 +112,23 @@ CREATE TEMP TABLE new_conn AS
 SELECT public.create_oauth_connection((SELECT id FROM acts WHERE label = 'connect'),
                                       'a9000000-0000-4000-8000-000000000000', 'google') AS id;
 SELECT ok((SELECT id IS NOT NULL FROM new_conn), 'service_role: creates a pending connection for an oauth.connect action');
+SELECT throws_ok(
+    format('SELECT public.create_oauth_connection(%L, %L, %L)',
+           (SELECT id FROM acts WHERE label = 'connect'), 'a9000000-0000-4000-8000-000000000000', 'meta'),
+    '42501', NULL, 'oauth.connect action cannot create a second connection');
+SELECT throws_ok(
+    format('SELECT public.store_oauth_tokens(%L, %L, %L, NULL, %L)',
+           'a9000000-0000-4000-8000-0000000000c0', 'unbound-access', NULL, (SELECT id FROM acts WHERE label = 'expiring')),
+    '42501', NULL, 'targetless oauth.connect action cannot authorize a connection-specific token write');
 
 SELECT lives_ok(
     format('SELECT public.store_oauth_tokens(%L, %L, %L, NULL, %L)',
            (SELECT id FROM new_conn), 'g-access', 'g-refresh', (SELECT id FROM acts WHERE label = 'connect')),
     'service_role: stores tokens for the same oauth.connect action');
+SELECT throws_ok(
+    format('SELECT public.store_oauth_tokens(%L, %L, %L, NULL, %L)',
+           'b9000000-0000-4000-8000-0000000000c0', 'cross-tenant-access', NULL, (SELECT id FROM acts WHERE label = 'connect')),
+    '42501', NULL, 'oauth.connect action cannot access another tenant connection');
 
 SELECT set_config('prisim.privileged_action_id', '', TRUE);  -- new request
 SELECT lives_ok(format('SELECT public.store_oauth_tokens(%L, %L)', (SELECT id FROM new_conn), 'g-access-refreshed'),

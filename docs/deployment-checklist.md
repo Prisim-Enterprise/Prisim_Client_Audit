@@ -6,8 +6,16 @@ project and for the pre-go-live checks. Other documents link here and do not
 repeat it.
 
 Written for the maintainer who performs the deployment. Nothing below happens
-automatically, and no step here was run against the hosted project during
-development. `supabase/config.toml` configures only the **local** stack.
+automatically. On 2026-11-10, hosted migration listing, read-only compatibility
+checks, an Auth health check, and a migration dry-run were performed; no
+production migration was applied. `supabase/config.toml` configures only the
+**local** stack.
+
+Local frontend development and production use the existing production Supabase
+project. Use only a dedicated authorized test account during local development.
+The local-only commands below are for database/migration validation, not
+frontend startup. Every hosted change or production operation requires explicit
+authorization.
 
 Work through the phases in order. Stop at the first unexpected result and ask
 before continuing.
@@ -48,13 +56,16 @@ targets the local stack when `--remote` is absent.
 
 ## Phase A: Local validation 🖥️
 
-```bash
+This Docker-backed phase validates database migrations; it is not required
+for routine Vite development.
+
+```powershell
 git status --short          # only expected untracked files (e.g. CLAUDE.md)
 npm run db:start
-npm run db:reset            # LOCAL: applies 0001 + 0002 + seed
-npm run db:test             # LOCAL: secret scan + pgTAP + Auth API, all must pass
-npm run db:lint             # "No schema errors found"
-git diff --quiet HEAD -- supabase/migrations/202611050001_initial_schema.sql && echo "0001 unchanged"
+$env:PRISIM_ALLOW_LOCAL_MIGRATION_0002 = "1" # only after review/approval
+npm run db:local:verify     # LOCAL: reset without seed, lint, pgTAP
+Remove-Item Env:PRISIM_ALLOW_LOCAL_MIGRATION_0002
+git diff --quiet HEAD -- supabase/migrations/202611050001_initial_schema.sql
 ```
 
 Optionally, run the dress rehearsal in Phase E3 once a hosted data dump exists.
@@ -79,7 +90,7 @@ Dashboard menu names change over time. Find each setting by name.
 | Minimum password length / requirements | **10+**, lower + upper + digits | |
 | Leaked-password protection | **Enable if your plan offers it** | Plan-dependent. At the time of writing it is not available on every plan. Do not assume it is on. If it isn't available, record "not available on current plan" in the deployment notes and rely on the length and complexity rules. Re-check when the plan changes. |
 | Access token (JWT) expiry | **3600 s or less** | Roles, suspension and MFA are re-read from the database on every request, but a stolen JWT stays valid until it expires |
-| Site URL | Production frontend URL, or a placeholder you control until the frontend exists | |
+| Site URL | Production frontend URL. During local Vite development, configure only the exact localhost redirect required for the test. | |
 | Redirect URLs | Exact production URL(s) only, plus `http://localhost:5173` only while developing | No wildcards on shared domains (`*.pages.dev`). Invitation and magic links go to these. |
 | Custom SMTP | A real provider before go-live | The built-in sender is rate-limited and for testing only |
 | Rate limits | Defaults or tighter | |
@@ -118,27 +129,29 @@ Public sign-up is off, so the project owner creates each PRISIM staff account:
 Do not create accounts with the service key from a laptop. Keep the key inside
 Edge Functions.
 
-"Send invitation" is the alternative. It needs a working Site URL page to land
-on, which does not exist until the frontend is built.
+"Send invitation" is the alternative. The local
+`invite-tenant-member` Edge Function source and frontend acceptance route now
+exist. Before use, deploy/review the function, configure its server-side
+`APP_URL`, configure Supabase Auth SMTP, and allow the exact invitation
+redirect URL. Do not treat invitation onboarding as ready until those pieces
+are deployed and tested.
 
 ### C2. TOTP is required before admin access (temporary bootstrap) ⚠️
 
 A platform admin has **no** admin privileges until they hold an `aal2`
-session, meaning they signed in with password **and** a verified TOTP code. The
-frontend MFA screen doesn't exist yet, and the Dashboard can't enroll a factor
-on a user's behalf.
+session, meaning they signed in with password **and** a verified TOTP code.
+The frontend now includes MFA enrollment and step-up screens; they have not
+been verified against the hosted project in this workflow. The Dashboard
+can't enroll a factor on a user's behalf.
 
 The temporary utility in [Appendix A](#appendix-a-temporary-mfa-bootstrap-utility)
-is **hard-limited to the local stack**. It rehearses and proves the enrollment
-flow locally, but it cannot reach the hosted project. Enrolling the first
-**hosted** admin therefore needs one of:
-- the frontend MFA enrollment and step-up screen, or
-- a separately reviewed and approved hosted-capable version of the tool (a
-  code change, not a flag).
-
-Until one exists, Phase F3 (bootstrap and verify the first admin) cannot be
-completed. Deploying 0002 does not depend on it: tables, RLS and
-`service_role` work without a platform admin.
+is **hard-limited to the local stack**. For the first hosted administrator,
+the owner creates and verifies a staff Auth account without assigning
+`platform_admins`; that user signs in and uses `/mfa/setup` to enroll and
+verify TOTP. This route only enrolls an Auth factor and grants no application
+privilege. The owner then inserts the user into `platform_admins` through the
+controlled SQL bootstrap in F3. Normal staff routes and RPCs remain unavailable
+until the user's session is AAL2.
 
 ## Phase D: Read-only checks on hosted 🔍
 
@@ -221,7 +234,7 @@ BEGIN READ ONLY;
 SELECT check_name, n FROM (VALUES
   ('auth.users: trigger name collision',            (SELECT count(*) FROM pg_trigger WHERE tgrelid = 'auth.users'::regclass AND NOT tgisinternal AND tgname IN ('on_auth_user_created','on_auth_user_email_changed'))),
   ('auth.users: any custom trigger (review)',       (SELECT count(*) FROM pg_trigger WHERE tgrelid = 'auth.users'::regclass AND NOT tgisinternal)),
-  ('public: function name collision',               (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('get_my_context','get_tenant_sync_status','accept_invitation','create_invitation','revoke_invitation','change_member_role','deactivate_member','expire_stale_invitations','begin_privileged_action','store_oauth_tokens','get_oauth_tokens','delete_oauth_tokens','create_oauth_connection','start_sync_job'))),
+  ('public: function name collision',               (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' AND p.proname IN ('get_my_context','get_tenant_sync_status','accept_invitation','create_invitation','fail_invitation_delivery','revoke_invitation','change_member_role','deactivate_member','expire_stale_invitations','begin_privileged_action','store_oauth_tokens','get_oauth_tokens','delete_oauth_tokens','create_oauth_connection','start_sync_job'))),
   ('private schema already exists (review)',        (SELECT count(*) FROM pg_namespace WHERE nspname = 'private')),
   ('public: policies not from 0001 (review)',       (SELECT count(*) FROM pg_policies WHERE schemaname = 'public' AND policyname NOT IN ('Users can view own profile','Members can view their tenants','Members can view tenant memberships','Members can view ad accounts','Members can view campaigns','Members can view daily metrics','Members can view audit scores','Members can view sync jobs','Members can view sync logs','Members can view reports'))),
   ('storage: reports: policy name collision',       (SELECT count(*) FROM pg_policies WHERE schemaname = 'storage' AND tablename = 'objects' AND policyname LIKE 'reports:%')),
@@ -421,8 +434,11 @@ If any row is `f`, do not continue. Recover with a forward fix
 
 ### F3. Bootstrap and verify the first platform admin ⚠️
 
-Requires C1, plus TOTP enrollment by that staff member through a hosted-capable
-path (C2). The Appendix A utility is local-only and cannot be used here.
+Requires migration 0002 to be applied and verified on the intended project,
+the staff account to be owner-created/confirmed, and the staff member to have
+successfully enrolled TOTP through `/mfa/setup` while not yet listed as an
+administrator (C2). The Appendix A utility is local-only and cannot be used
+here.
 
 ```sql
 INSERT INTO public.platform_admins (user_id, note)
@@ -432,15 +448,18 @@ WHERE email = 'admin@your-domain.example';
 -- expect: INSERT 0 1 (0 means the e-mail did not match; do not retry blindly)
 ```
 
-Then the staff member checks their own access, with the same checks as the
-local utility's `verify` mode (Appendix A):
-- signed in with a password only: `get_my_context()` returns
-  `is_platform_admin: false`, `platform_admin_mfa_required: true`
-- after entering a TOTP code (`aal2`): `is_platform_admin: true`
+The owner verifies the inserted row and records the operator/ticket in its
+`note`. The initial SQL operation has no authenticated application actor;
+retain the change ticket as the provisioning record. Then the staff member
+signs out/in and verifies:
+- password-only session (`aal1`): `get_my_context()` returns
+  `is_platform_admin: false`, `platform_admin_mfa_required: true`;
+- after TOTP verification (`aal2`): `is_platform_admin: true`.
 
-Remove an administrator with
-`DELETE FROM public.platform_admins WHERE user_id = '<uuid>';`. Both changes
-are recorded in `audit_logs`.
+The trigger rejects removing or reassigning the final platform administrator,
+including deletion of that Auth user. To revoke one administrator, first
+verify another authorized administrator remains, then use the owner-controlled
+SQL process. No API role or Edge Function can write `platform_admins`.
 
 ### F4. Follow-ups
 
@@ -582,7 +601,7 @@ previously in `security.md`.
 - [ ] Cloudflare Pages environment variables contain only the public `VITE_*` values
 - [ ] `expire_stale_invitations()` scheduled
 - [ ] Every Edge Function reviewed against [edge-function-contract.md](edge-function-contract.md)
-- [ ] Temporary MFA bootstrap utility removed once the frontend MFA screen exists (Appendix A)
+- [ ] Temporary local-only MFA bootstrap utility retired after the hosted frontend MFA flow is verified, or its continued local-only use is explicitly approved (Appendix A)
 
 ---
 
@@ -618,15 +637,17 @@ The implementation also:
 - exits with 0 (success), 1 (failed), 2 (usage or refused input), 3 (`verify`:
   aal2 reached but not a platform admin) or 130 (interrupted)
 
-Making it hosted-capable later is a code change that needs its own security
-review and approval. It is not a configuration switch.
+The frontend MFA flow is the intended hosted path once it is configured and
+deployed. Making this utility hosted-capable would still require a separate
+code change, security review and approval; it is not a configuration switch.
 
 ### Problem
 
 Platform-admin privileges require an `aal2` JWT. Getting one requires a
-verified TOTP factor. Enrolling a factor needs a signed-in client, which
-doesn't exist yet: no frontend, and the Dashboard can't enroll factors for a
-user.
+verified TOTP factor. When this local-only utility was introduced, the
+frontend MFA screen did not exist. The frontend now has that flow, but this
+utility remains strictly local-only and the Dashboard can't enroll a factor
+on a user's behalf.
 
 ### Proposal
 

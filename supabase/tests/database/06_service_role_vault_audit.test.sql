@@ -160,11 +160,12 @@ SELECT ok(EXISTS (SELECT 1 FROM public.audit_logs
 -- User deletion keeps the actor on existing audit rows.
 SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000006a1","role":"authenticated"}';
-SELECT public.create_invitation('a6000000-0000-4000-8000-000000000000', 'someone@a6.test', 'client');
+UPDATE public.profiles SET full_name = 'Owner A6 Updated'
+WHERE id = '00000000-0000-4000-8000-0000000006a1';
 RESET ROLE;
 DELETE FROM auth.users WHERE id = '00000000-0000-4000-8000-0000000006a1';
 SELECT ok(EXISTS (SELECT 1 FROM public.audit_logs
-                  WHERE action = 'tenant_invitations.insert'
+                  WHERE action = 'profiles.update'
                     AND user_id = '00000000-0000-4000-8000-0000000006a1'),
     'user delete: audit rows keep the actor id');
 

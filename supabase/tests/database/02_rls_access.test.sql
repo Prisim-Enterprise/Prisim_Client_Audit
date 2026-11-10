@@ -255,8 +255,8 @@ SELECT ok(NOT private.can_read_tenant_object('b0000000-0000-4000-8000-0000000000
 SELECT throws_ok($$ INSERT INTO public.ad_accounts (tenant_id, provider, external_account_id)
                     VALUES ('b0000000-0000-4000-8000-000000000000', 'google', 'aal1-attempt') $$,
     '42501', NULL, 'admin aal1: cannot write tenant data');
-SELECT throws_ok($$ SELECT public.create_invitation('a0000000-0000-4000-8000-000000000000', 'x@a.test', 'owner') $$,
-    '42501', NULL, 'admin aal1: cannot create invitations');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a0000000-0000-4000-8000-000000000000', 'invitation.create') $$,
+    '42501', NULL, 'admin aal1: cannot authorize invitation creation');
 SELECT results_eq($$ SELECT user_id FROM public.platform_admins $$,
     $$ VALUES ('00000000-0000-4000-8000-00000000ad01'::uuid) $$, 'admin aal1: may still read own platform_admins row');
 

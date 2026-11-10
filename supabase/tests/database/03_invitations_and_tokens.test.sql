@@ -20,9 +20,15 @@ INSERT INTO auth.users (id, email, email_confirmed_at, aud, role) VALUES
 
 INSERT INTO public.platform_admins (user_id) VALUES ('00000000-0000-4000-8000-0000000003ad');
 
--- Raw tokens returned by create_invitation, kept only for this test.
+-- Test-only token inputs stand in for Edge Function Web Crypto output.
 CREATE TEMP TABLE issued (label TEXT PRIMARY KEY, id UUID, token TEXT);
-GRANT ALL ON issued TO authenticated;
+CREATE TEMP TABLE invite_actions (label TEXT PRIMARY KEY, id UUID);
+GRANT ALL ON issued, invite_actions TO authenticated, service_role;
+CREATE FUNCTION pg_temp.invite_token_hash(p_token TEXT)
+RETURNS TEXT
+LANGUAGE sql
+IMMUTABLE
+AS $$ SELECT encode(sha256(convert_to(p_token, 'UTF8')), 'hex') $$;
 
 INSERT INTO public.tenants (id, business_name, slug, status) VALUES
     ('a3000000-0000-4000-8000-000000000000', 'Invite Co',     'invite-co',     'active'),
@@ -92,36 +98,99 @@ SELECT is((SELECT role FROM public.tenant_memberships WHERE user_id = '00000000-
     'owner', 'invite: accepting never downgrades an existing role');
 
 -- -----------------------------------------------------
--- create_invitation (owner 3a4): DB-generated token, normalized e-mail
+-- Invitation creation is authorized by an aal2 platform-admin action.
+-- The browser role cannot execute the token-hashing RPC.
 -- -----------------------------------------------------
-INSERT INTO issued
-SELECT 'mixed', invitation_id, invitation_token
-FROM public.create_invitation('a3000000-0000-4000-8000-000000000000', '  Mixed.Case@INV.test ', 'viewer');
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create') $$,
+    '42501', NULL, 'tenant owner: cannot authorize platform invitation creation');
 
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal1"}';
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create') $$,
+    '42501', NULL, 'platform admin aal1: cannot authorize invitation creation');
+SELECT throws_ok($$ SELECT public.create_invitation(gen_random_uuid(), 'a3000000-0000-4000-8000-000000000000', 'x@inv.test', 'client', repeat('a', 64)) $$,
+    '42501', NULL,     'authenticated: cannot execute the invitation hash-storage RPC');
+
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
+INSERT INTO invite_actions
+SELECT 'mixed', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'resend-1', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'resend-2', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'expired-replacement', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'delivery-failure', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'invalid-role', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'malformed-email', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+INSERT INTO invite_actions
+SELECT 'suspended', action_id FROM public.begin_privileged_action('c3000000-0000-4000-8000-000000000000', 'invitation.create');
+
+RESET ROLE;
+SET LOCAL ROLE service_role;
+SET LOCAL request.jwt.claims TO '{"role":"service_role"}';
+
+INSERT INTO issued
+SELECT 'mixed', invitation_id, repeat('a', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'mixed'),
+    'a3000000-0000-4000-8000-000000000000', '  Mixed.Case@INV.test ', 'viewer', pg_temp.invite_token_hash(repeat('a', 64)));
+SELECT throws_ok(format('SELECT * FROM public.create_invitation(%L, %L, %L, %L, %L)',
+    (SELECT id FROM invite_actions WHERE label = 'mixed'),
+    'a3000000-0000-4000-8000-000000000000', 'another@inv.test', 'client', repeat('9', 64)),
+    '42501', NULL, 'create: invitation action cannot be reused for a second target');
 SELECT ok((SELECT token ~ '^[0-9a-f]{64}$' FROM issued WHERE label = 'mixed'),
-    'create: returns a 256-bit hex token');
+    'Edge Function input: 256-bit hexadecimal token');
 SELECT is((SELECT email FROM public.tenant_invitations WHERE id = (SELECT id FROM issued WHERE label = 'mixed')),
     'mixed.case@inv.test', 'create: e-mail is trimmed and lower-cased');
-SELECT throws_ok($$ SELECT public.create_invitation('a3000000-0000-4000-8000-000000000000', 'not-an-email', 'client') $$,
+SELECT throws_ok(format('SELECT * FROM public.create_invitation(%L, %L, %L, %L, %L)',
+    (SELECT id FROM invite_actions WHERE label = 'malformed-email'),
+    'a3000000-0000-4000-8000-000000000000', 'not-an-email', 'client', pg_temp.invite_token_hash(repeat('1', 64))),
     '23514', NULL, 'create: malformed e-mail rejected');
-SELECT throws_ok($$ SELECT public.create_invitation('c3000000-0000-4000-8000-000000000000', 'x@inv.test', 'client') $$,
-    '42501', NULL, 'create: cannot invite into a tenant the caller does not manage');
+SELECT throws_ok(format('SELECT * FROM public.create_invitation(%L, %L, %L, %L, %L)',
+    (SELECT id FROM invite_actions WHERE label = 'suspended'),
+    'c3000000-0000-4000-8000-000000000000', 'x@inv.test', 'client', pg_temp.invite_token_hash(repeat('2', 64))),
+    '22023', NULL, 'create: cannot invite into a suspended tenant');
+SELECT throws_ok(format('SELECT * FROM public.create_invitation(%L, %L, %L, %L, %L)',
+    (SELECT id FROM invite_actions WHERE label = 'invalid-role'),
+    'a3000000-0000-4000-8000-000000000000', 'x@inv.test', 'superuser', pg_temp.invite_token_hash(repeat('3', 64))),
+    '22023', NULL, 'create: unsupported tenant role rejected');
 
 -- Resend replaces the earlier pending invitation and kills its token.
 INSERT INTO issued
-SELECT 'resend-1', invitation_id, invitation_token
-FROM public.create_invitation('a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'client');
+SELECT 'resend-1', invitation_id, repeat('b', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'resend-1'),
+    'a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'client', pg_temp.invite_token_hash(repeat('b', 64)));
 INSERT INTO issued
-SELECT 'resend-2', invitation_id, invitation_token
-FROM public.create_invitation('a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'manager');
+SELECT 'resend-2', invitation_id, repeat('c', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'resend-2'),
+    'a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'manager', pg_temp.invite_token_hash(repeat('c', 64)));
 SELECT is((SELECT status FROM public.tenant_invitations WHERE id = (SELECT id FROM issued WHERE label = 'resend-1')),
     'revoked', 'resend: the earlier pending invitation is revoked');
 
 -- An expired pending invitation is closed as expired when re-invited.
-SELECT public.create_invitation('a3000000-0000-4000-8000-000000000000', 'other@inv.test', 'client');
+INSERT INTO issued
+SELECT 'expired-replacement', invitation_id, repeat('d', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'expired-replacement'),
+    'a3000000-0000-4000-8000-000000000000', 'other@inv.test', 'client', pg_temp.invite_token_hash(repeat('d', 64)));
 SELECT is((SELECT status FROM public.tenant_invitations WHERE id = 'a3000000-0000-4000-8000-0000000000e2'),
     'expired', 'resend: an overdue pending invitation is marked expired');
+INSERT INTO issued
+SELECT 'delivery-failure', invitation_id, repeat('4', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'delivery-failure'),
+    'a3000000-0000-4000-8000-000000000000', 'delivery@inv.test', 'client', pg_temp.invite_token_hash(repeat('4', 64)));
+SELECT lives_ok(format('SELECT public.fail_invitation_delivery(%L, %L)',
+    (SELECT id FROM invite_actions WHERE label = 'delivery-failure'),
+    (SELECT id FROM issued WHERE label = 'delivery-failure')),
+    'delivery failure: pending invitation can be revoked');
+SELECT is((SELECT status FROM public.tenant_invitations WHERE id = (SELECT id FROM issued WHERE label = 'delivery-failure')),
+    'revoked', 'delivery failure: token is invalidated before reporting failure');
 
+RESET ROLE;
+SET LOCAL ROLE authenticated;
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
 -- Revoke through the RPC; terminal invitations cannot be revoked again.
 SELECT lives_ok($$ SELECT public.revoke_invitation('a3000000-0000-4000-8000-0000000000e3') $$,
     'revoke: owner revokes a pending invitation');
@@ -140,10 +209,18 @@ SELECT throws_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FRO
 SELECT lives_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FROM issued WHERE label = 'resend-2')),
     'former: joins with the current invitation');
 
-SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
+INSERT INTO invite_actions
+SELECT 'stale', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+RESET ROLE;
+SET LOCAL ROLE service_role;
 INSERT INTO issued
-SELECT 'stale', invitation_id, invitation_token
-FROM public.create_invitation('a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'owner');
+SELECT 'stale', invitation_id, repeat('e', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'stale'),
+    'a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'owner', pg_temp.invite_token_hash(repeat('e', 64)));
+RESET ROLE;
+SET LOCAL ROLE authenticated;
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
 SELECT lives_ok($$ SELECT public.deactivate_member('a3000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000003a6') $$,
     'inactive: owner deactivates the member');
 SELECT is((SELECT status FROM public.tenant_invitations WHERE id = (SELECT id FROM issued WHERE label = 'stale')),
@@ -155,9 +232,17 @@ SELECT throws_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FRO
     '22023', NULL, 'inactive: an old invitation cannot restore access');
 
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
+INSERT INTO invite_actions
+SELECT 'rejoin', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
+RESET ROLE;
+SET LOCAL ROLE service_role;
 INSERT INTO issued
-SELECT 'rejoin', invitation_id, invitation_token
-FROM public.create_invitation('a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'viewer');
+SELECT 'rejoin', invitation_id, repeat('f', 64)
+FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'rejoin'),
+    'a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'viewer', pg_temp.invite_token_hash(repeat('f', 64)));
+RESET ROLE;
+SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a6","role":"authenticated"}';
 SELECT lives_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FROM issued WHERE label = 'rejoin')),
     'inactive: a fresh invitation re-admits the member');
@@ -212,6 +297,15 @@ SELECT ok(EXISTS (SELECT 1 FROM public.audit_logs
 SELECT ok(NOT EXISTS (SELECT 1 FROM public.audit_logs
                       WHERE entity_type = 'tenant_invitations' AND details::text LIKE '%token_hash%'),
     'invite: token hashes are never copied into the audit log');
+SELECT ok(NOT EXISTS (SELECT 1 FROM public.audit_logs
+                      WHERE entity_type = 'tenant_invitations' AND details::text LIKE '%invitation_token%'),
+    'invite: raw token values are never copied into audit records');
+SELECT results_eq(
+    $$ SELECT user_id FROM public.audit_logs
+       WHERE action = 'tenant_invitations.insert'
+         AND entity_id = (SELECT id FROM issued WHERE label = 'mixed') $$,
+    $$ VALUES ('00000000-0000-4000-8000-0000000003ad'::uuid) $$,
+    'invite: service-role insertion is attributed to the authorized platform admin');
 
 
 -- =====================================================

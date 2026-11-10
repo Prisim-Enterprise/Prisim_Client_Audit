@@ -24,8 +24,11 @@ INSERT INTO auth.users (id, email, email_confirmed_at, aud, role) VALUES
     ('00000000-0000-4000-8000-0000000008c2', 'former@c8.test', NOW(), 'authenticated', 'authenticated'),
     ('00000000-0000-4000-8000-0000000008d1', 'owner@d8.test',  NOW(), 'authenticated', 'authenticated'),
     ('00000000-0000-4000-8000-0000000008e1', 'owner@e8.test',  NOW(), 'authenticated', 'authenticated'),
-    ('00000000-0000-4000-8000-0000000008ad', 'staff@p8.test',  NOW(), 'authenticated', 'authenticated');
-INSERT INTO public.platform_admins (user_id) VALUES ('00000000-0000-4000-8000-0000000008ad');
+    ('00000000-0000-4000-8000-0000000008ad', 'staff@p8.test',  NOW(), 'authenticated', 'authenticated'),
+    ('00000000-0000-4000-8000-0000000008ae', 'staff2@p8.test', NOW(), 'authenticated', 'authenticated');
+INSERT INTO public.platform_admins (user_id) VALUES
+    ('00000000-0000-4000-8000-0000000008ad'),
+    ('00000000-0000-4000-8000-0000000008ae');
 
 INSERT INTO public.tenants (id, business_name, slug) VALUES
     ('a8000000-0000-4000-8000-000000000000', 'Owner A', 'owner-a'),
@@ -133,6 +136,26 @@ RESET ROLE;
 SELECT throws_ok($$ UPDATE public.tenant_memberships SET role = 'viewer'
                     WHERE user_id = '00000000-0000-4000-8000-0000000008d1' $$,
     '23514', NULL, 'table owner (SQL): cannot downgrade the last active owner');
+
+-- A controlled SQL owner may revoke a non-final administrator, but cannot
+-- remove, reassign, or cascade-delete the final administrator.
+SELECT lives_ok($$ DELETE FROM public.platform_admins
+                  WHERE user_id = '00000000-0000-4000-8000-0000000008ae' $$,
+    'platform admin: a non-final administrator can be revoked');
+SELECT throws_ok($$ DELETE FROM public.platform_admins
+                   WHERE user_id = '00000000-0000-4000-8000-0000000008ad' $$,
+    '23514', NULL, 'platform admin: the final administrator cannot be revoked');
+SELECT throws_ok($$ TRUNCATE public.platform_admins $$,
+    '23514', NULL, 'platform admin: the administrator table cannot be truncated');
+SELECT throws_ok($$ UPDATE public.platform_admins
+                    SET user_id = '00000000-0000-4000-8000-0000000008a3'
+                    WHERE user_id = '00000000-0000-4000-8000-0000000008ad' $$,
+    '23514', NULL, 'platform admin: the final administrator cannot be reassigned');
+SELECT throws_ok($$ DELETE FROM auth.users
+                   WHERE id = '00000000-0000-4000-8000-0000000008ad' $$,
+    '23514', NULL, 'platform admin: Auth cascade cannot remove the final administrator');
+SELECT ok(EXISTS (SELECT 1 FROM public.platform_admins WHERE user_id = '00000000-0000-4000-8000-0000000008ad'),
+    'platform admin: failed Auth deletion preserves the final admin row');
 
 
 -- =====================================================

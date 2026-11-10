@@ -83,8 +83,8 @@ SELECT results_eq($$ SELECT user_id FROM public.tenant_memberships $$,
     $$ VALUES ('00000000-0000-4000-8000-0000000004a3'::uuid) $$, 'manager: sees only own membership (admin+ sees all)');
 SELECT is_empty($$ SELECT id FROM public.tenant_invitations $$, 'manager: cannot read invitations');
 SELECT is_empty($$ SELECT id FROM public.audit_logs $$,         'manager: cannot read audit logs');
-SELECT throws_ok($$ SELECT public.create_invitation('a4000000-0000-4000-8000-000000000000', 'x@a4.test', 'client') $$,
-    '42501', NULL, 'manager: cannot invite');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a4000000-0000-4000-8000-000000000000', 'invitation.create') $$,
+    '42501', NULL, 'manager: cannot authorize invitation creation');
 SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4', 'client') $$,
     '42501', NULL, 'manager: cannot change roles');
 
@@ -134,16 +134,8 @@ SELECT ok((SELECT count(*) FROM public.audit_logs) > 0, 'admin: reads own tenant
 SELECT ok(NOT EXISTS (SELECT 1 FROM public.audit_logs WHERE tenant_id IS DISTINCT FROM 'a4000000-0000-4000-8000-000000000000'),
     'admin: sees no audit entries of other tenants or the platform');
 
-SELECT lives_ok($$ SELECT public.create_invitation('a4000000-0000-4000-8000-000000000000', 'new.client@a4.test', 'manager') $$,
-    'admin: can invite up to manager');
-SELECT throws_ok($$ SELECT public.create_invitation('a4000000-0000-4000-8000-000000000000', 'boss@a4.test', 'admin') $$,
-    '42501', NULL, 'admin: cannot invite an admin');
-SELECT throws_ok($$ SELECT public.create_invitation('a4000000-0000-4000-8000-000000000000', 'boss@a4.test', 'owner') $$,
-    '42501', NULL, 'admin: cannot invite an owner');
-SELECT throws_ok($$ SELECT public.create_invitation('b4000000-0000-4000-8000-000000000000', 'x@b4.test', 'client') $$,
-    '42501', NULL, 'admin: cannot invite into another tenant');
-SELECT throws_ok($$ SELECT public.create_invitation('a4000000-0000-4000-8000-000000000000', 'x@a4.test', 'superuser') $$,
-    '22023', NULL, 'admin: unknown role rejected');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a4000000-0000-4000-8000-000000000000', 'invitation.create') $$,
+    '42501', NULL, 'tenant admin: cannot authorize platform invitation creation');
 
 SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4', 'client') $$,
     'admin: can change a viewer to client');
@@ -165,13 +157,6 @@ SELECT results_eq(
          AND details -> 'new' ->> 'user_id' = '00000000-0000-4000-8000-0000000004a4' $$,
     $$ VALUES ('00000000-0000-4000-8000-0000000004a2'::uuid, 'authenticated'::text) $$,
     'audit: role change attributed to the admin who made it');
-SELECT results_eq(
-    $$ SELECT user_id FROM public.audit_logs
-       WHERE action = 'tenant_invitations.insert' AND details -> 'new' ->> 'email' = 'new.client@a4.test' $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000004a2'::uuid) $$,
-    'audit: invitation attributed to the inviter');
-SELECT is((SELECT invited_by FROM public.tenant_invitations WHERE email = 'new.client@a4.test'),
-    '00000000-0000-4000-8000-0000000004a2'::uuid, 'invite: invited_by is the caller, not a request field');
 SET LOCAL ROLE authenticated;
 
 
@@ -232,8 +217,8 @@ SELECT ok((public.get_my_context() -> 'user_id') = 'null'::jsonb, 'no sub: conte
 SELECT is(jsonb_array_length(public.get_my_context() -> 'memberships'), 0, 'no sub: context has no memberships');
 SELECT throws_ok($$ SELECT public.accept_invitation('roles-fixture-token-a4-0000000000000') $$,
     '42501', NULL, 'no sub: cannot accept invitations');
-SELECT throws_ok($$ SELECT public.create_invitation('a4000000-0000-4000-8000-000000000000', 'x@a4.test', 'client') $$,
-    '42501', NULL, 'no sub: cannot create invitations');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a4000000-0000-4000-8000-000000000000', 'invitation.create') $$,
+    '42501', NULL, 'no sub: cannot authorize invitation creation');
 
 -- Same with aal2 but no sub: MFA alone grants nothing.
 SET LOCAL request.jwt.claims TO '{"role":"authenticated","aal":"aal2"}';
