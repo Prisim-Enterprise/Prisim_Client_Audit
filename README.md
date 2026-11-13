@@ -8,16 +8,33 @@ reports.
 - **Client users** belong to one or more tenants and only ever see their own
   tenant's data, with permissions set by their tenant role.
 
-> **Status:** frontend authentication foundation and local remediation for
-> migration `20261105120000_security_hardening.sql` are present. Migration 0002
-> is pending in production and remains **NO-GO** pending local database tests
-> and final review.
+> **Status:** the full application is implemented: client management,
+> invitations, Meta and Google Ads OAuth, daily sync, campaign analytics, the
+> audit engine with a staff review workflow, PDF reports in private storage
+> and client report access. The hosted database still has only migration 0001,
+> which is why sign-in currently stops at "Account access unavailable"
+> (`get_my_context()` is missing). Three migrations are prepared and **not
+> applied**; see [docs/production-rollout.md](docs/production-rollout.md).
+
+## What's in the app
+
+| Area | Staff (`/admin`, aal2) | Client (`/app/:slug`) |
+|---|---|---|
+| Overview | Platform counters, audits awaiting review, failing connections, recent syncs | 30-day spend/conversions, daily trend, latest published audit, reports |
+| Clients & team | Create/edit/suspend clients, invite members (email), roles, revoke | Owners/admins manage roles and access (invites go through PRISIM) |
+| Ad accounts | Connect on a client's behalf, sync, backfill, connection health, sync history | Managers+ connect Meta/Google (read-only), choose accounts, sync now |
+| Analytics | Per-client performance tab | Campaign analytics: KPIs, daily trend, spend by campaign, sortable table |
+| Audits | Run the engine (18 rules, scored 0–100), review/dismiss/annotate findings, edit summary, publish, archive | Published audits only, without dismissed findings |
+| Reports | Generate PDF (internal or shared), share/unshare, delete | Download shared reports via one-minute signed URLs |
+| Activity | Database-written audit trail | – |
+
+Realtime updates refresh sync status, accounts, audits and reports as they change.
 
 ## Stack
 
 | Layer | Technology | Hosting (free tier) |
 |---|---|---|
-| Frontend | React, TypeScript, Vite, Tailwind CSS, shadcn/ui, React Query, React Router | Cloudflare Pages |
+| Frontend | React, TypeScript, Vite, Tailwind CSS, shadcn/ui, React Query, React Router | Vercel |
 | Auth | Supabase Auth (e-mail + password, invite-only) | Supabase |
 | Database | Supabase PostgreSQL 17 with Row Level Security | Supabase |
 | Files | Supabase Storage (private `reports` bucket) | Supabase |
@@ -35,17 +52,54 @@ for the limits that implies.
 │   ├── architecture.md       System design, request flows, roles
 │   ├── database-schema.md    Tables, relationships, RLS matrix
 │   ├── deployment-checklist.md  Authoritative hosted deployment and go-live procedure
+│   ├── production-rollout.md  What the audit platform adds to the rollout, secrets, approvals
 │   ├── edge-function-contract.md  Mandatory rules for Edge Functions
 │   └── security.md           Threat model, secrets, operational rules
 ├── frontend/                 React + TypeScript + Vite application
 │   ├── .env.example          Public frontend environment variables
-│   └── src/                  Authentication, routes, layouts and shared UI
+│   └── src/
+│       ├── lib/api/          PortalApi contract, Supabase implementation, errors
+│       ├── features/         Analytics, connections, audits, reports, team panels
+│       ├── pages/            Staff (admin/) and client (client/) pages, OAuth callback
+│       ├── demo/             Demo mode: synthetic fixtures + in-memory API (never in production builds)
+│       └── server/           Tests for the shared Edge Function modules
 ├── supabase/
 │   ├── config.toml           Local development stack configuration
+│   ├── functions/            Edge Functions: invite-tenant-member, ad-connections,
+│   │                         sync-ad-data, run-audit, generate-report; _shared/ holds
+│   │                         the audit engine, PDF builder and Meta/Google clients
 │   ├── migrations/           Ordered SQL migrations (source of truth)
 │   ├── seed.sql              Local-only demo data
 │   └── tests/database/       pgTAP tests (RLS, integrity, invitations, vault)
 └── package.json              Supabase CLI (dev dependency) and local scripts
+```
+
+## Run and inspect it
+
+**Demo mode (no credentials, no backend).** Every screen works against
+clearly labelled synthetic fixtures, using the real audit engine and PDF
+builder. Nothing is sent to Supabase.
+
+```bash
+cd frontend
+npm install
+npm run dev:demo        # http://localhost:5173 - pick Staff, Client owner or Client viewer
+```
+
+Try: Staff → Audits → "Onboarding audit" → dismiss a finding → Publish →
+Generate & share with client → Download (the PDF carries a SYNTHETIC
+watermark). Then sign out, pick Client owner and open Reports.
+
+**Live mode** uses the hosted project and needs the migrations applied first
+(see the status note above): `npm run dev` with `frontend/.env.local`.
+
+**Validation** (repository root, no Docker):
+
+```bash
+npm install
+npm test                # secret scan, frontend typecheck, 74 Vitest tests, Deno check of all functions + invite tests
+npm run sql:parse       # parses every migration, function body and pgTAP file with the PostgreSQL 17 parser
+npm --prefix frontend run build:production
 ```
 
 ## Frontend development

@@ -46,10 +46,17 @@ SELECT results_eq(
         ('begin_privileged_action(uuid,text,uuid)'),
         ('change_member_role(uuid,uuid,text)'),
         ('deactivate_member(uuid,uuid)'),
+        ('get_campaign_performance(uuid,date,date,uuid)'),
+        ('get_daily_performance(uuid,date,date,uuid)'),
         ('get_my_context()'),
+        ('get_platform_overview()'),
+        ('get_tenant_members(uuid)'),
         ('get_tenant_sync_status(uuid)'),
         ('is_tenant_member(uuid)'),
-        ('revoke_invitation(uuid)') $$,
+        ('revoke_invitation(uuid)'),
+        ('save_audit_run(uuid,jsonb,jsonb)'),
+        ('set_ad_account_sync(uuid,uuid[])'),
+        ('set_audit_run_status(uuid,text,text)') $$,
     'authenticated can execute exactly the approved public functions');
 
 -- Private helpers callable by authenticated (needed inside RLS policies).
@@ -58,6 +65,7 @@ SELECT results_eq(
        WHERE nspname = 'private' AND has_function_privilege('authenticated', oid, 'EXECUTE')
        ORDER BY 1 $$,
     $$ VALUES
+        ('private.can_read_report_object(text)'),
         ('private.can_read_tenant_object(text)'),
         ('private.can_view_profile(uuid)'),
         ('private.has_tenant_role(uuid,text)'),
@@ -76,14 +84,20 @@ SELECT results_eq(
          AND NOT has_function_privilege('authenticated', oid, 'EXECUTE')
        ORDER BY 1 $$,
     $$ VALUES
+        ('claim_sync_job(uuid)'),
+        ('complete_sync_job(uuid,boolean,text,jsonb)'),
         ('create_invitation(uuid,uuid,text,text,text)'),
         ('create_oauth_connection(uuid,uuid,text)'),
         ('delete_oauth_tokens(uuid,uuid)'),
+        ('enqueue_scheduled_sync_jobs()'),
         ('expire_stale_invitations()'),
         ('fail_invitation_delivery(uuid,uuid)'),
         ('get_oauth_tokens(uuid)'),
+        ('ingest_ad_account_data(uuid,uuid,jsonb,jsonb)'),
+        ('set_connection_status(uuid,text)'),
         ('start_sync_job(uuid,uuid,text)'),
-        ('store_oauth_tokens(uuid,text,text,timestamp with time zone,uuid)') $$,
+        ('store_oauth_tokens(uuid,text,text,timestamp with time zone,uuid)'),
+        ('upsert_discovered_ad_accounts(uuid,uuid,jsonb,text,text,text[])') $$,
     'service_role-only public functions are exactly the approved RPCs');
 
 -- private.use_privileged_action binds identities; only definer RPCs may call it.

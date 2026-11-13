@@ -4,7 +4,7 @@
 
 ```
                     ┌──────────────────────────────────────┐
-  Browser           │ Cloudflare Pages                     │
+  Browser           │ Vercel                               │
   (staff / client)  │ React SPA (static files only)        │
         │           └──────────────────────────────────────┘
         │  HTTPS, publishable key + user JWT
@@ -19,13 +19,13 @@
 │                            • public schema: business data + RPCs    │
 │                            • private schema: helpers, credentials   │
 │                            • Vault: encrypted OAuth tokens          │
-│                            • pg_cron: schedules sync jobs (planned) │
+│                            • pg_cron: hourly sync, daily cleanup    │
 │                                                                     │
 │  Storage ── private `reports` bucket, path <tenant_id>/<file>       │
 │                                                                     │
 │  Edge Functions (Deno) ── the only backend; service_role lives here │
-│     invite-user · manage-members · oauth-start · oauth-callback     │
-│     sync-runner · generate-report                         (planned) │
+│     invite-tenant-member · ad-connections · sync-ad-data            │
+│     run-audit · generate-report (user JWT; no service_role needed)  │
 └─────────────────────────────────────────────────────────────────────┘
         │  OAuth 2.0, Marketing / Ads APIs
         ▼
@@ -34,10 +34,10 @@
 
 Decisions:
 
-- **Supabase Edge Functions are the only application backend.** No
-  Cloudflare Workers, so secrets live in one place.
-- **Cloudflare Pages only hosts static files.** It holds no secrets and makes
-  no privileged calls.
+- **Supabase Edge Functions are the only application backend.** Secrets live
+  in one place.
+- **Vercel only hosts the static frontend.** It receives public `VITE_*`
+  configuration and makes no privileged calls.
 - **PostgreSQL is the security boundary.** The browser talks to the Data API
   with the user's JWT, and RLS decides what is visible. Frontend route guards
   are only for user experience.
@@ -126,44 +126,77 @@ not possible through the API.
    role. The acceptance page removes the invitation query token from browser
    history immediately.
 
-### Ad-platform connection (planned)
+### Ad-platform connection
 
-1. A manager+ user starts OAuth via the `oauth-start` function, which uses a
-   signed `state` bound to user and tenant.
-2. `oauth-callback` exchanges the code, creates or updates
-   `oauth_connections`, and calls `store_oauth_tokens` (`service_role` only).
-   The tokens are encrypted in Vault and never reach the browser.
-3. Discovered ad accounts are written to `ad_accounts`.
+1. A manager+ user (or aal2 staff) calls `ad-connections` `start`. The
+   function obtains an `oauth.connect` privileged action with the caller's JWT,
+   `create_oauth_connection` creates a pending connection and binds the action
+   to it, and the function returns the provider consent URL with an
+   HMAC-signed `state` (action, connection, tenant, provider, user, nonce,
+   10-minute expiry). Google uses PKCE; the verifier is derived from the
+   state nonce, so nothing is stored between requests.
+2. Meta/Google redirect to the SPA at `/oauth/callback`, which posts `code`
+   and `state` to `ad-connections` `complete` and clears them from the URL.
+   The function verifies the signature, expiry and that the caller is the
+   user who started, exchanges the code server-side (Meta: long-lived token),
+   and stores tokens with `store_oauth_tokens` using the bound action.
+3. Discovered ad accounts (Meta `me/adaccounts`; Google accessible customers
+   and manager clients with their `login-customer-id`) are written with
+   `upsert_discovered_ad_accounts`. The user then selects accounts with
+   `set_ad_account_sync` (their own JWT, manager+).
+4. `disconnect` uses an `oauth.disconnect` action, asks the provider to revoke
+   (best effort) and purges Vault with `delete_oauth_tokens`.
 
-### Daily sync (planned)
+### Sync
 
-1. `pg_cron` inserts `sync_jobs` rows and calls `sync-runner` via `pg_net`.
-2. `sync-runner` reads tokens with `get_oauth_tokens`, calls the Ads APIs,
-   upserts `campaigns` and `daily_metrics` with
-   `ON CONFLICT (ad_account_id, campaign_id, metric_date)`, and writes
-   `sync_logs`.
-3. Clients see only `get_tenant_sync_status()`, never raw job errors.
+1. Manual: `sync-ad-data` `start` -> `sync.start` action -> `start_sync_job`;
+   the job is processed after the 202 response with `EdgeRuntime.waitUntil`.
+2. Scheduled: pg_cron runs `private.dispatch_scheduled_sync()` hourly, which
+   queues due daily jobs (`enqueue_scheduled_sync_jobs`) and calls the
+   function through `pg_net` with the `x-prisim-cron-secret` header.
+3. The worker claims jobs with `claim_sync_job` (`FOR UPDATE SKIP LOCKED`),
+   refreshes Google tokens when they expire, fetches campaigns and daily
+   campaign insights (backfill 90 days, manual 30, daily re-reads the last
+   7), and upserts them with `ingest_ad_account_data` in batches of 5,000.
+   `complete_sync_job` records the result; staff see errors, clients see only
+   `get_tenant_sync_status()`.
 
-### Reports (planned)
+### Audits
 
-`generate-report` renders a PDF, uploads it to `reports/<tenant_id>/<report_id>.pdf`
-with `service_role`, and sets `reports.status = 'ready'`. Users download it
-via the Storage API; the storage policies check the tenant folder.
+`run-audit` (aal2 staff, their own JWT) reads `get_campaign_performance` /
+`get_daily_performance` (SECURITY INVOKER, so RLS applies), runs the shared
+audit engine (`supabase/functions/_shared/audit/engine.ts`) and stores a draft
+with `save_audit_run`. Staff review findings (severity, dismiss, notes,
+summary) and publish with `set_audit_run_status`, which stamps the reviewer,
+writes `audit_scores` history and makes the run immutable (trigger). Clients
+read published runs and non-dismissed findings only.
+
+### Reports
+
+`generate-report` (aal2 staff, their own JWT) renders the audit with pdf-lib,
+uploads `reports/<tenant_id>/<report_id>.pdf` and marks the row `ready`,
+`internal` or `client`. A report can be shared only when ready and its audit
+is published. Clients download through signed URLs; the storage policy lets a
+member read a file only when a matching shared, ready report row exists.
 
 ## Frontend structure
 
 ```
 frontend/src/
-  app/            router, query/auth providers, route guards
-  components/     accessible shared UI, authentication shell, portal layout
+  app/            router, query/auth/API providers, route guards
+  components/     shared UI, charts, authentication shell, portal layout
   context/        authenticated user, memberships and tenant selection
-  lib/            Supabase client, public env validation, auth contracts
-  pages/           login/recovery/reset/invitation/MFA and portal dashboards
-  styles.css       Tailwind-based application styles
+  lib/api/        PortalApi contract, Supabase implementation, error mapping, realtime hook
+  features/       analytics, connections, audits, reports and team panels
+  pages/          auth pages, staff (admin/) and client (client/) portals, OAuth callback
+  demo/           demo mode only: synthetic fixtures and an in-memory PortalApi
+  server/         Vitest suites for the shared Edge Function modules
 ```
 
-The existing frontend is an authentication foundation. Business features and
-Edge Functions listed as planned above are not implied to be implemented.
+All data access goes through `PortalApi`. The Supabase implementation is used
+in local and production modes; `npm run dev:demo` swaps in the demo
+implementation. Vite removes the demo branch from every non-demo build, so
+production bundles contain no synthetic data.
 
 Because some columns are protected by column-level grants
 (`oauth_connections`, `tenant_invitations`), queries on those tables must list
@@ -171,7 +204,7 @@ their columns explicitly. `select('*')` will fail on them.
 
 ## Free-tier limits
 
-Limits at the time of writing. Check the current Supabase and Cloudflare
+Limits at the time of writing. Check the current Supabase and Vercel
 pricing pages before relying on them.
 
 | Constraint | Impact | Mitigation |

@@ -13,7 +13,7 @@ export function ConfigurationError({ errors }: { errors: string[] }) {
         <p className="mt-2 text-sm leading-6 text-slate-600">
           The portal can’t connect until its public environment settings are configured. Add the values to
           <code className="mx-1 rounded bg-slate-100 px-1.5 py-0.5 text-xs">frontend/.env.local</code>
-          for local development or your Cloudflare Pages project settings for deployment.
+          for local development or your Vercel project settings for deployment.
         </p>
         <div className="mt-6 rounded-xl border border-amber-200 bg-amber-50 p-4">
           <p className="flex items-center gap-2 text-sm font-semibold text-amber-900">

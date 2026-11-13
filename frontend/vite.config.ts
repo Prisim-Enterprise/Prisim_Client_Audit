@@ -15,10 +15,22 @@ function readNodeEnvironment(name: string) {
 const envDir = readNodeEnvironment("PRISIM_VITE_ENV_DIR") ?? ".";
 const outDir = readNodeEnvironment("PRISIM_VITE_OUT_DIR") ?? "dist";
 
+// File path of ../supabase/functions (works for POSIX and Windows drive paths).
+const sharedDir = decodeURIComponent(new URL("../supabase/functions", import.meta.url).pathname)
+  .replace(/^\/([A-Za-z]:)/, "$1")
+  .replace(/\/$/, "");
+
 export default defineConfig({
   envDir,
   plugins: [react()],
+  resolve: {
+    // Audit engine, report builder and formatters are shared with the Edge
+    // Functions. Their bare imports (pdf-lib) resolve from this package.
+    alias: [{ find: /^@functions\//, replacement: `${sharedDir}/` }],
+    dedupe: ["pdf-lib"],
+  },
   server: {
+    fs: { allow: [".", sharedDir] },
     host: "localhost",
     port: 5173,
     strictPort: true,
@@ -41,6 +53,7 @@ export default defineConfig({
           if (id.includes("/zod/")) return "validation";
           if (id.includes("/lucide-react/")) return "icons";
           if (id.includes("/@radix-ui/")) return "ui-primitives";
+          if (id.includes("/pdf-lib/") || id.includes("/@pdf-lib/") || id.includes("/pako/")) return "pdf";
         },
       },
     },
@@ -49,5 +62,6 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: "./src/test/setup.ts",
     css: true,
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 });

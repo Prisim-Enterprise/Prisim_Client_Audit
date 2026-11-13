@@ -7,6 +7,8 @@ explains the schema; if it disagrees with the migrations, the migrations win.
 |---|---|---|
 | `202611050001_initial_schema.sql` | **Applied to hosted. Frozen.** | Core tables, indexes, `is_tenant_member`, read-only RLS |
 | `20261105120000_security_hardening.sql` | **Approved and committed. Not yet applied to hosted.** Apply only via [deployment-checklist.md](deployment-checklist.md). | Roles, platform admins, Vault tokens, invitations, storage, integrity, explicit grants |
+| `20261111100000_audit_platform.sql` | **Not applied.** See [production-rollout.md](production-rollout.md). | Audit runs/findings, report visibility, analytics and sync RPCs, account selection, Realtime |
+| `20261111100100_scheduled_jobs.sql` | **Not applied.** | pg_cron schedules (sync dispatch, invitation expiry, pruning) when available |
 
 Items marked *(0002)* below are introduced by the hardening migration.
 
@@ -126,3 +128,21 @@ readable only by `service_role`.
   `REVOKE ALL ON FUNCTION ... FROM PUBLIC, anon;`. `01_structure.test.sql`
   fails if anon can execute any public function.
 - Add pgTAP coverage in `supabase/tests/database/` for any new access rule.
+
+## Audit platform additions (20261111100000)
+
+| Object | Access | Purpose |
+|---|---|---|
+| `audit_runs` | aal2 staff manage; members read `status = 'published'` | Frozen engine result and review workflow (draft -> in_review -> published -> archived). Published rows are immutable (trigger); publishing only via `set_audit_run_status`. |
+| `audit_findings` | aal2 staff manage; members read non-dismissed findings of published runs | Rule id, category, severity, evidence, spend at risk, reviewer note (client-visible). |
+| `reports.visibility` | `internal` / `client` | Clients read only `client` + `ready`; sharing requires a published audit (trigger). |
+| `ad_accounts.sync_enabled`, `metadata`, `last_synced_at` | members read | Account selection, Google `login_customer_id`. |
+| `campaigns.daily_budget`, `bid_strategy`, `channel_type` | members read | Inputs for budget and bidding rules. |
+| `daily_metrics.conversion_value` | column grant | ROAS. |
+| `get_campaign_performance`, `get_daily_performance` | authenticated, SECURITY INVOKER | Period totals from campaign-level rows (RLS applies). |
+| `get_tenant_members` | tenant owner/admin, aal2 staff | Member directory with email. |
+| `set_ad_account_sync` | tenant manager+, aal2 staff | Choose synced accounts of a connection. |
+| `save_audit_run`, `set_audit_run_status`, `get_platform_overview` | aal2 staff | Audit storage, review workflow, dashboard counters. |
+| `upsert_discovered_ad_accounts` | service_role + bound `oauth.connect` action | OAuth account discovery. |
+| `claim_sync_job`, `ingest_ad_account_data`, `complete_sync_job`, `enqueue_scheduled_sync_jobs`, `set_connection_status` | service_role | Sync worker. |
+| storage `reports: members read shared report files` | members | Replaces the folder-wide read; uses `private.can_read_report_object`. |

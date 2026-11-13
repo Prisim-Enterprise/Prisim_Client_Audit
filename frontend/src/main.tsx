@@ -11,15 +11,17 @@ const rootElement = document.getElementById("root");
 if (!rootElement) throw new Error("The frontend root element is missing.");
 
 const root = createRoot(rootElement);
-const envResult = parsePublicEnv(import.meta.env, import.meta.env.MODE);
 
-if (!envResult.success) {
-  root.render(
-    <StrictMode>
-      <ConfigurationError errors={envResult.errors} />
-    </StrictMode>,
-  );
-} else {
+function renderApp() {
+  const envResult = parsePublicEnv(import.meta.env, import.meta.env.MODE);
+  if (!envResult.success) {
+    root.render(
+      <StrictMode>
+        <ConfigurationError errors={envResult.errors} />
+      </StrictMode>,
+    );
+    return;
+  }
   const supabase = createSupabaseBrowserClient(envResult.data);
   root.render(
     <StrictMode>
@@ -28,4 +30,18 @@ if (!envResult.success) {
       </Providers>
     </StrictMode>,
   );
+}
+
+if (import.meta.env.MODE === "demo") {
+  // Synthetic fixtures and no backend. Vite removes this branch from every
+  // non-demo build, so production bundles never contain demo data.
+  void import("./demo/DemoRoot").then(({ DemoRoot }) => {
+    root.render(
+      <StrictMode>
+        <DemoRoot />
+      </StrictMode>,
+    );
+  });
+} else {
+  renderApp();
 }

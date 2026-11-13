@@ -17,7 +17,20 @@ import { totpSchema, type TotpValues } from "../../lib/validation";
 type Factor = { id: string; status: string };
 
 export function MfaPage({ bootstrapEnrollment = false }: { bootstrapEnrollment?: boolean }) {
-  const { context, contextLoading, refreshContext, supabase } = useAuth();
+  const { supabase } = useAuth();
+  // Demo mode has no authentication backend.
+  if (!supabase) return <Navigate to="/" replace />;
+  return <MfaForm bootstrapEnrollment={bootstrapEnrollment} supabase={supabase} />;
+}
+
+function MfaForm({
+  bootstrapEnrollment,
+  supabase,
+}: {
+  bootstrapEnrollment: boolean;
+  supabase: NonNullable<ReturnType<typeof useAuth>["supabase"]>;
+}) {
+  const { context, contextLoading, refreshContext } = useAuth();
   const navigate = useNavigate();
   const [factorId, setFactorId] = useState<string | null>(null);
   const [setupUri, setSetupUri] = useState<string | null>(null);

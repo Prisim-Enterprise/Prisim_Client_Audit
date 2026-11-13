@@ -395,6 +395,24 @@ deno_version = 2
 [functions.invite-tenant-member]
 verify_jwt = true
 
+[functions.ad-connections]
+verify_jwt = true
+import_map = "./functions/ad-connections/deno.json"
+
+[functions.run-audit]
+verify_jwt = true
+import_map = "./functions/run-audit/deno.json"
+
+[functions.generate-report]
+verify_jwt = true
+import_map = "./functions/generate-report/deno.json"
+
+# pg_cron calls this function with the x-prisim-cron-secret header instead of
+# a JWT; the function authenticates every request itself (user JWT or secret).
+[functions.sync-ad-data]
+verify_jwt = false
+import_map = "./functions/sync-ad-data/deno.json"
+
 # [edge_runtime.secrets]
 # secret_key = "env(SECRET_VALUE)"
 

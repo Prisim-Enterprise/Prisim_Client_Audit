@@ -91,7 +91,7 @@ Dashboard menu names change over time. Find each setting by name.
 | Leaked-password protection | **Enable if your plan offers it** | Plan-dependent. At the time of writing it is not available on every plan. Do not assume it is on. If it isn't available, record "not available on current plan" in the deployment notes and rely on the length and complexity rules. Re-check when the plan changes. |
 | Access token (JWT) expiry | **3600 s or less** | Roles, suspension and MFA are re-read from the database on every request, but a stolen JWT stays valid until it expires |
 | Site URL | Production frontend URL. During local Vite development, configure only the exact localhost redirect required for the test. | |
-| Redirect URLs | Exact production URL(s) only, plus `http://localhost:5173` only while developing | No wildcards on shared domains (`*.pages.dev`). Invitation and magic links go to these. |
+| Redirect URLs | Exact production URL(s) only, plus `http://localhost:5173` only while developing | No wildcards on shared hosting domains. Invitation and magic links go to these. |
 | Custom SMTP | A real provider before go-live | The built-in sender is rate-limited and for testing only |
 | Rate limits | Defaults or tighter | |
 
@@ -598,10 +598,47 @@ previously in `security.md`.
 - [ ] At least two staff members can reach `aal2`, or a recorded recovery path exists for a lost authenticator (Appendix A, "Lost device")
 - [ ] Dashboard → Advisors → Security shows no errors
 - [ ] Edge Function secrets set; none in the frontend bundle (`npm run check:secrets` passes, including on the built `frontend/dist`)
-- [ ] Cloudflare Pages environment variables contain only the public `VITE_*` values
+- [ ] Vercel production environment variables contain the required public `VITE_*` values only:
+      `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, `VITE_APP_URL`, and `VITE_APP_ENV=production`
 - [ ] `expire_stale_invitations()` scheduled
 - [ ] Every Edge Function reviewed against [edge-function-contract.md](edge-function-contract.md)
 - [ ] Temporary local-only MFA bootstrap utility retired after the hosted frontend MFA flow is verified, or its continued local-only use is explicitly approved (Appendix A)
+
+### Vercel frontend project
+
+Configure the existing `frontend/` directory as the Vercel project root:
+
+| Vercel setting | Value |
+|---|---|
+| Framework preset | Vite |
+| Root directory | `frontend` |
+| Install command | `npm install` |
+| Build command | `npm run build` |
+| Output directory | `dist` |
+| Production branch | The explicitly approved release branch |
+
+Set these variables in the **Production** environment scope. All `VITE_*`
+values are public and are included in browser assets:
+
+| Variable | Production value |
+|---|---|
+| `VITE_SUPABASE_URL` | `https://svqzxrkkakfiigrsndzn.supabase.co` |
+| `VITE_SUPABASE_PUBLISHABLE_KEY` | The project's public publishable key |
+| `VITE_APP_URL` | The exact HTTPS Vercel production URL or configured custom domain |
+| `VITE_APP_ENV` | `production` |
+
+Do not add Supabase service-role/secret keys, database credentials, SMTP
+credentials, OAuth client secrets or encryption keys to Vercel frontend
+variables. Those belong in Supabase Edge Function secrets. Disable automatic
+Preview deployments or leave their environment variables unset until a
+separately approved preview policy exists; there is no staging backend.
+
+The checked-in [Vercel configuration](../frontend/vercel.json) rewrites SPA
+routes to `index.html`, so routes such as `/login`, `/mfa/setup` and
+`/accept-invite` load on direct navigation. This config does not deploy the
+site or configure Supabase Auth. Add the exact production URL and required
+redirect paths to Supabase Auth's redirect allow-list before using email
+recovery or invitation flows.
 
 ---
 

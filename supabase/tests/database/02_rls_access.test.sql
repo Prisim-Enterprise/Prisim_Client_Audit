@@ -64,9 +64,10 @@ INSERT INTO public.audit_scores (tenant_id, platform, score) VALUES
     ('a0000000-0000-4000-8000-000000000000', 'meta', 70),
     ('b0000000-0000-4000-8000-000000000000', 'meta', 60);
 
-INSERT INTO public.reports (tenant_id, report_name, status, storage_path) VALUES
-    ('a0000000-0000-4000-8000-000000000000', 'A report', 'ready', 'a0000000-0000-4000-8000-000000000000/r1.pdf'),
-    ('b0000000-0000-4000-8000-000000000000', 'B report', 'ready', 'b0000000-0000-4000-8000-000000000000/r1.pdf');
+-- Clients read only reports shared with them (visibility added in 20261111100000).
+INSERT INTO public.reports (tenant_id, report_name, status, storage_path, visibility) VALUES
+    ('a0000000-0000-4000-8000-000000000000', 'A report', 'ready', 'a0000000-0000-4000-8000-000000000000/r1.pdf', 'client'),
+    ('b0000000-0000-4000-8000-000000000000', 'B report', 'ready', 'b0000000-0000-4000-8000-000000000000/r1.pdf', 'client');
 
 INSERT INTO public.sync_jobs (id, tenant_id, connection_id, provider, status, error_message, completed_at) VALUES
     ('a0000000-0000-4000-8000-00000000005a', 'a0000000-0000-4000-8000-000000000000', 'a0000000-0000-4000-8000-0000000000c0', 'meta', 'failed',    'internal: upstream 500 for act_a', NULL),
@@ -121,6 +122,19 @@ SELECT is_empty(
 
 SELECT is((public.get_my_context() ->> 'is_platform_admin')::boolean, FALSE, 'client: context says not platform admin');
 SELECT is(jsonb_array_length(public.get_my_context() -> 'memberships'), 1, 'client: context lists one membership');
+SELECT is(public.get_my_context() ->> 'user_id', '00000000-0000-4000-8000-0000000000a2',
+    'client: context identifies only the authenticated user');
+SELECT results_eq(
+    $$ SELECT membership.value ->> 'tenant_id'
+       FROM jsonb_array_elements(public.get_my_context() -> 'memberships') AS membership(value) $$,
+    $$ VALUES ('a0000000-0000-4000-8000-000000000000'::text) $$,
+    'client: context contains only the caller''s tenant membership');
+SELECT is(
+    (SELECT count(*)::int
+     FROM jsonb_array_elements(public.get_my_context() -> 'memberships') AS membership(value)
+     WHERE membership.value ->> 'tenant_id' = 'b0000000-0000-4000-8000-000000000000'),
+    0,
+    'client: context does not reveal another tenant membership');
 SELECT ok(public.is_tenant_member('a0000000-0000-4000-8000-000000000000'), 'client: is_tenant_member(A) is true');
 SELECT ok(NOT public.is_tenant_member('b0000000-0000-4000-8000-000000000000'), 'client: is_tenant_member(B) is false');
 

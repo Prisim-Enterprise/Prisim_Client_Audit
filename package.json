@@ -15,9 +15,13 @@
     "db:lint": "node scripts/supabase-local.mjs lint",
     "functions:serve": "node scripts/supabase-local.mjs functions-serve",
     "functions:check": "node scripts/supabase-local.mjs functions-check",
-    "check:secrets": "node scripts/check-secrets.mjs"
+    "check:secrets": "node scripts/check-secrets.mjs",
+    "test": "node scripts/check-secrets.mjs && npm --prefix frontend run typecheck && npm --prefix frontend test && node scripts/supabase-local.mjs functions-check",
+    "sql:parse": "node scripts/parse-sql.mjs"
   },
   "devDependencies": {
+    "deno": "^2.9.6",
+    "libpg-query": "^18.2.2",
     "supabase": "^3.0.0"
   }
 }

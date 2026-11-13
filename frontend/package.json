@@ -4,14 +4,16 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node scripts/dev-server.mjs",
     "build": "tsc -b && vite build --mode production",
     "build:production": "tsc -b && vite build --mode production",
     "preview": "vite preview --mode production",
     "preview:production": "vite preview --mode production",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc -b --pretty"
+    "typecheck": "tsc -b --pretty",
+    "dev:demo": "node scripts/dev-server.mjs --mode demo",
+    "build:demo": "tsc -b && vite build --mode demo --outDir dist-demo"
   },
   "dependencies": {
     "@hookform/resolvers": "^5.2.1",
@@ -20,6 +22,7 @@
     "@supabase/supabase-js": "^2.57.4",
     "@tanstack/react-query": "^5.83.0",
     "lucide-react": "^0.468.0",
+    "pdf-lib": "^1.17.1",
     "qrcode.react": "^4.2.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

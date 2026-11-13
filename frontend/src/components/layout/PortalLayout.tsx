@@ -10,6 +10,8 @@ import {
   LogOut,
   Menu,
   ShieldCheck,
+  TriangleAlert,
+  UserCog,
   Users,
   X,
 } from "lucide-react";
@@ -46,15 +48,19 @@ const clientNavigation = [
   { label: "Campaigns", path: "campaigns", icon: BarChart3 },
   { label: "Audit findings", path: "audits", icon: ShieldCheck },
   { label: "Reports", path: "reports", icon: FileText },
+  { label: "Team", path: "team", icon: UserCog, minimumRole: "admin" as const },
 ];
 
 export function PortalLayout({ portal }: { portal: Portal }) {
-  const { user, profile, memberships, setCurrentTenant, signOut } = useAuth();
+  const { user, profile, memberships, setCurrentTenant, signOut, demo } = useAuth();
   const { tenantSlug } = useParams();
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
   const currentMembership = memberships.find((membership) => membership.slug === tenantSlug) ?? null;
-  const navigation = portal === "staff" ? staffNavigation : clientNavigation;
+  const canManageTeam = currentMembership ? ["owner", "admin"].includes(currentMembership.role) : false;
+  const navigation = portal === "staff"
+    ? staffNavigation
+    : clientNavigation.filter((item) => !("minimumRole" in item) || canManageTeam);
   const root = portal === "staff" ? "/admin" : `/app/${tenantSlug}`;
   const displayName = profile?.full_name?.trim() || user?.email?.split("@")[0] || "Account";
   const initials = displayName.slice(0, 1).toUpperCase();
@@ -78,6 +84,12 @@ export function PortalLayout({ portal }: { portal: Portal }) {
 
   return (
     <div className="min-h-screen bg-[#f6f8fa]">
+      {demo && (
+        <div role="status" className="relative z-50 flex items-center justify-center gap-2 bg-amber-400 px-4 py-1.5 text-center text-xs font-semibold text-amber-950">
+          <TriangleAlert aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+          DEMO MODE — synthetic data only, not real client results. Nothing is saved or sent.
+        </div>
+      )}
       <aside className="fixed inset-y-0 left-0 z-30 hidden w-[252px] flex-col bg-ink-950 text-white lg:flex">
         <div className="flex h-[76px] items-center border-b border-white/[0.08] px-6">
           <Brand light />
@@ -194,7 +206,7 @@ export function PortalLayout({ portal }: { portal: Portal }) {
             </a>
             {portal === "staff" && (
               <span className="hidden items-center gap-1.5 rounded-full bg-accent-50 px-3 py-1.5 text-xs font-medium text-accent-700 sm:inline-flex">
-                <ShieldCheck aria-hidden="true" className="h-3.5 w-3.5" /> MFA verified
+                <ShieldCheck aria-hidden="true" className="h-3.5 w-3.5" /> {demo ? "Demo staff session" : "MFA verified"}
               </span>
             )}
             <DropdownMenu>

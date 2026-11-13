@@ -56,6 +56,13 @@ INSERT INTO storage.objects (bucket_id, name) VALUES
     ('reports', 'c5000000-0000-4000-8000-000000000000/report-1.pdf'),
     ('reports', 'not-a-tenant/stray.pdf');
 
+-- Since 20261111100000, members read a file only when a matching report row
+-- is ready and shared with the client (internal drafts stay hidden; see 10_).
+INSERT INTO public.reports (tenant_id, report_name, status, storage_path, visibility) VALUES
+    ('a5000000-0000-4000-8000-000000000000', 'A report', 'ready', 'a5000000-0000-4000-8000-000000000000/report-1.pdf', 'client'),
+    ('b5000000-0000-4000-8000-000000000000', 'B report', 'ready', 'b5000000-0000-4000-8000-000000000000/report-1.pdf', 'client'),
+    ('c5000000-0000-4000-8000-000000000000', 'S report', 'ready', 'c5000000-0000-4000-8000-000000000000/report-1.pdf', 'client');
+
 SET LOCAL ROLE authenticated;
 
 -- -----------------------------------------------------

@@ -13,14 +13,31 @@ const MfaPage = lazy(() => import("../pages/auth/MfaPage").then((module) => ({ d
 const ResetPasswordPage = lazy(() => import("../pages/auth/ResetPasswordPage").then((module) => ({ default: module.ResetPasswordPage })));
 const ClientDashboard = lazy(() => import("../pages/client/ClientDashboard").then((module) => ({ default: module.ClientDashboard })));
 const StaffDashboard = lazy(() => import("../pages/admin/StaffDashboard").then((module) => ({ default: module.StaffDashboard })));
-const PlaceholderPage = lazy(() => import("../pages/PlaceholderPage").then((module) => ({ default: module.PlaceholderPage })));
+const ClientsPage = lazy(() => import("../pages/admin/ClientsPage").then((module) => ({ default: module.ClientsPage })));
+const ClientDetailPage = lazy(() => import("../pages/admin/ClientDetailPage").then((module) => ({ default: module.ClientDetailPage })));
+const ConnectionsPage = lazy(() => import("../pages/admin/ConnectionsPage").then((module) => ({ default: module.ConnectionsPage })));
+const AuditsPage = lazy(() => import("../pages/admin/AuditsPage").then((module) => ({ default: module.AuditsPage })));
+const ReportsPage = lazy(() => import("../pages/admin/AuditsPage").then((module) => ({ default: module.ReportsPage })));
+const AuditReviewPage = lazy(() => import("../pages/admin/AuditReviewPage").then((module) => ({ default: module.AuditReviewPage })));
+const ActivityPage = lazy(() => import("../pages/admin/ActivityPage").then((module) => ({ default: module.ActivityPage })));
+const AdAccountsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.AdAccountsPage })));
+const CampaignsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.CampaignsPage })));
+const ClientAuditsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientAuditsPage })));
+const ClientAuditDetailPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientAuditDetailPage })));
+const ClientReportsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientReportsPage })));
+const TeamPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.TeamPage })));
+const OAuthCallbackPage = lazy(() => import("../pages/OAuthCallbackPage").then((module) => ({ default: module.OAuthCallbackPage })));
+// Statically removed from non-demo builds (Vite replaces import.meta.env.MODE).
+const DemoLoginPage = import.meta.env.MODE === "demo" || import.meta.env.MODE === "test"
+  ? lazy(() => import("../demo/DemoLoginPage").then((module) => ({ default: module.DemoLoginPage })))
+  : null;
 
 export function App() {
   return (
     <BrowserRouter>
       <Suspense fallback={<LoadingState />}>
         <Routes>
-          <Route path="/login" element={<GuestOnly><LoginPage /></GuestOnly>} />
+          <Route path="/login" element={<GuestOnly><LoginRoute /></GuestOnly>} />
           <Route path="/forgot-password" element={<GuestOnly><ForgotPasswordPage /></GuestOnly>} />
           <Route path="/reset-password" element={<ResetPasswordPage />} />
           <Route path="/accept-invite" element={<AcceptInvitePage />} />
@@ -28,23 +45,28 @@ export function App() {
           <Route path="/mfa/setup" element={<MfaEnrollmentGate />} />
 
           <Route element={<AuthenticatedGate />}>
+            <Route path="/oauth/callback" element={<OAuthCallbackPage />} />
             <Route path="/admin" element={<PlatformAdminGate />}>
               <Route element={<PortalLayout portal="staff" />}>
                 <Route index element={<StaffDashboard />} />
-                <Route path="clients" element={<PlaceholderPage title="Clients" description="Client business management will be available here." />} />
-                <Route path="connections" element={<PlaceholderPage title="Connections" description="Secure Meta and Google account connections will be available here." />} />
-                <Route path="audits" element={<PlaceholderPage title="Audits" description="Review advertising audit findings and recommendations." />} />
-                <Route path="reports" element={<PlaceholderPage title="Reports" description="Create and review client audit reports." />} />
-                <Route path="activity" element={<PlaceholderPage title="Activity" description="Review workspace and account activity." />} />
+                <Route path="clients" element={<ClientsPage />} />
+                <Route path="clients/:tenantId" element={<ClientDetailPage />} />
+                <Route path="connections" element={<ConnectionsPage />} />
+                <Route path="audits" element={<AuditsPage />} />
+                <Route path="audits/:auditId" element={<AuditReviewPage />} />
+                <Route path="reports" element={<ReportsPage />} />
+                <Route path="activity" element={<ActivityPage />} />
               </Route>
             </Route>
             <Route path="/app/:tenantSlug" element={<ClientAccessGate />}>
               <Route element={<PortalLayout portal="client" />}>
                 <Route index element={<ClientDashboard />} />
-                <Route path="accounts" element={<PlaceholderPage title="Ad accounts" description="Connected advertising accounts will appear here." />} />
-                <Route path="campaigns" element={<PlaceholderPage title="Campaigns" description="Campaign performance will appear here once data sync is available." />} />
-                <Route path="audits" element={<PlaceholderPage title="Audit findings" description="Your reviewed audit findings and recommendations will appear here." />} />
-                <Route path="reports" element={<PlaceholderPage title="Reports" description="Your published audit reports will appear here." />} />
+                <Route path="accounts" element={<AdAccountsPage />} />
+                <Route path="campaigns" element={<CampaignsPage />} />
+                <Route path="audits" element={<ClientAuditsPage />} />
+                <Route path="audits/:auditId" element={<ClientAuditDetailPage />} />
+                <Route path="reports" element={<ClientReportsPage />} />
+                <Route path="team" element={<TeamPage />} />
               </Route>
             </Route>
             <Route path="/" element={<HomeRedirect />} />
@@ -55,6 +77,11 @@ export function App() {
       </Suspense>
     </BrowserRouter>
   );
+}
+
+function LoginRoute() {
+  const { demo } = useAuth();
+  return demo && DemoLoginPage ? <DemoLoginPage /> : <LoginPage />;
 }
 
 function GuestOnly({ children }: { children: ReactNode }) {

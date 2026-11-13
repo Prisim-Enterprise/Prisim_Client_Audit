@@ -11,13 +11,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Session, User } from "@supabase/supabase-js";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { friendlyAuthError } from "../lib/auth-errors";
-import { parseAuthContext, type AuthContextData, type TenantMembership, type UserProfile } from "../lib/auth-context";
+import type { AuthContextData, TenantMembership, UserProfile } from "../lib/auth-context";
 import type { Database } from "../lib/database";
-
-type AuthSnapshot = {
-  context: AuthContextData;
-  profile: UserProfile | null;
-};
+import { loadAuthSnapshot } from "../lib/load-auth-snapshot";
 
 type AuthActions = {
   signIn: (email: string, password: string) => Promise<void>;
@@ -30,7 +26,9 @@ type AuthActions = {
 };
 
 export type AuthState = AuthActions & {
-  supabase: SupabaseClient<Database>;
+  /** null in demo mode (no backend). */
+  supabase: SupabaseClient<Database> | null;
+  demo: boolean;
   user: User | null;
   session: Session | null;
   isAuthenticated: boolean;
@@ -44,36 +42,32 @@ export type AuthState = AuthActions & {
   platformRole: "platform_admin" | null;
 };
 
-const AuthContext = createContext<AuthState | null>(null);
+export const AuthContext = createContext<AuthState | null>(null);
 
 type AuthProviderProps = PropsWithChildren<{
   supabase: SupabaseClient<Database>;
   appUrl: string;
 }>;
 
-async function loadAuthSnapshot(
+function loadAuthenticatedSnapshot(
   supabase: SupabaseClient<Database>,
   authenticatedUserId: string,
-): Promise<AuthSnapshot> {
-  const [contextResult, profileResult] = await Promise.all([
-    supabase.rpc("get_my_context"),
-    supabase
-      .from("profiles")
-      .select("id, full_name, avatar_url")
-      .eq("id", authenticatedUserId)
-      .maybeSingle(),
-  ]);
-
-  if (contextResult.error || profileResult.error) {
-    throw new Error(
-      "Your account access could not be loaded. Confirm that migration 20261105120000_security_hardening.sql is applied, then try again.",
-    );
-  }
-
-  return {
-    context: parseAuthContext(contextResult.data, authenticatedUserId),
-    profile: profileResult.data,
-  };
+) {
+  return loadAuthSnapshot(
+    authenticatedUserId,
+    async () => {
+      const { data, error } = await supabase.rpc("get_my_context");
+      return { data, error };
+    },
+    async () => {
+      const { data, error } = await supabase
+        .from("profiles")
+        .select("id, full_name, avatar_url")
+        .eq("id", authenticatedUserId)
+        .maybeSingle();
+      return { data, error };
+    },
+  );
 }
 
 export function AuthProvider({ children, supabase, appUrl }: AuthProviderProps) {
@@ -112,7 +106,7 @@ export function AuthProvider({ children, supabase, appUrl }: AuthProviderProps) 
 
   const contextQuery = useQuery({
     queryKey: ["auth-context", user?.id],
-    queryFn: () => loadAuthSnapshot(supabase, user!.id),
+    queryFn: () => loadAuthenticatedSnapshot(supabase, user!.id),
     enabled: Boolean(user) && !authLoading,
     retry: false,
     staleTime: 0,
@@ -198,6 +192,7 @@ export function AuthProvider({ children, supabase, appUrl }: AuthProviderProps) 
   const value = useMemo<AuthState>(
     () => ({
       supabase,
+      demo: false,
       user,
       session,
       isAuthenticated: Boolean(user),

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,7 +15,6 @@ const commands = {
   "functions-serve": [
     "functions",
     "serve",
-    "invite-tenant-member",
     "--env-file",
     "supabase/functions/.env.example",
   ],
@@ -72,20 +72,38 @@ const [action, ...extraArgs] = process.argv.slice(2);
 if (extraArgs.length > 0) {
   fail("This wrapper accepts no extra arguments; remote or linked targets are not supported.");
 } else if (action === "functions-check") {
-  let spawnFailed = false;
-  const deno = spawn("deno", ["check", "supabase/functions/invite-tenant-member/index.ts"], {
-    cwd: root,
-    stdio: "inherit",
+  // Deno comes from the `deno` npm dev dependency (no global install needed).
+  const runDeno = (args) => new Promise((resolveExit) => {
+    let spawnFailed = false;
+    const executable = process.platform === "win32" ? "npx.cmd" : "npx";
+    const deno = spawn(executable, ["--no-install", "deno", ...args], {
+      cwd: root,
+      stdio: "inherit",
+      shell: process.platform === "win32",
+    });
+    deno.once("error", (error) => {
+      spawnFailed = true;
+      fail(`Unable to run Deno (run npm install at the repository root): ${error.message}`);
+      resolveExit(1);
+    });
+    deno.once("close", (code) => {
+      if (!spawnFailed) resolveExit(code ?? 1);
+    });
   });
-  deno.once("error", (error) => {
-    spawnFailed = true;
-    fail(error.code === "ENOENT"
-      ? "Deno is required for Edge Function checks; install Deno and retry."
-      : `Unable to run Deno: ${error.message}`);
-  });
-  deno.once("close", (code) => {
-    if (!spawnFailed && code !== 0) process.exitCode = code ?? 1;
-  });
+  const functions = ["invite-tenant-member", "ad-connections", "sync-ad-data", "run-audit", "generate-report"];
+  let code = 0;
+  for (const name of functions) {
+    const config = `supabase/functions/${name}/deno.json`;
+    const args = ["check", "--no-lock"];
+    if (existsSync(resolve(root, config))) args.push("--config", config);
+    args.push(`supabase/functions/${name}/index.ts`);
+    code = await runDeno(args);
+    if (code !== 0) break;
+  }
+  if (code === 0) {
+    code = await runDeno(["test", "--no-lock", "supabase/functions/invite-tenant-member/index.test.ts"]);
+  }
+  process.exitCode = code;
 } else if ((action === "reset" || action === "verify") && process.env[localMigrationApproval] !== "1") {
   fail(`Refusing to apply migrations without ${localMigrationApproval}=1. Set it only after migration 0002 is approved for local validation.`);
 } else if (action === "verify") {

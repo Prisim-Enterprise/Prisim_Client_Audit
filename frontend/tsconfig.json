@@ -14,8 +14,25 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "@functions/*": ["../supabase/functions/*"],
+      "pdf-lib": ["./node_modules/pdf-lib"]
+    },
     "jsx": "react-jsx",
     "types": ["vite/client", "vitest/globals"]
   },
-  "include": ["src", "vite.config.ts"]
+  "include": [
+    "src",
+    "vite.config.ts",
+    "../supabase/functions/_shared/audit",
+    "../supabase/functions/_shared/report",
+    "../supabase/functions/_shared/providers",
+    "../supabase/functions/_shared/format.ts",
+    "../supabase/functions/_shared/oauth-state.ts",
+    "../supabase/functions/_shared/http.ts",
+    "../supabase/functions/_shared/sync.ts",
+    "../supabase/functions/ad-connections/handler.ts",
+    "../supabase/functions/sync-ad-data/handler.ts"
+  ]
 }

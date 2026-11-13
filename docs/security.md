@@ -44,8 +44,8 @@ pre-flight) and [edge-function-contract.md](edge-function-contract.md)
 
 | Secret | Where it lives | Never |
 |---|---|---|
-| Publishable / anon key | `frontend/.env.local`, Cloudflare Pages env vars | n/a, it is public |
-| `service_role` / `sb_secret_...` key | Supabase Edge Functions only (injected automatically). See "Service-role key and Vault boundary" below. | In the frontend, in `VITE_*` variables, in git, in Cloudflare, in API responses or logs |
+| Publishable / anon key | `frontend/.env.local`, Vercel production environment variables | n/a, it is public |
+| `service_role` / `sb_secret_...` key | Supabase Edge Functions only (injected automatically). See "Service-role key and Vault boundary" below. | In the frontend, in `VITE_*` variables, in git, in Vercel frontend variables, in API responses or logs |
 | Database password | Password manager of the project owner | In git, `.env` files, chat or tickets |
 | Meta app secret, Google client secret, Google Ads developer token | `npx supabase secrets set NAME=value` | In the frontend or git |
 | OAuth access/refresh tokens | Supabase Vault via `store_oauth_tokens` | In `public` tables, logs or API responses |
@@ -79,10 +79,10 @@ Functions.**
 
 | Rule | How it is enforced |
 |---|---|
-| The key never enters frontend environment variables | Only `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, `VITE_APP_URL` and `VITE_APP_ENV` exist (`frontend/.env.example`). Every `VITE_*` value is bundled into public JavaScript. `npm run check:secrets` (part of `npm run db:test`) fails on any `sb_secret_` key, any `service_role` JWT anywhere in the working tree (including `frontend/.env*` and a built `frontend/dist`), and any `VITE_*` name containing SERVICE / SECRET / PRIVATE / PASSWORD. Run it on CI and before each Cloudflare deploy. |
+| The key never enters frontend environment variables | Only `VITE_SUPABASE_URL`, `VITE_SUPABASE_PUBLISHABLE_KEY`, `VITE_APP_URL` and `VITE_APP_ENV` exist (`frontend/.env.example`). Every `VITE_*` value is bundled into public JavaScript. `npm run check:secrets` (part of `npm run db:test`) fails on any `sb_secret_` key, any `service_role` JWT anywhere in the working tree (including `frontend/.env*` and a built `frontend/dist`), and any `VITE_*` name containing SERVICE / SECRET / PRIVATE / PASSWORD. Run it on CI and before each Vercel production deployment. |
 | The key is never returned through an API | The key is injected into Edge Functions by Supabase (`SUPABASE_SERVICE_ROLE_KEY` / secret key env). No table, view or RPC stores or returns it. Edge Functions MUST NOT echo environment variables, include them in errors, or log request headers ([edge-function-contract.md](edge-function-contract.md) §1). |
 | OAuth tokens are never returned to browser clients | `get_oauth_tokens`, `store_oauth_tokens` and `delete_oauth_tokens` are executable only by `service_role` (the `07_catalog.test.sql` allowlist). Legacy token columns are NULL by constraint and not selectable. `private.oauth_credentials` and `vault` are not exposed through the Data API. Tested with real JWTs: a signed-in user, and even an aal2 platform admin, get an error from `get_oauth_tokens` (`scripts/auth-api.test.mjs`). Edge Functions MUST NOT put tokens in responses (contract §7). |
-| Only Edge Functions retrieve decrypted OAuth tokens | Edge Functions are the only application component that holds the service key. The frontend (Cloudflare Pages) holds only the publishable key. No other backend exists. A new component that needs tokens requires a security review and an update to this section. |
+| Only Edge Functions retrieve decrypted OAuth tokens | Edge Functions are the only application component that holds the service key. The frontend (Vercel) holds only the publishable key. No other backend exists. A new component that needs tokens requires a security review and an update to this section. |
 
 Accepted residual risk: a leaked service key exposes every tenant's tokens.
 Mitigations: rotate immediately (see above), then revoke and reconnect the
