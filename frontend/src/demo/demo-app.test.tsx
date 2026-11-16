@@ -41,7 +41,8 @@ describe("demo application", () => {
     await choose(/Client owner/);
     expect(await screen.findByText(/Welcome, Rohan/)).toBeInTheDocument();
     expect(await screen.findByText("Q4 performance audit")).toBeInTheDocument();
-    expect(screen.getAllByRole("link", { name: "Team" }).length).toBeGreaterThan(0);
+    // Client users never manage access: there is no Team / onboarding area.
+    expect(screen.queryByRole("link", { name: "Team" })).not.toBeInTheDocument();
 
     await userEvent.click(screen.getAllByRole("link", { name: "Campaigns" })[0]);
     expect(await screen.findByRole("heading", { name: "Campaign analytics" })).toBeInTheDocument();
@@ -60,15 +61,51 @@ describe("demo application", () => {
 });
 
 describe("core workflows", () => {
-  it("client owner connects Meta through the OAuth callback and returns to account selection", async () => {
+  it("client owner sees ad accounts read-only; connections are managed by PRISIM staff", async () => {
     await choose(/Client owner/);
     await userEvent.click((await screen.findAllByRole("link", { name: "Ad accounts" }))[0]);
+    expect(await screen.findByText("Connected ad accounts")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Connect|Disconnect|Sync now|Backfill/ })).not.toBeInTheDocument();
+  }, 20_000);
+
+  it("staff connect Meta for a client through the OAuth callback and return to account selection", async () => {
+    await choose(/PRISIM staff/);
+    await userEvent.click(screen.getAllByRole("link", { name: "Clients" })[0]);
+    await userEvent.click(await screen.findByRole("link", { name: "Harbor Realty (Demo)" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Connections" }));
     const connectButtons = await screen.findAllByRole("button", { name: /Connect/ });
     await waitFor(() => expect(connectButtons[0]).toBeEnabled());
     await userEvent.click(connectButtons[0]);
     expect(await screen.findByText(/Meta Ads connected/, {}, { timeout: 5000 })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Choose ad accounts" }));
     expect(await screen.findByText("Meta account (Demo)")).toBeInTheDocument();
+  }, 20_000);
+
+  it("staff create a client owner account and get a single-use password link", async () => {
+    await choose(/PRISIM staff/);
+    await userEvent.click(screen.getAllByRole("link", { name: "Clients" })[0]);
+    await userEvent.click(await screen.findByRole("link", { name: "Harbor Realty (Demo)" }));
+    expect(await screen.findByText("Onboarding")).toBeInTheDocument();
+    await userEvent.click(await screen.findByRole("tab", { name: "Users" }));
+    await userEvent.type(await screen.findByLabelText("Full name"), "Priya (Demo)");
+    await userEvent.type(screen.getByLabelText("Email address"), "priya.demo@harbor.example");
+    await userEvent.selectOptions(screen.getByLabelText("Role"), "viewer");
+    await userEvent.click(screen.getByRole("button", { name: /Create user/ }));
+    expect(await screen.findByText(/Password link for priya.demo@harbor.example/)).toBeInTheDocument();
+    expect((screen.getByLabelText("Password link") as HTMLInputElement).value).toMatch(/\/reset-password\?token_hash=.+&type=recovery$/);
+    await userEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(await screen.findByText("Priya (Demo)")).toBeInTheDocument();
+  }, 20_000);
+
+  it("rejects invalid client user details before calling the server", async () => {
+    await choose(/PRISIM staff/);
+    await userEvent.click(screen.getAllByRole("link", { name: "Clients" })[0]);
+    await userEvent.click(await screen.findByRole("link", { name: "Harbor Realty (Demo)" }));
+    await userEvent.click(await screen.findByRole("tab", { name: "Users" }));
+    await userEvent.type(await screen.findByLabelText("Email address"), "not-an-email");
+    await userEvent.click(screen.getByRole("button", { name: /Create user/ }));
+    expect(await screen.findByLabelText("Email address")).toHaveAttribute("aria-invalid", "true");
+    expect(screen.queryByText(/Password link for/)).not.toBeInTheDocument();
   }, 20_000);
 
   it("staff publish a reviewed audit and generate a shared PDF report", async () => {
@@ -103,6 +140,20 @@ describe("demo API rules mirror the database", () => {
     await api.setReportVisibility(reportId, "client");
     expect((await api.listReports(DEMO_TENANT_IDS.harbor)).find((report) => report.id === reportId)?.visibility).toBe("client");
   }, 20_000);
+
+  it("provisions client users only once and never attaches staff accounts", async () => {
+    const created = await api.createTenantUser({ tenantId: DEMO_TENANT_IDS.harbor, email: "New.User@Harbor.example", role: "viewer" });
+    expect(created).toMatchObject({ accountCreated: true, membership: "created" });
+    await expect(api.createTenantUser({ tenantId: DEMO_TENANT_IDS.harbor, email: "new.user@harbor.example", role: "owner" })).rejects.toThrow(/already has access/);
+    await expect(api.createTenantUser({ tenantId: DEMO_TENANT_IDS.harbor, email: "staff.demo@prisim.example", role: "viewer" })).rejects.toThrow(/staff/);
+    await expect(api.createTenantUser({ tenantId: DEMO_TENANT_IDS.cedar, email: "x@cedar.example", role: "owner" })).rejects.toThrow(/Reactivate/);
+    const link = await api.issuePasswordLink(DEMO_TENANT_IDS.harbor, created.userId);
+    expect(link.url).toContain("token_hash=");
+    await api.deactivateMember(DEMO_TENANT_IDS.harbor, created.userId);
+    await expect(api.issuePasswordLink(DEMO_TENANT_IDS.harbor, created.userId)).rejects.toThrow(/not an active user/);
+    const restored = await api.createTenantUser({ tenantId: DEMO_TENANT_IDS.harbor, email: "new.user@harbor.example", role: "viewer" });
+    expect(restored).toMatchObject({ userId: created.userId, membership: "reactivated" });
+  });
 
   it("protects the last owner", async () => {
     const [owner] = await api.listMembers(DEMO_TENANT_IDS.harbor);

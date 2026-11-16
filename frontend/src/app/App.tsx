@@ -6,7 +6,6 @@ import { LoadingState } from "../components/ui/LoadingState";
 import { useAuth } from "../context/AuthProvider";
 import { PortalLayout } from "../components/layout/PortalLayout";
 
-const AcceptInvitePage = lazy(() => import("../pages/auth/AcceptInvitePage").then((module) => ({ default: module.AcceptInvitePage })));
 const ForgotPasswordPage = lazy(() => import("../pages/auth/ForgotPasswordPage").then((module) => ({ default: module.ForgotPasswordPage })));
 const LoginPage = lazy(() => import("../pages/auth/LoginPage").then((module) => ({ default: module.LoginPage })));
 const MfaPage = lazy(() => import("../pages/auth/MfaPage").then((module) => ({ default: module.MfaPage })));
@@ -25,7 +24,6 @@ const CampaignsPage = lazy(() => import("../pages/client/ClientPages").then((mod
 const ClientAuditsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientAuditsPage })));
 const ClientAuditDetailPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientAuditDetailPage })));
 const ClientReportsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientReportsPage })));
-const TeamPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.TeamPage })));
 const OAuthCallbackPage = lazy(() => import("../pages/OAuthCallbackPage").then((module) => ({ default: module.OAuthCallbackPage })));
 // Statically removed from non-demo builds (Vite replaces import.meta.env.MODE).
 const DemoLoginPage = import.meta.env.MODE === "demo" || import.meta.env.MODE === "test"
@@ -40,7 +38,8 @@ export function App() {
           <Route path="/login" element={<GuestOnly><LoginRoute /></GuestOnly>} />
           <Route path="/forgot-password" element={<GuestOnly><ForgotPasswordPage /></GuestOnly>} />
           <Route path="/reset-password" element={<ResetPasswordPage />} />
-          <Route path="/accept-invite" element={<AcceptInvitePage />} />
+          {/* Retired: accounts are created by PRISIM staff, who send a password link. */}
+          <Route path="/accept-invite" element={<Navigate to="/login" replace />} />
           <Route path="/mfa" element={<AuthenticatedGate allowMfaStepUp><MfaPage /></AuthenticatedGate>} />
           <Route path="/mfa/setup" element={<MfaEnrollmentGate />} />
 
@@ -66,7 +65,6 @@ export function App() {
                 <Route path="audits" element={<ClientAuditsPage />} />
                 <Route path="audits/:auditId" element={<ClientAuditDetailPage />} />
                 <Route path="reports" element={<ClientReportsPage />} />
-                <Route path="team" element={<TeamPage />} />
               </Route>
             </Route>
             <Route path="/" element={<HomeRedirect />} />
@@ -89,10 +87,7 @@ function GuestOnly({ children }: { children: ReactNode }) {
   const location = useLocation();
   if (authLoading || (user && contextLoading)) return <LoadingState />;
   if (user) {
-    const state = location.state as { from?: { pathname?: string }; invitationToken?: string } | null;
-    if (state?.invitationToken) {
-      return <Navigate to="/accept-invite" replace state={{ invitationToken: state.invitationToken }} />;
-    }
+    const state = location.state as { from?: { pathname?: string } } | null;
     return <Navigate to={state?.from?.pathname ?? "/"} replace />;
   }
   return children;

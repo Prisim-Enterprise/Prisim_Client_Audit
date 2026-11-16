@@ -46,6 +46,7 @@ function connectionDeps(overrides: Partial<AdConnectionDependencies> = {}, env =
   const deps: AdConnectionDependencies = {
     env: (name) => env[name],
     authenticate: vi.fn(async () => USER),
+    isPlatformAdmin: vi.fn(async () => true),
     beginAction: vi.fn(async () => ACTION),
     cleanupPendingConnections: vi.fn(async () => undefined),
     createConnection: vi.fn(async () => CONNECTION),
@@ -144,6 +145,63 @@ describe("ad-connections handler", () => {
     expect(JSON.stringify(await body(response))).not.toContain("invalid_grant");
   });
 
+  it("runs the full staff OAuth flow: start, provider consent, callback, completion", async () => {
+    const { handler, deps, provider } = connectionDeps();
+    const started = await handler(request({ action: "start", tenantId: TENANT, provider: "google" }, auth));
+    expect(started.status).toBe(200);
+    const { authorizeUrl } = await body(started) as { authorizeUrl: string };
+    const consent = new URL(authorizeUrl);
+    const state = consent.searchParams.get("state")!;
+    // PKCE challenge is sent to the provider; the verifier never leaves the server.
+    expect(consent.searchParams.get("c")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    // Provider redirects to /oauth/callback; the SPA posts code + state back.
+    const completed = await handler(request({ action: "complete", code: "auth-code", state }, auth));
+    expect(completed.status).toBe(200);
+    expect(await body(completed)).toMatchObject({ connectionId: CONNECTION, tenantId: TENANT, provider: "google", accountsDiscovered: 1 });
+    expect(provider.exchangeCode).toHaveBeenCalledWith("auth-code", expect.any(String));
+    const verifier = (provider.exchangeCode.mock.calls[0] as unknown[])[1] as string;
+    expect(verifier).not.toBe(consent.searchParams.get("c"));
+    expect(deps.storeTokens).toHaveBeenCalledWith(CONNECTION, expect.objectContaining({ accessToken: "access" }), ACTION);
+    expect(deps.saveAccounts).toHaveBeenCalledWith(ACTION, CONNECTION, expect.any(Array), expect.anything(), expect.anything());
+    expect(deps.isPlatformAdmin).toHaveBeenCalledTimes(2);
+    // A tampered state is rejected before any provider call.
+    const tampered = state.slice(0, -2) + (state.endsWith("A") ? "BB" : "AA");
+    const before = provider.exchangeCode.mock.calls.length;
+    expect((await handler(request({ action: "complete", code: "auth-code", state: tampered }, auth))).status).toBe(400);
+    expect(provider.exchangeCode.mock.calls.length).toBe(before);
+  });
+
+  it("denies every action to users who are not aal2 PRISIM staff, before any database or provider call", async () => {
+    const state = await validState();
+    for (const payload of [
+      { action: "providers" },
+      { action: "start", tenantId: TENANT, provider: "google" },
+      { action: "complete", code: "auth-code", state },
+      { action: "disconnect", connectionId: CONNECTION },
+    ]) {
+      const { handler, deps, provider } = connectionDeps({ isPlatformAdmin: vi.fn(async () => false) });
+      const response = await handler(request(payload, auth));
+      expect(response.status).toBe(403);
+      expect(await body(response)).toEqual({ error: "platform_admin_required" });
+      expect(deps.beginAction).not.toHaveBeenCalled();
+      expect(deps.createConnection).not.toHaveBeenCalled();
+      expect(deps.getConnection).not.toHaveBeenCalled();
+      expect(deps.storeTokens).not.toHaveBeenCalled();
+      expect(deps.deleteTokens).not.toHaveBeenCalled();
+      expect(provider.exchangeCode).not.toHaveBeenCalled();
+      expect(provider.revoke).not.toHaveBeenCalled();
+    }
+  });
+
+  it("checks authentication before staff status and staff status before reading the body", async () => {
+    const anonymous = connectionDeps({ authenticate: vi.fn(async () => null) });
+    expect((await anonymous.handler(request({ action: "providers" }, auth))).status).toBe(401);
+    expect(anonymous.deps.isPlatformAdmin).not.toHaveBeenCalled();
+    const client = connectionDeps({ isPlatformAdmin: vi.fn(async () => false) });
+    const malformed = new Request(ORIGIN + "/fn", { method: "POST", headers: { "Content-Type": "application/json", Origin: ORIGIN, ...auth }, body: "{not json" });
+    expect((await client.handler(malformed)).status).toBe(403);
+  });
+
   it("disconnects with an oauth.disconnect action bound to the connection", async () => {
     const { handler, deps, provider } = connectionDeps();
     const response = await handler(request({ action: "disconnect", connectionId: CONNECTION }, auth));
@@ -160,6 +218,7 @@ describe("sync-ad-data handler", () => {
     const deps: SyncHandlerDependencies = {
       cronSecret: CRON,
       authenticate: vi.fn(async () => USER),
+      isPlatformAdmin: vi.fn(async () => true),
       connectionTenant: vi.fn(async () => TENANT),
       beginSyncAction: vi.fn(async () => ACTION),
       startJob: vi.fn(async () => ({ jobId: "job-1" })),
@@ -201,6 +260,29 @@ describe("sync-ad-data handler", () => {
     expect((await denied.handler(request({ action: "start", connectionId: CONNECTION }, auth))).status).toBe(403);
     const busy = syncDeps({ startJob: vi.fn(async () => ({ conflict: true as const })) });
     expect((await busy.handler(request({ action: "start", connectionId: CONNECTION }, auth))).status).toBe(409);
+  });
+
+  it("lets only aal2 PRISIM staff start a manual sync", async () => {
+    const client = syncDeps({ isPlatformAdmin: vi.fn(async () => false) });
+    const response = await client.handler(request({ action: "start", connectionId: CONNECTION }, auth));
+    expect(response.status).toBe(403);
+    expect(await body(response)).toEqual({ error: "platform_admin_required" });
+    expect(client.deps.connectionTenant).not.toHaveBeenCalled();
+    expect(client.deps.beginSyncAction).not.toHaveBeenCalled();
+    expect(client.deps.startJob).not.toHaveBeenCalled();
+    expect(client.deps.background).not.toHaveBeenCalled();
+  });
+
+  it("keeps scheduled sync on the cron secret only (no user, no staff check)", async () => {
+    const { handler, deps } = syncDeps({ isPlatformAdmin: vi.fn(async () => false) });
+    const response = await handler(cronRequest(CRON));
+    expect(response.status).toBe(202);
+    expect(deps.enqueueScheduled).toHaveBeenCalled();
+    expect(deps.isPlatformAdmin).not.toHaveBeenCalled();
+    expect(deps.authenticate).not.toHaveBeenCalled();
+    // A user JWT cannot trigger the scheduled path without the secret.
+    const withJwt = new Request(ORIGIN + "/fn", { method: "POST", headers: { ...auth }, body: JSON.stringify({ action: "run-scheduled" }) });
+    expect((await handler(withJwt)).status).toBe(401);
   });
 
   it("drains the queue within its time budget", async () => {

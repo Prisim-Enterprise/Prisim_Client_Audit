@@ -10,8 +10,8 @@ import type {
   CampaignPerformance,
   Connection,
   DailyPerformance,
+  CreateTenantUserResult,
   IntegrationStatus,
-  Invitation,
   Member,
   OAuthCompletion,
   PlatformOverview,
@@ -28,7 +28,6 @@ import type {
 const TENANT_COLUMNS = "id, business_name, slug, email, status, industry, website, primary_contact_name, created_at, updated_at";
 const CONNECTION_COLUMNS = "id, tenant_id, provider, provider_account_id, account_name, status, token_expires_at, scopes, created_at, updated_at";
 const AD_ACCOUNT_COLUMNS = "id, tenant_id, connection_id, provider, external_account_id, account_name, currency, timezone, status, sync_enabled, last_synced_at";
-const INVITATION_COLUMNS = "id, tenant_id, email, role, status, expires_at, created_at";
 const SYNC_JOB_COLUMNS = "id, tenant_id, connection_id, provider, job_type, status, attempts, started_at, completed_at, error_message, created_at";
 const AUDIT_RUN_COLUMNS = "id, tenant_id, title, period_start, period_end, status, engine_version, overall_score, platform_scores, category_scores, kpis, summary, ad_account_ids, reviewed_at, published_at, created_at, updated_at";
 const FINDING_COLUMNS = "id, tenant_id, audit_run_id, ad_account_id, campaign_id, rule_id, category, platform, severity, title, description, recommendation, evidence, estimated_impact, impact_currency, status, reviewer_note, sort_order";
@@ -121,18 +120,12 @@ export function createSupabaseApi(typedClient: SupabaseClient<never> | SupabaseC
       return unwrap(await supabase.rpc("get_tenant_members", { p_tenant_id: tenantId })) as Member[];
     },
 
-    async listInvitations(tenantId) {
-      return unwrap(
-        await supabase.from("tenant_invitations").select(INVITATION_COLUMNS).eq("tenant_id", tenantId).order("created_at", { ascending: false }).limit(50),
-      ) as Invitation[];
+    async createTenantUser({ tenantId, email, fullName, role }) {
+      return invoke<CreateTenantUserResult>("manage-tenant-user", { action: "create", tenantId, email, fullName: fullName ?? null, role });
     },
 
-    async inviteMember(tenantId, email, role) {
-      await invoke("invite-tenant-member", { tenantId, email, role });
-    },
-
-    async revokeInvitation(invitationId) {
-      unwrap(await supabase.rpc("revoke_invitation", { p_invitation_id: invitationId }));
+    async issuePasswordLink(tenantId, userId) {
+      return invoke<{ url: string }>("manage-tenant-user", { action: "password-link", tenantId, userId });
     },
 
     async changeMemberRole(tenantId, userId, role: TenantRole) {

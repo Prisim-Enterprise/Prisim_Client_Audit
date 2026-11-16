@@ -68,8 +68,15 @@ const FUNCTION_MESSAGES: Record<string, string> = {
   report_generation_failed: "The report could not be generated. Try again.",
   origin_not_allowed: "This application origin is not allowed by the server (check APP_URL).",
   server_configuration_error: "The server is missing required configuration.",
-  invitation_not_created: "The invitation could not be created.",
-  invitation_email_not_sent: "The invitation email could not be sent. Check the Auth SMTP settings.",
+  tenant_not_found: "That client no longer exists.",
+  tenant_not_active: "Reactivate the client before adding users.",
+  already_member: "This person already has access to this client. Change their role instead.",
+  staff_account: "PRISIM staff accounts can't be added to a client or receive client password links.",
+  account_conflict: "An account with this email exists but couldn't be matched. Try again.",
+  account_not_created: "The account could not be created. Try again.",
+  membership_not_saved: "The account's access could not be saved. Nothing was changed.",
+  member_not_found: "This person is not an active user of this client.",
+  link_not_generated: "The password link could not be generated. Try again.",
 };
 
 /** Error from supabase.functions.invoke (FunctionsHttpError / FunctionsFetchError / FunctionsRelayError). */

@@ -86,7 +86,7 @@ function DemoAuth({ children }: PropsWithChildren) {
       signOut: async () => setPersona(null),
       requestPasswordReset: notAvailable,
       updatePassword: notAvailable,
-      acceptInvitation: notAvailable,
+      verifyPasswordLink: notAvailable,
       refreshContext: async () => undefined,
       setCurrentTenant: () => undefined,
     };

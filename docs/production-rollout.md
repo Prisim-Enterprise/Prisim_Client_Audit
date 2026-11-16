@@ -19,7 +19,7 @@ bypass this: tenant roles, platform-admin status and the MFA (aal2) rule all
 come from that function and the RLS helpers next to it.
 
 After the apply, a signed-in user with no membership sees "No workspace
-assigned" until they accept an invitation, and PRISIM staff see admin pages
+assigned" until PRISIM staff add them to a client, and PRISIM staff see admin pages
 only after the first-admin bootstrap (step 4) **and** a TOTP-verified session.
 
 ## 2. Pending migrations (apply in this order, one `db push`)
@@ -29,6 +29,7 @@ only after the first-admin bootstrap (step 4) **and** a TOTP-verified session.
 | `20261105120000_security_hardening.sql` | `get_my_context`, roles, platform admins (aal2), invitations, Vault tokens, privileged actions, append-only audit log, last-owner protection, private `reports` bucket | Local remediation of the three review blockers is in the file. Run checklist phases A–E first. |
 | `20261111100000_audit_platform.sql` | `audit_runs`, `audit_findings`, report visibility, analytics RPCs, sync service RPCs, member directory, account selection, Realtime publication | Depends on 0002. Replaces two policies: `Members read reports` and the folder-wide `reports: tenant members read own folder` storage policy (clients now download only reports shared with them). |
 | `20261111100100_scheduled_jobs.sql` | `pg_cron` schedules: hourly sync dispatch, daily invitation expiry, daily pruning | Enables `pg_cron` / `pg_net` only if available; otherwise a no-op with a NOTICE. |
+| `20261113120000_staff_only_client_management.sql` | Client management and connections become staff-only: member RPCs, privileged actions, account selection and member directory require an aal2 platform admin; `accept_invitation` is not executable by any API role; five client read policies (memberships, invitations, audit logs, connections, member profiles) are dropped | No schema or data change. Not applied yet; apply together with the redeploy of `ad-connections` and `sync-ad-data`. |
 
 Validation done locally without a database: `npm run sql:parse` parses every
 migration, function body and pgTAP file with the PostgreSQL 17 parser. The
@@ -88,7 +89,7 @@ Secrets (names only; values are set by the owner, never committed):
 
 ```bash
 npx supabase secrets set --project-ref svqzxrkkakfiigrsndzn APP_URL=... OAUTH_STATE_SECRET=... CRON_SECRET=...
-npx supabase functions deploy invite-tenant-member ad-connections sync-ad-data run-audit generate-report --project-ref svqzxrkkakfiigrsndzn
+npx supabase functions deploy manage-tenant-user ad-connections sync-ad-data run-audit generate-report --project-ref svqzxrkkakfiigrsndzn
 ```
 
 `sync-ad-data` deploys with `verify_jwt = false` (from `config.toml`) because
@@ -120,9 +121,10 @@ manually.
 ## 7. Supabase Auth and Vercel
 
 - Auth → URL configuration: Site URL = `APP_URL`; redirect allow-list contains
-  `${APP_URL}/accept-invite` and `${APP_URL}/reset-password` (the OAuth
-  callback is not a Supabase Auth redirect). Configure custom SMTP before
-  sending real invitations.
+  `${APP_URL}/reset-password**` (the OAuth callback is not a Supabase Auth
+  redirect). Client accounts are created by staff in the client's Users tab;
+  the user sets a password through a single-use link (see security.md,
+  "Client accounts"). SMTP is only needed for self-service reset e-mails.
 - Vercel project root `frontend/`, env vars `VITE_SUPABASE_URL`,
   `VITE_SUPABASE_PUBLISHABLE_KEY`, `VITE_APP_URL`, `VITE_APP_ENV=production`.
   `frontend/vercel.json` sets the SPA rewrite, a CSP limited to the project's

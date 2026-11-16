@@ -12,7 +12,7 @@ import { EmptyState, PageHeader, SectionCard, StatTile } from "../../components/
 import { useAuth } from "../../context/AuthProvider";
 import { currenciesOf, dailyTotals, formatDate, presetRange, relativeTime, totalsFromCampaigns } from "../../lib/analytics";
 import { queryKeys, useApi, useRealtime } from "../../lib/api/ApiProvider";
-import { roleAtLeast, useWorkspace } from "./workspace";
+import { useWorkspace } from "./workspace";
 
 export function ClientDashboard() {
   const api = useApi();
@@ -63,10 +63,8 @@ export function ClientDashboard() {
         <Card className="overflow-hidden">
           <EmptyState
             icon={<Link2 />}
-            title="Connect your ad accounts to get started"
-            description={roleAtLeast(workspace.role, "manager")
-              ? "Connect Meta Ads or Google Ads with read-only access. PRISIM syncs campaign data daily and uses it for your audits."
-              : "A workspace manager or your PRISIM team will connect your advertising accounts."}
+            title="Your advertising data is being set up"
+            description="Your PRISIM team is connecting your Meta Ads and Google Ads accounts. Performance appears here after the first data sync."
             action={<Link to={`${workspace.base}/accounts`} className="inline-flex items-center gap-1 text-sm font-semibold text-accent-700">Go to ad accounts <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>}
           />
         </Card>

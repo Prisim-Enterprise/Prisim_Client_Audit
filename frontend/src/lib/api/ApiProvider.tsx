@@ -19,7 +19,6 @@ export const queryKeys = {
   tenants: ["tenants"] as const,
   tenant: (tenantId: string) => ["tenants", tenantId] as const,
   members: (tenantId: string) => ["members", tenantId] as const,
-  invitations: (tenantId: string) => ["invitations", tenantId] as const,
   integrations: ["integrations"] as const,
   connections: (tenantId?: string) => ["connections", tenantId ?? "all"] as const,
   adAccounts: (tenantId?: string) => ["ad-accounts", tenantId ?? "all"] as const,

@@ -1,6 +1,7 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { MailPlus, UserX, Users } from "lucide-react";
+import { Check, Copy, KeyRound, UserPlus, UserRoundCheck, UserX, Users } from "lucide-react";
+import { useState } from "react";
 import { useForm } from "react-hook-form";
 import { toast } from "sonner";
 import { z } from "zod";
@@ -8,62 +9,73 @@ import { Alert } from "../../components/ui/Alert";
 import { StatusBadge } from "../../components/ui/Badge";
 import { Button } from "../../components/ui/Button";
 import { ConfirmButton, Select } from "../../components/ui/Controls";
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from "../../components/ui/Dialog";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
 import { EmptyState, QueryView, SectionCard } from "../../components/ui/States";
 import { formatDate } from "../../lib/analytics";
 import { queryKeys, useApi } from "../../lib/api/ApiProvider";
 import { errorMessage } from "../../lib/api/errors";
+import type { ClientUserRole, Member } from "../../lib/api/types";
 import type { TenantRole } from "../../lib/auth-context";
 import { emailSchema } from "../../lib/validation";
 
-const ROLES: Array<{ value: TenantRole; label: string; description: string }> = [
-  { value: "owner", label: "Owner", description: "Full workspace control, including owners and admins" },
-  { value: "admin", label: "Admin", description: "Manages members, sees the activity log" },
-  { value: "manager", label: "Manager", description: "Connects ad accounts and starts syncs" },
-  { value: "viewer", label: "Viewer", description: "Reads dashboards, audits and reports" },
-  { value: "client", label: "Client", description: "Same access as viewer" },
+const ROLES: Array<{ value: ClientUserRole; label: string }> = [
+  { value: "owner", label: "Owner" },
+  { value: "viewer", label: "Viewer" },
 ];
+const LEGACY_ROLE_LABELS: Record<TenantRole, string> = { owner: "Owner", admin: "Admin", manager: "Manager", viewer: "Viewer", client: "Client" };
 
-const inviteSchema = z.object({ email: emailSchema, role: z.enum(["owner", "admin", "manager", "viewer", "client"]) });
-type InviteValues = z.infer<typeof inviteSchema>;
+const userSchema = z.object({
+  fullName: z.string().trim().max(120, "Use at most 120 characters."),
+  email: emailSchema,
+  role: z.enum(["owner", "viewer"]),
+});
+type UserValues = z.infer<typeof userSchema>;
+
+type IssuedLink = { email: string; url: string };
 
 /**
- * actorRole: the signed-in user's authority in this tenant. Platform admins
- * may invite (database rule: invitations require an aal2 platform admin).
+ * Client user management for PRISIM staff (client detail → Users tab).
+ * Staff create accounts, assign roles, issue password links and remove
+ * access. Clients have no access to any of this: the Edge Function and the
+ * database both require an aal2 platform admin.
  */
-export function TeamPanel({
-  tenantId,
-  actorRole,
-  currentUserId,
-}: {
-  tenantId: string;
-  actorRole: "platform_admin" | TenantRole;
-  currentUserId: string | null;
-}) {
+export function ClientUsersPanel({ tenantId, tenantActive }: { tenantId: string; tenantActive: boolean }) {
   const api = useApi();
   const queryClient = useQueryClient();
   const membersQuery = useQuery({ queryKey: queryKeys.members(tenantId), queryFn: () => api.listMembers(tenantId) });
-  const invitationsQuery = useQuery({ queryKey: queryKeys.invitations(tenantId), queryFn: () => api.listInvitations(tenantId) });
-  const canInvite = actorRole === "platform_admin";
-  const isOwner = actorRole === "owner" || actorRole === "platform_admin";
-  const refresh = () => {
-    void queryClient.invalidateQueries({ queryKey: queryKeys.members(tenantId) });
-    void queryClient.invalidateQueries({ queryKey: queryKeys.invitations(tenantId) });
-  };
+  const [issued, setIssued] = useState<IssuedLink | null>(null);
+  const refresh = () => void queryClient.invalidateQueries({ queryKey: queryKeys.members(tenantId) });
 
-  const form = useForm<InviteValues>({ resolver: zodResolver(inviteSchema), defaultValues: { email: "", role: "client" } });
-  const invite = useMutation({
-    mutationFn: (values: InviteValues) => api.inviteMember(tenantId, values.email.trim().toLowerCase(), values.role),
-    onSuccess: () => {
-      toast.success("Invitation sent");
-      form.reset({ email: "", role: form.getValues("role") });
+  const form = useForm<UserValues>({ resolver: zodResolver(userSchema), defaultValues: { fullName: "", email: "", role: "owner" } });
+  const errors = form.formState.errors;
+
+  const issueLink = useMutation({
+    mutationFn: ({ userId }: { userId: string; email: string }) => api.issuePasswordLink(tenantId, userId),
+    onSuccess: ({ url }, { email }) => setIssued({ email, url }),
+    onError: (error) => toast.error(errorMessage(error)),
+  });
+
+  const create = useMutation({
+    mutationFn: (values: UserValues) =>
+      api.createTenantUser({ tenantId, email: values.email.trim().toLowerCase(), fullName: values.fullName.trim() || undefined, role: values.role }),
+    onSuccess: (result, values) => {
+      const email = values.email.trim().toLowerCase();
+      form.reset({ fullName: "", email: "", role: values.role });
       refresh();
+      if (result.accountCreated) {
+        toast.success("Account created");
+        issueLink.mutate({ userId: result.userId, email });
+      } else {
+        toast.success(result.membership === "reactivated" ? "Access restored" : "Access granted to an existing account");
+      }
     },
     onError: (error) => toast.error(errorMessage(error)),
   });
+
   const changeRole = useMutation({
-    mutationFn: ({ userId, role }: { userId: string; role: TenantRole }) => api.changeMemberRole(tenantId, userId, role),
+    mutationFn: ({ userId, role }: { userId: string; role: ClientUserRole }) => api.changeMemberRole(tenantId, userId, role),
     onSuccess: () => {
       toast.success("Role updated");
       refresh();
@@ -71,77 +83,112 @@ export function TeamPanel({
     onError: (error) => toast.error(errorMessage(error)),
   });
 
-  const manageableRoles = (current: TenantRole) =>
-    ROLES.filter((role) => isOwner || (role.value !== "owner" && role.value !== "admin") || role.value === current);
+  const restore = useMutation({
+    mutationFn: (member: Member) =>
+      api.createTenantUser({ tenantId, email: member.email ?? "", role: member.role === "owner" ? "owner" : "viewer" }),
+    onSuccess: () => {
+      toast.success("Access restored");
+      refresh();
+    },
+    onError: (error) => toast.error(errorMessage(error)),
+  });
 
   return (
     <div className="space-y-5">
-      {canInvite ? (
-        <SectionCard title="Invite a member" description="An email with a secure, single-use link is sent through Supabase Auth. Links expire after 7 days.">
-          <form className="grid gap-4 p-5 sm:grid-cols-[1fr_200px_auto] sm:items-end sm:p-6" onSubmit={form.handleSubmit((values) => invite.mutate(values))} noValidate>
-            <Field label="Email address" htmlFor="invite-email" error={form.formState.errors.email?.message}>
-              <Input id="invite-email" type="email" autoComplete="off" {...form.register("email")} aria-invalid={Boolean(form.formState.errors.email)} />
+      <SectionCard
+        title="Add a client user"
+        description="Creates the person's account and gives them access to this client only. They set their own password with a single-use link; no password is ever sent."
+      >
+        {tenantActive ? (
+          <form
+            className="grid gap-4 p-5 sm:grid-cols-2 sm:p-6 lg:grid-cols-[1fr_1fr_160px_auto] lg:items-start"
+            onSubmit={form.handleSubmit((values) => create.mutate(values))}
+            noValidate
+          >
+            <Field label="Full name" htmlFor="user-name" error={errors.fullName?.message} hint="Optional">
+              <Input id="user-name" autoComplete="off" {...form.register("fullName")} aria-invalid={Boolean(errors.fullName)} aria-describedby={errors.fullName ? "user-name-error" : undefined} />
             </Field>
-            <Field label="Role" htmlFor="invite-role">
-              <Select id="invite-role" {...form.register("role")}>
+            <Field label="Email address" htmlFor="user-email" error={errors.email?.message}>
+              <Input id="user-email" type="email" autoComplete="off" {...form.register("email")} aria-invalid={Boolean(errors.email)} aria-describedby={errors.email ? "user-email-error" : undefined} />
+            </Field>
+            <Field label="Role" htmlFor="user-role">
+              <Select id="user-role" {...form.register("role")}>
                 {ROLES.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
               </Select>
             </Field>
-            <Button type="submit" loading={invite.isPending}><MailPlus aria-hidden="true" className="h-4 w-4" /> Send invite</Button>
+            <div className="lg:pt-7">
+              <Button type="submit" loading={create.isPending || issueLink.isPending} className="w-full lg:w-auto">
+                <UserPlus aria-hidden="true" className="h-4 w-4" /> Create user
+              </Button>
+            </div>
           </form>
-        </SectionCard>
-      ) : (
-        <Alert tone="info" title="Adding people">
-          New members are invited by your PRISIM account team. Contact them with the person's email address and the role they need.
-        </Alert>
-      )}
+        ) : (
+          <div className="p-5 sm:p-6"><Alert tone="info">Reactivate this client before adding users.</Alert></div>
+        )}
+      </SectionCard>
 
-      <SectionCard title="Members">
-        <QueryView query={membersQuery} empty={<EmptyState icon={<Users />} title="No members yet" description={canInvite ? "Invite the client's first owner above." : undefined} />}>
+      <SectionCard title="Users" description="Owners and viewers both see this client's dashboards, published audits and shared reports.">
+        <QueryView query={membersQuery} empty={<EmptyState icon={<Users />} title="No users yet" description="Create the client's first owner above." />}>
           {(members) => (
             <ul className="divide-y divide-slate-100">
               {members.map((member) => {
-                const self = member.user_id === currentUserId;
-                const canEdit = member.status === "active" && !self && (isOwner || (member.role !== "owner" && member.role !== "admin"));
+                const active = member.status === "active";
+                const label = member.full_name ?? member.email ?? "This user";
                 return (
                   <li key={member.user_id} className="flex flex-wrap items-center gap-3 px-5 py-3 sm:px-6">
-                    <div className="flex h-9 w-9 items-center justify-center rounded-full bg-slate-100 text-sm font-semibold text-slate-600">
-                      {(member.full_name ?? member.email ?? "?").slice(0, 1).toUpperCase()}
+                    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-100 text-sm font-semibold text-slate-600">
+                      {label.slice(0, 1).toUpperCase()}
                     </div>
                     <div className="min-w-0 flex-1">
-                      <p className="truncate text-sm font-medium text-ink-950">{member.full_name ?? member.email}{self && <span className="text-slate-400"> (you)</span>}</p>
-                      <p className="truncate text-xs text-slate-500">{member.email} · joined {formatDate(member.created_at)}</p>
+                      <p className="truncate text-sm font-medium text-ink-950">{label}</p>
+                      <p className="truncate text-xs text-slate-500">{member.email} · added {formatDate(member.created_at)}</p>
                     </div>
-                    {member.status !== "active" && <StatusBadge status={member.status} />}
-                    <div className="w-36">
+                    {!active && <StatusBadge status={member.status} />}
+                    <div className="w-32">
                       <label className="sr-only" htmlFor={`role-${member.user_id}`}>Role for {member.email}</label>
                       <Select
                         id={`role-${member.user_id}`}
                         value={member.role}
-                        disabled={!canEdit || changeRole.isPending}
-                        onChange={(event) => changeRole.mutate({ userId: member.user_id, role: event.target.value as TenantRole })}
+                        disabled={!active || changeRole.isPending}
+                        onChange={(event) => changeRole.mutate({ userId: member.user_id, role: event.target.value as ClientUserRole })}
                       >
-                        {manageableRoles(member.role).map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
+                        {!ROLES.some((role) => role.value === member.role) && <option value={member.role} disabled>{LEGACY_ROLE_LABELS[member.role]}</option>}
+                        {ROLES.map((role) => <option key={role.value} value={role.value}>{role.label}</option>)}
                       </Select>
                     </div>
-                    <ConfirmButton
-                      title="Remove access?"
-                      description={`${member.email ?? "This member"} will lose access to this workspace immediately, and any pending invitations for them are revoked.`}
-                      confirmLabel="Remove access"
-                      variant="ghost"
-                      disabled={!canEdit}
-                      onConfirm={async () => {
-                        try {
-                          await api.deactivateMember(tenantId, member.user_id);
-                          toast.success("Access removed");
-                          refresh();
-                        } catch (error) {
-                          toast.error(errorMessage(error));
-                        }
-                      }}
-                    >
-                      <UserX aria-hidden="true" className="h-4 w-4" /><span className="sr-only">Remove access</span>
-                    </ConfirmButton>
+                    {active ? (
+                      <>
+                        <Button
+                          size="small"
+                          variant="secondary"
+                          loading={issueLink.isPending && issueLink.variables?.userId === member.user_id}
+                          onClick={() => issueLink.mutate({ userId: member.user_id, email: member.email ?? "" })}
+                        >
+                          <KeyRound aria-hidden="true" className="h-4 w-4" /> Password link
+                        </Button>
+                        <ConfirmButton
+                          title="Remove access?"
+                          description={`${label} will lose access to this client immediately. Their account and the client's data are kept, and you can restore access later.`}
+                          confirmLabel="Remove access"
+                          variant="ghost"
+                          onConfirm={async () => {
+                            try {
+                              await api.deactivateMember(tenantId, member.user_id);
+                              toast.success("Access removed");
+                              refresh();
+                            } catch (error) {
+                              toast.error(errorMessage(error));
+                            }
+                          }}
+                        >
+                          <UserX aria-hidden="true" className="h-4 w-4" /><span className="sr-only">Remove access for {label}</span>
+                        </ConfirmButton>
+                      </>
+                    ) : (
+                      <Button size="small" variant="secondary" disabled={!tenantActive || !member.email} loading={restore.isPending && restore.variables?.user_id === member.user_id} onClick={() => restore.mutate(member)}>
+                        <UserRoundCheck aria-hidden="true" className="h-4 w-4" /> Restore access
+                      </Button>
+                    )}
                   </li>
                 );
               })}
@@ -150,42 +197,43 @@ export function TeamPanel({
         </QueryView>
       </SectionCard>
 
-      <SectionCard title="Invitations">
-        <QueryView query={invitationsQuery} empty={<EmptyState title="No invitations" description="Sent invitations and their status appear here." />}>
-          {(invitations) => (
-            <ul className="divide-y divide-slate-100">
-              {invitations.map((invitation) => (
-                <li key={invitation.id} className="flex flex-wrap items-center gap-3 px-5 py-3 sm:px-6">
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-ink-950">{invitation.email}</p>
-                    <p className="text-xs capitalize text-slate-500">{invitation.role} · sent {formatDate(invitation.created_at)} · expires {formatDate(invitation.expires_at)}</p>
-                  </div>
-                  <StatusBadge status={invitation.status} />
-                  {invitation.status === "pending" && (
-                    <ConfirmButton
-                      title="Revoke invitation?"
-                      description="The invitation link stops working immediately."
-                      confirmLabel="Revoke"
-                      variant="ghost"
-                      onConfirm={async () => {
-                        try {
-                          await api.revokeInvitation(invitation.id);
-                          toast.success("Invitation revoked");
-                          refresh();
-                        } catch (error) {
-                          toast.error(errorMessage(error));
-                        }
-                      }}
-                    >
-                      Revoke
-                    </ConfirmButton>
-                  )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </QueryView>
-      </SectionCard>
+      <PasswordLinkDialog issued={issued} onClose={() => setIssued(null)} />
     </div>
+  );
+}
+
+function PasswordLinkDialog({ issued, onClose }: { issued: IssuedLink | null; onClose: () => void }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    if (!issued) return;
+    try {
+      await navigator.clipboard.writeText(issued.url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      toast.error("Copy failed. Select the link and copy it manually.");
+    }
+  };
+  return (
+    <Dialog open={Boolean(issued)} onOpenChange={(open) => { if (!open) { setCopied(false); onClose(); } }}>
+      <DialogContent>
+        <DialogTitle>Password link for {issued?.email}</DialogTitle>
+        <DialogDescription>
+          Send this link only to {issued?.email}. It lets them choose their own password, works once and expires soon.
+          It is shown only now; create a new one if it is lost or expires.
+        </DialogDescription>
+        <div className="mt-5 space-y-3">
+          <label className="sr-only" htmlFor="password-link">Password link</label>
+          <Input id="password-link" readOnly value={issued?.url ?? ""} onFocus={(event) => event.currentTarget.select()} className="font-mono text-xs" />
+          <div className="flex justify-end gap-2">
+            <Button variant="secondary" onClick={() => { setCopied(false); onClose(); }}>Done</Button>
+            <Button onClick={() => void copy()}>
+              {copied ? <Check aria-hidden="true" className="h-4 w-4" /> : <Copy aria-hidden="true" className="h-4 w-4" />}
+              {copied ? "Copied" : "Copy link"}
+            </Button>
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   );
 }

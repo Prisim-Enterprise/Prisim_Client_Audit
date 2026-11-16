@@ -90,7 +90,7 @@ if (extraArgs.length > 0) {
       if (!spawnFailed) resolveExit(code ?? 1);
     });
   });
-  const functions = ["invite-tenant-member", "ad-connections", "sync-ad-data", "run-audit", "generate-report"];
+  const functions = ["invite-tenant-member", "manage-tenant-user", "ad-connections", "sync-ad-data", "run-audit", "generate-report"];
   let code = 0;
   for (const name of functions) {
     const config = `supabase/functions/${name}/deno.json`;

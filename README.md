@@ -9,7 +9,7 @@ reports.
   tenant's data, with permissions set by their tenant role.
 
 > **Status:** the full application is implemented: client management,
-> invitations, Meta and Google Ads OAuth, daily sync, campaign analytics, the
+> staff-managed client onboarding and accounts, Meta and Google Ads OAuth, daily sync, campaign analytics, the
 > audit engine with a staff review workflow, PDF reports in private storage
 > and client report access. The hosted database still has only migration 0001,
 > which is why sign-in currently stops at "Account access unavailable"
@@ -21,8 +21,8 @@ reports.
 | Area | Staff (`/admin`, aal2) | Client (`/app/:slug`) |
 |---|---|---|
 | Overview | Platform counters, audits awaiting review, failing connections, recent syncs | 30-day spend/conversions, daily trend, latest published audit, reports |
-| Clients & team | Create/edit/suspend clients, invite members (email), roles, revoke | Owners/admins manage roles and access (invites go through PRISIM) |
-| Ad accounts | Connect on a client's behalf, sync, backfill, connection health, sync history | Managers+ connect Meta/Google (read-only), choose accounts, sync now |
+| Clients & users | Create/edit/suspend clients, onboarding checklist, create client owner/viewer accounts, single-use password links, roles, remove/restore access | None: onboarding and access are managed only by PRISIM staff |
+| Ad accounts | Connect Meta/Google on the client's behalf, choose accounts, sync, backfill, connection health, sync history | Read-only list of connected accounts and sync status |
 | Analytics | Per-client performance tab | Campaign analytics: KPIs, daily trend, spend by campaign, sortable table |
 | Audits | Run the engine (18 rules, scored 0–100), review/dismiss/annotate findings, edit summary, publish, archive | Published audits only, without dismissed findings |
 | Reports | Generate PDF (internal or shared), share/unshare, delete | Download shared reports via one-minute signed URLs |
@@ -35,7 +35,7 @@ Realtime updates refresh sync status, accounts, audits and reports as they chang
 | Layer | Technology | Hosting (free tier) |
 |---|---|---|
 | Frontend | React, TypeScript, Vite, Tailwind CSS, shadcn/ui, React Query, React Router | Vercel |
-| Auth | Supabase Auth (e-mail + password, invite-only) | Supabase |
+| Auth | Supabase Auth (e-mail + password; accounts created by PRISIM staff) | Supabase |
 | Database | Supabase PostgreSQL 17 with Row Level Security | Supabase |
 | Files | Supabase Storage (private `reports` bucket) | Supabase |
 | Backend | Supabase Edge Functions (Deno), the only backend | Supabase |
@@ -65,7 +65,7 @@ for the limits that implies.
 │       └── server/           Tests for the shared Edge Function modules
 ├── supabase/
 │   ├── config.toml           Local development stack configuration
-│   ├── functions/            Edge Functions: invite-tenant-member, ad-connections,
+│   ├── functions/            Edge Functions: manage-tenant-user, ad-connections,
 │   │                         sync-ad-data, run-audit, generate-report; _shared/ holds
 │   │                         the audit engine, PDF builder and Meta/Google clients
 │   ├── migrations/           Ordered SQL migrations (source of truth)
@@ -97,7 +97,7 @@ watermark). Then sign out, pick Client owner and open Reports.
 
 ```bash
 npm install
-npm test                # secret scan, frontend typecheck, 74 Vitest tests, Deno check of all functions + invite tests
+npm test                # secret scan, frontend typecheck, Vitest tests, Deno check of all functions + invite tests
 npm run sql:parse       # parses every migration, function body and pgTAP file with the PostgreSQL 17 parser
 npm --prefix frontend run build:production
 ```

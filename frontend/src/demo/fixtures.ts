@@ -9,7 +9,6 @@ import type {
   AdAccount,
   CampaignPerformance,
   Connection,
-  Invitation,
   Member,
   Provider,
   SyncJob,
@@ -140,18 +139,6 @@ export function demoMembers(): Record<string, Member[]> {
     [DEMO_TENANT_IDS.harbor]: [member(DEMO_USERS.harborOwner, "owner")],
     [DEMO_TENANT_IDS.cedar]: [],
   };
-}
-
-export function demoInvitations(): Invitation[] {
-  return [{
-    id: id("d8000000", 1),
-    tenant_id: DEMO_TENANT_IDS.northwind,
-    email: "marketing.demo@northwind.example",
-    role: "manager",
-    status: "pending",
-    expires_at: new Date(Date.now() + 5 * 86_400_000).toISOString(),
-    created_at: new Date(Date.now() - 2 * 86_400_000).toISOString(),
-  }];
 }
 
 type AccountSpec = {

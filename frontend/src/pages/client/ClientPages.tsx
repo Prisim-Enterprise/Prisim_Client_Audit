@@ -1,32 +1,27 @@
 import { useQuery } from "@tanstack/react-query";
 import { ArrowLeft, ClipboardCheck, FileText } from "lucide-react";
 import { Link, useParams } from "react-router-dom";
-import { Alert } from "../../components/ui/Alert";
 import { LoadingState } from "../../components/ui/LoadingState";
 import { EmptyState, ErrorState, PageHeader, QueryView, SectionCard } from "../../components/ui/States";
-import { useAuth } from "../../context/AuthProvider";
 import { PerformancePanel } from "../../features/analytics/PerformancePanel";
 import { AuditOverview, AuditRunTable, FindingsList } from "../../features/audits/AuditComponents";
 import { ConnectionsPanel } from "../../features/connections/ConnectionsPanel";
 import { ReportsTable } from "../../features/reports/ReportsTable";
-import { TeamPanel } from "../../features/team/TeamPanel";
 import { formatDate, formatDateTime } from "../../lib/analytics";
 import { queryKeys, useApi, useRealtime } from "../../lib/api/ApiProvider";
-import { roleAtLeast, useWorkspace } from "./workspace";
+import { useWorkspace } from "./workspace";
 
+// Connections are set up and managed by PRISIM staff; clients see their status.
 export function AdAccountsPage() {
   const workspace = useWorkspace();
-  const canManage = roleAtLeast(workspace.role, "manager");
   return (
     <div className="space-y-6">
       <PageHeader
         eyebrow={workspace.business_name}
         title="Ad accounts"
-        description={canManage
-          ? "Connect Meta Ads and Google Ads with read-only access, choose which accounts PRISIM audits, and sync on demand."
-          : "The advertising accounts connected to this workspace."}
+        description="The advertising accounts PRISIM analyses for you. Your PRISIM team manages connections and data syncs."
       />
-      <ConnectionsPanel tenantId={workspace.tenant_id} canManage={canManage} />
+      <ConnectionsPanel tenantId={workspace.tenant_id} canManage={false} />
     </div>
   );
 }
@@ -117,21 +112,3 @@ export function ClientReportsPage() {
   );
 }
 
-export function TeamPage() {
-  const workspace = useWorkspace();
-  const { user } = useAuth();
-  if (!roleAtLeast(workspace.role, "admin")) {
-    return (
-      <div className="space-y-6">
-        <PageHeader eyebrow={workspace.business_name} title="Team" />
-        <Alert tone="info">Only workspace owners and admins can manage members.</Alert>
-      </div>
-    );
-  }
-  return (
-    <div className="space-y-6">
-      <PageHeader eyebrow={workspace.business_name} title="Team" description="People with access to this workspace and their roles." />
-      <TeamPanel tenantId={workspace.tenant_id} actorRole={workspace.role} currentUserId={user?.id ?? null} />
-    </div>
-  );
-}

@@ -395,6 +395,10 @@ deno_version = 2
 [functions.invite-tenant-member]
 verify_jwt = true
 
+# Staff-only client account provisioning (create user, password setup link).
+[functions.manage-tenant-user]
+verify_jwt = true
+
 [functions.ad-connections]
 verify_jwt = true
 import_map = "./functions/ad-connections/deno.json"

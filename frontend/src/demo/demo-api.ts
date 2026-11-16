@@ -19,7 +19,6 @@ import type {
   Connection,
   DailyPerformance,
   DateRange,
-  Invitation,
   Member,
   PortalApi,
   Provider,
@@ -34,7 +33,6 @@ import {
   type DemoCampaign,
   type DemoMetric,
   demoConnections,
-  demoInvitations,
   demoMembers,
   demoSyncJobs,
   demoTenants,
@@ -52,7 +50,6 @@ const newId = () => {
 type DemoState = {
   tenants: Tenant[];
   members: Record<string, Member[]>;
-  invitations: Invitation[];
   connections: Connection[];
   accounts: AdAccount[];
   campaigns: DemoCampaign[];
@@ -69,7 +66,6 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
   const state: DemoState = {
     tenants: demoTenants(),
     members: demoMembers(),
-    invitations: demoInvitations(),
     connections: demoConnections(),
     accounts: data.accounts,
     campaigns: data.campaigns,
@@ -345,36 +341,49 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
 
     async listMembers(tenantId) {
       await wait();
-      return state.members[tenantId] ?? [];
+      // Copies, like a real API response: in-place edits must not hide changes from React Query.
+      return (state.members[tenantId] ?? []).map((member) => ({ ...member }));
     },
 
-    async listInvitations(tenantId) {
-      await wait();
-      return state.invitations.filter((invitation) => invitation.tenant_id === tenantId);
-    },
-
-    async inviteMember(tenantId, email, role) {
+    // Mirrors manage-tenant-user: no account or e-mail is created in demo mode.
+    async createTenantUser({ tenantId, email, fullName, role }) {
       await wait(400);
-      for (const invitation of state.invitations) {
-        if (invitation.tenant_id === tenantId && invitation.email === email && invitation.status === "pending") invitation.status = "revoked";
+      const tenant = tenantOrThrow(tenantId);
+      if (tenant.status !== "active") throw new ApiError("Reactivate the client before adding users.", "tenant_not_active");
+      const address = email.trim().toLowerCase();
+      if (address === DEMO_USERS.staff.email) {
+        throw new ApiError("PRISIM staff accounts can't be added to a client or receive client password links.", "staff_account");
       }
-      state.invitations.unshift({
-        id: newId(),
-        tenant_id: tenantId,
-        email: email.toLowerCase(),
-        role,
-        status: "pending",
-        expires_at: new Date(Date.now() + 7 * 86_400_000).toISOString(),
-        created_at: new Date().toISOString(),
-      });
-      log("tenant_invitations.insert", tenantId, "tenant_invitations", null);
+      const known = Object.values(state.members).flat().find((member) => member.email === address);
+      const members = (state.members[tenantId] ??= []);
+      const existing = members.find((member) => member.email === address);
+      if (existing?.status === "active") {
+        throw new ApiError("This person already has access to this client. Change their role instead.", "already_member");
+      }
+      const now = new Date().toISOString();
+      if (existing) {
+        Object.assign(existing, { role, status: "active", updated_at: now });
+      } else {
+        members.push({
+          user_id: known?.user_id ?? newId(),
+          email: address,
+          full_name: fullName?.trim() || known?.full_name || null,
+          role,
+          status: "active",
+          created_at: now,
+          updated_at: now,
+        });
+      }
+      const member = members.find((item) => item.email === address)!;
+      log("tenant_memberships.insert", tenantId, "tenant_memberships", member.user_id);
+      return { userId: member.user_id, accountCreated: !known, membership: existing ? "reactivated" : "created" };
     },
 
-    async revokeInvitation(invitationId) {
-      await wait();
-      const invitation = state.invitations.find((item) => item.id === invitationId);
-      if (!invitation || invitation.status !== "pending") throw new ApiError("Invitation is not pending", "22023");
-      invitation.status = "revoked";
+    async issuePasswordLink(tenantId, userId) {
+      await wait(250);
+      const member = (state.members[tenantId] ?? []).find((item) => item.user_id === userId && item.status === "active");
+      if (!member) throw new ApiError("This person is not an active user of this client.", "member_not_found");
+      return { url: `${window.location.origin}/reset-password?token_hash=demo-link-not-valid&type=recovery` };
     },
 
     async changeMemberRole(tenantId, userId, role) {

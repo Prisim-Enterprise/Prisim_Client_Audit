@@ -1,50 +1,94 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Eye, EyeOff, LockKeyhole } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useForm } from "react-hook-form";
-import { Link } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { AuthShell } from "../../components/auth/AuthShell";
 import { Alert } from "../../components/ui/Alert";
 import { Button } from "../../components/ui/Button";
 import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
+import { LoadingState } from "../../components/ui/LoadingState";
 import { useAuth } from "../../context/AuthProvider";
 import { friendlyAuthError } from "../../lib/auth-errors";
 import { resetPasswordSchema, type ResetPasswordValues } from "../../lib/validation";
 
+type LinkState = "none" | "verifying" | "verified" | "failed";
+
+/** Reads a single-use password link (?token_hash=…&type=recovery) once. */
+function readLinkToken(search: string): string | null {
+  const params = new URLSearchParams(search);
+  const token = params.get("token_hash");
+  return token && params.get("type") === "recovery" ? token : null;
+}
+
+/**
+ * Sets a password for:
+ *   - a new client account (password link issued by PRISIM staff), and
+ *   - an existing account (staff-issued link or a reset e-mail).
+ * Both carry a one-time token_hash. A PKCE reset (?code=…) is still handled
+ * by the Supabase client before this page renders.
+ */
 export function ResetPasswordPage() {
-  const { user, authLoading, updatePassword } = useAuth();
+  const { user, authLoading, updatePassword, verifyPasswordLink } = useAuth();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const [linkState, setLinkState] = useState<LinkState>(() => (readLinkToken(location.search) ? "verifying" : "none"));
+  const [linkError, setLinkError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [complete, setComplete] = useState(false);
   const [visible, setVisible] = useState(false);
+  const consumed = useRef(false);
   const {
     register,
     handleSubmit,
     formState: { errors, isSubmitting },
   } = useForm<ResetPasswordValues>({ resolver: zodResolver(resetPasswordSchema) });
 
-  if (authLoading) return null;
-  if (!user && !complete) {
+  useEffect(() => {
+    const token = readLinkToken(location.search);
+    if (!token || consumed.current) return;
+    // The token works once: never verify twice (React StrictMode re-runs effects).
+    consumed.current = true;
+    // Remove the token from the address bar and history straight away.
+    navigate(location.pathname, { replace: true });
+    verifyPasswordLink(token)
+      .then(() => setLinkState("verified"))
+      .catch((error: unknown) => {
+        setLinkError(error instanceof Error ? error.message : null);
+        setLinkState("failed");
+      });
+  }, [location.pathname, location.search, navigate, verifyPasswordLink]);
+
+  if (authLoading || linkState === "verifying") {
     return (
-      <AuthShell eyebrow="Account recovery">
-        <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Reset link unavailable</h1>
-        <p className="mt-3 text-sm leading-6 text-slate-500">
-          This link may have expired or already been used. Request a fresh reset link to continue.
-        </p>
-        <Link to="/forgot-password" className="mt-7 inline-flex text-sm font-semibold text-accent-700 hover:text-accent-800">
-          Request another link
-        </Link>
+      <AuthShell eyebrow="Account access">
+        <LoadingState label="Checking your password link…" />
       </AuthShell>
     );
   }
   if (complete) {
     return (
-      <AuthShell eyebrow="Account recovery">
-        <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Password updated</h1>
-        <p className="mt-3 text-sm leading-6 text-slate-500">Your password is ready. Sign in with your new credentials.</p>
+      <AuthShell eyebrow="Account access">
+        <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Password saved</h1>
+        <p className="mt-3 text-sm leading-6 text-slate-500">You're signed in. From now on, sign in with your email address and this password.</p>
         <Link to="/" className="mt-7 inline-flex text-sm font-semibold text-accent-700 hover:text-accent-800">
           Continue to your portal
         </Link>
+      </AuthShell>
+    );
+  }
+  if (linkState === "failed" || !user) {
+    return (
+      <AuthShell eyebrow="Account access">
+        <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Password link unavailable</h1>
+        <p className="mt-3 text-sm leading-6 text-slate-500">
+          {linkError ?? "This link may have expired or already been used."} Your PRISIM team can send you a new link.
+        </p>
+        <div className="mt-7 flex flex-wrap gap-x-6 gap-y-3">
+          <Link to="/login" className="inline-flex text-sm font-semibold text-accent-700 hover:text-accent-800">Back to sign in</Link>
+          <Link to="/forgot-password" className="inline-flex text-sm font-medium text-slate-500 hover:text-ink-950">Request a reset email</Link>
+        </div>
       </AuthShell>
     );
   }
@@ -60,10 +104,11 @@ export function ResetPasswordPage() {
   });
 
   return (
-    <AuthShell eyebrow="Account recovery">
+    <AuthShell eyebrow="Account access">
       <div className="mb-8">
-        <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Choose a new password</h1>
+        <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Choose your password</h1>
         <p className="mt-3 text-sm leading-6 text-slate-500">
+          {user.email ? <>For <span className="font-medium text-ink-950">{user.email}</span>. </> : null}
           Use at least 10 characters with an uppercase letter, a lowercase letter, and a number.
         </p>
       </div>
@@ -77,6 +122,8 @@ export function ResetPasswordPage() {
               type={visible ? "text" : "password"}
               autoComplete="new-password"
               className="pl-10 pr-11"
+              aria-invalid={Boolean(errors.password)}
+              aria-describedby={errors.password ? "password-error" : undefined}
               {...register("password")}
             />
             <button
@@ -90,9 +137,16 @@ export function ResetPasswordPage() {
           </div>
         </Field>
         <Field label="Confirm new password" htmlFor="confirmPassword" error={errors.confirmPassword?.message}>
-          <Input id="confirmPassword" type={visible ? "text" : "password"} autoComplete="new-password" {...register("confirmPassword")} />
+          <Input
+            id="confirmPassword"
+            type={visible ? "text" : "password"}
+            autoComplete="new-password"
+            aria-invalid={Boolean(errors.confirmPassword)}
+            aria-describedby={errors.confirmPassword ? "confirmPassword-error" : undefined}
+            {...register("confirmPassword")}
+          />
         </Field>
-        <Button type="submit" className="w-full" loading={isSubmitting}>Update password</Button>
+        <Button type="submit" className="w-full" loading={isSubmitting}>Save password</Button>
       </form>
     </AuthShell>
   );

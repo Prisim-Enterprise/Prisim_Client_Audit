@@ -77,10 +77,10 @@ SET LOCAL ROLE authenticated;
 -- =====================================================
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000004a3","role":"authenticated"}';
 
-SELECT results_eq($$ SELECT id FROM public.oauth_connections $$,
-    $$ VALUES ('a4000000-0000-4000-8000-0000000000c0'::uuid) $$, 'manager: sees own tenant connections');
+-- Connections are managed by PRISIM staff only (20261113120000).
+SELECT is_empty($$ SELECT id FROM public.oauth_connections $$, 'manager: cannot read connections');
 SELECT results_eq($$ SELECT user_id FROM public.tenant_memberships $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000004a3'::uuid) $$, 'manager: sees only own membership (admin+ sees all)');
+    $$ VALUES ('00000000-0000-4000-8000-0000000004a3'::uuid) $$, 'manager: sees only own membership');
 SELECT is_empty($$ SELECT id FROM public.tenant_invitations $$, 'manager: cannot read invitations');
 SELECT is_empty($$ SELECT id FROM public.audit_logs $$,         'manager: cannot read audit logs');
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a4000000-0000-4000-8000-000000000000', 'invitation.create') $$,
@@ -88,9 +88,11 @@ SELECT throws_ok($$ SELECT public.begin_privileged_action('a4000000-0000-4000-80
 SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4', 'client') $$,
     '42501', NULL, 'manager: cannot change roles');
 
--- 8. Profile visibility across tenants
-SELECT ok(EXISTS (SELECT 1 FROM public.profiles WHERE id = '00000000-0000-4000-8000-0000000004c1'),
-    'manager: sees profile of a member shared with another tenant');
+-- 8. Profile visibility: client users see only their own profile.
+SELECT results_eq($$ SELECT id FROM public.profiles $$,
+    $$ VALUES ('00000000-0000-4000-8000-0000000004a3'::uuid) $$, 'manager: sees only own profile');
+SELECT ok(NOT EXISTS (SELECT 1 FROM public.profiles WHERE id = '00000000-0000-4000-8000-0000000004c1'),
+    'manager: cannot see profiles of other members of the tenant');
 SELECT ok(NOT EXISTS (SELECT 1 FROM public.profiles WHERE id = '00000000-0000-4000-8000-0000000004b1'),
     'manager: cannot see profile of a user who belongs only to another tenant');
 SELECT ok(NOT EXISTS (SELECT 1 FROM public.profiles WHERE id IN ('00000000-0000-4000-8000-0000000004e1', '00000000-0000-4000-8000-0000000004ad')),
@@ -125,56 +127,77 @@ SELECT throws_ok($$ SELECT public.deactivate_member('a4000000-0000-4000-8000-000
 -- =====================================================
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000004a2","role":"authenticated"}';
 
-SELECT is((SELECT count(*)::int FROM public.tenant_memberships), 7, 'admin: sees every membership of own tenant');
-SELECT ok(NOT EXISTS (SELECT 1 FROM public.tenant_memberships WHERE tenant_id <> 'a4000000-0000-4000-8000-000000000000'),
-    'admin: sees no memberships of other tenants');
-SELECT results_eq($$ SELECT email FROM public.tenant_invitations $$,
-    $$ VALUES ('pending@a4.test'::text) $$, 'admin: reads own tenant invitations');
-SELECT ok((SELECT count(*) FROM public.audit_logs) > 0, 'admin: reads own tenant audit log');
-SELECT ok(NOT EXISTS (SELECT 1 FROM public.audit_logs WHERE tenant_id IS DISTINCT FROM 'a4000000-0000-4000-8000-000000000000'),
-    'admin: sees no audit entries of other tenants or the platform');
+-- Client management is staff-only (20261113120000): a tenant admin has no
+-- member directory, invitations, audit log or member-management rights.
+SELECT results_eq($$ SELECT user_id FROM public.tenant_memberships $$,
+    $$ VALUES ('00000000-0000-4000-8000-0000000004a2'::uuid) $$, 'admin: sees only own membership');
+SELECT is_empty($$ SELECT id FROM public.tenant_invitations $$, 'admin: cannot read invitations');
+SELECT is_empty($$ SELECT id FROM public.audit_logs $$,         'admin: cannot read the audit log');
 
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a4000000-0000-4000-8000-000000000000', 'invitation.create') $$,
     '42501', NULL, 'tenant admin: cannot authorize platform invitation creation');
 
-SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4', 'client') $$,
-    'admin: can change a viewer to client');
-SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a3', 'admin') $$,
-    '42501', NULL, 'admin: cannot promote to admin');
-SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1', 'client') $$,
-    '42501', NULL, 'admin: cannot demote the owner');
-SELECT throws_ok($$ SELECT public.deactivate_member('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1') $$,
-    '42501', NULL, 'admin: cannot deactivate the owner');
+SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4', 'client') $$,
+    '42501', NULL, 'admin: cannot change a viewer''s role');
 SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a2', 'owner') $$,
     '42501', NULL, 'admin: cannot promote self');
+SELECT throws_ok($$ SELECT public.deactivate_member('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4') $$,
+    '42501', NULL, 'admin: cannot deactivate members');
 
--- H2: tenant writes through RPCs are attributed to the signed-in actor.
+
+-- =====================================================
+-- OWNER of A: no member management
+-- =====================================================
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000004a1","role":"authenticated"}';
+
+SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a2', 'owner') $$,
+    '42501', NULL, 'owner: cannot promote members');
+SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1', 'admin') $$,
+    '42501', NULL, 'owner: cannot change own role');
+SELECT throws_ok($$ SELECT public.deactivate_member('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4') $$,
+    '42501', NULL, 'owner: cannot deactivate members');
+SELECT throws_ok($$ INSERT INTO public.tenant_memberships (tenant_id, user_id, role)
+                    VALUES ('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004b1', 'viewer') $$,
+    '42501', NULL, 'owner: cannot add users to own tenant directly');
+WITH u AS (UPDATE public.tenant_memberships SET status = 'active'
+           WHERE user_id = '00000000-0000-4000-8000-0000000004a5' RETURNING 1)
+SELECT is(count(*)::int, 0, 'owner: cannot reactivate members directly') FROM u;
+SELECT is((SELECT count(*)::int FROM public.tenant_memberships), 1, 'owner: sees only own membership');
+
+
+-- =====================================================
+-- PLATFORM ADMIN (aal2): member management and last-owner protection
+-- =====================================================
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000004ad","role":"authenticated","aal":"aal2"}';
+
+SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a4', 'client') $$,
+    'platform admin: can change a viewer to client');
+SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1', 'admin') $$,
+    '23514', NULL, 'platform admin: last owner cannot be demoted');
+SELECT throws_ok($$ SELECT public.deactivate_member('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1') $$,
+    '23514', NULL, 'platform admin: last owner cannot be deactivated');
+SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a2', 'owner') $$,
+    'platform admin: can promote an admin to owner');
+SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1', 'admin') $$,
+    'platform admin: can demote an owner once another owner exists');
+SELECT lives_ok($$ UPDATE public.tenant_memberships SET status = 'active'
+                   WHERE user_id = '00000000-0000-4000-8000-0000000004a5' $$,
+    'platform admin: can reactivate a member directly');
+SELECT is((SELECT count(*)::int FROM public.tenant_memberships WHERE tenant_id = 'a4000000-0000-4000-8000-000000000000'), 7,
+    'platform admin: sees every membership of the tenant');
+
+-- H2: member changes are attributed to the staff member who made them.
 RESET ROLE;
 SELECT results_eq(
     $$ SELECT user_id, actor_role FROM public.audit_logs
        WHERE action = 'tenant_memberships.update'
          AND entity_type = 'tenant_memberships'
          AND details -> 'new' ->> 'user_id' = '00000000-0000-4000-8000-0000000004a4' $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000004a2'::uuid, 'authenticated'::text) $$,
-    'audit: role change attributed to the admin who made it');
+    $$ VALUES ('00000000-0000-4000-8000-0000000004ad'::uuid, 'authenticated'::text) $$,
+    'audit: role change attributed to the platform admin who made it');
+-- Restore the fixture state used by the next sections.
+UPDATE public.tenant_memberships SET status = 'inactive' WHERE user_id = '00000000-0000-4000-8000-0000000004a5';
 SET LOCAL ROLE authenticated;
-
-
--- =====================================================
--- OWNER of A: last-owner protection
--- =====================================================
-SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000004a1","role":"authenticated"}';
-
-SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1', 'admin') $$,
-    '23514', NULL, 'owner: last owner cannot demote self');
-SELECT throws_ok($$ SELECT public.deactivate_member('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1') $$,
-    '23514', NULL, 'owner: last owner cannot deactivate self');
-SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a2', 'owner') $$,
-    'owner: can promote an admin to owner');
-SELECT lives_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a1', 'admin') $$,
-    'owner: can step down once another owner exists');
-SELECT throws_ok($$ SELECT public.change_member_role('a4000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000004a2', 'client') $$,
-    '42501', NULL, 'former owner (now admin): cannot demote the new owner');
 
 
 -- =====================================================

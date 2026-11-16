@@ -20,7 +20,8 @@ type AuthActions = {
   signOut: () => Promise<void>;
   requestPasswordReset: (email: string) => Promise<void>;
   updatePassword: (password: string) => Promise<void>;
-  acceptInvitation: (token: string) => Promise<void>;
+  /** Exchanges a single-use password link (token_hash) for a recovery session. */
+  verifyPasswordLink: (tokenHash: string) => Promise<void>;
   refreshContext: () => Promise<void>;
   setCurrentTenant: (tenantId: string) => void;
 };
@@ -163,14 +164,17 @@ export function AuthProvider({ children, supabase, appUrl }: AuthProviderProps) 
     [supabase],
   );
 
-  const acceptInvitation = useCallback(
-    async (token: string) => {
-      const { error } = await supabase.rpc("accept_invitation", { p_token: token });
-      if (error) {
-        throw new Error(
-          "We couldn't accept this invitation. Confirm you are signed in with the invited, verified email address and that the invitation is still valid.",
-        );
+  // Password links issued by PRISIM staff (and, once SMTP is configured,
+  // reset e-mails) carry a one-time token_hash. Verifying it works in any
+  // browser, unlike the PKCE code flow, and replaces any current session.
+  const verifyPasswordLink = useCallback(
+    async (tokenHash: string) => {
+      const { data, error } = await supabase.auth.verifyOtp({ token_hash: tokenHash, type: "recovery" });
+      if (error || !data.session) {
+        throw new Error("This password link has expired or was already used. Ask your PRISIM team for a new link.");
       }
+      setSession(data.session);
+      setAuthError(null);
     },
     [supabase],
   );
@@ -208,14 +212,14 @@ export function AuthProvider({ children, supabase, appUrl }: AuthProviderProps) 
       signOut,
       requestPasswordReset,
       updatePassword,
-      acceptInvitation,
+      verifyPasswordLink,
       refreshContext,
       setCurrentTenant,
     }),
     [
       authError,
       authLoading,
-      acceptInvitation,
+      verifyPasswordLink,
       context,
       contextQuery.data,
       contextQuery.error,

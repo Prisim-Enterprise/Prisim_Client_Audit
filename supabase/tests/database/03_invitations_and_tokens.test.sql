@@ -57,10 +57,24 @@ INSERT INTO public.oauth_connections (id, tenant_id, provider, account_name) VAL
 
 -- =====================================================
 -- INVITATIONS
+-- Invitation acceptance is retired (20261113120000): accounts are created by
+-- PRISIM staff. No API role may execute accept_invitation. Its validation is
+-- still exercised below as the function owner with the user's JWT claims, so
+-- the function stays safe should it ever be re-enabled.
 -- =====================================================
 SET LOCAL ROLE authenticated;
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a1","role":"authenticated"}';
+SELECT throws_ok($$ SELECT public.accept_invitation('valid-token-0123456789abcdef0123456789') $$,
+    '42501', NULL, 'invite: authenticated users cannot execute accept_invitation (retired)');
+SELECT ok(NOT has_function_privilege('authenticated', 'public.accept_invitation(text)', 'EXECUTE'),
+    'invite: authenticated has no EXECUTE on accept_invitation');
+SELECT ok(NOT has_function_privilege('service_role', 'public.accept_invitation(text)', 'EXECUTE'),
+    'invite: service_role has no EXECUTE on accept_invitation');
+SELECT ok(NOT EXISTS (SELECT 1 FROM public.tenant_memberships WHERE user_id = '00000000-0000-4000-8000-0000000003a1'),
+    'invite: the rejected call created no membership');
+RESET ROLE;
 
--- Invitee
+-- Invitee (function owner, invitee's claims)
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a1","role":"authenticated"}';
 
 SELECT throws_ok($$ SELECT public.accept_invitation('short') $$,
@@ -71,7 +85,7 @@ SELECT throws_ok($$ SELECT public.accept_invitation('expired-token-0123456789abc
     '22023', NULL, 'invite: token addressed to another e-mail rejected');
 SELECT is(public.accept_invitation('valid-token-0123456789abcdef0123456789'),
     'a3000000-0000-4000-8000-000000000000'::uuid, 'invite: valid token accepted and returns tenant id');
-SELECT results_eq($$ SELECT tenant_id, role, status FROM public.tenant_memberships $$,
+SELECT results_eq($$ SELECT tenant_id, role, status FROM public.tenant_memberships WHERE user_id = '00000000-0000-4000-8000-0000000003a1' $$,
     $$ VALUES ('a3000000-0000-4000-8000-000000000000'::uuid, 'manager'::text, 'active'::text) $$,
     'invite: membership created with the invited role');
 SELECT ok(public.is_tenant_member('a3000000-0000-4000-8000-000000000000'), 'invite: invitee now has tenant access');
@@ -101,6 +115,7 @@ SELECT is((SELECT role FROM public.tenant_memberships WHERE user_id = '00000000-
 -- Invitation creation is authorized by an aal2 platform-admin action.
 -- The browser role cannot execute the token-hashing RPC.
 -- -----------------------------------------------------
+SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create') $$,
     '42501', NULL, 'tenant owner: cannot authorize platform invitation creation');
@@ -190,14 +205,18 @@ SELECT is((SELECT status FROM public.tenant_invitations WHERE id = (SELECT id FR
 
 RESET ROLE;
 SET LOCAL ROLE authenticated;
+-- Revoking is staff-only; terminal invitations cannot be revoked again.
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
--- Revoke through the RPC; terminal invitations cannot be revoked again.
+SELECT throws_ok($$ SELECT public.revoke_invitation('a3000000-0000-4000-8000-0000000000e3') $$,
+    '42501', NULL, 'revoke: a tenant owner cannot revoke invitations');
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
 SELECT lives_ok($$ SELECT public.revoke_invitation('a3000000-0000-4000-8000-0000000000e3') $$,
-    'revoke: owner revokes a pending invitation');
+    'revoke: platform admin revokes a pending invitation');
 SELECT throws_ok($$ SELECT public.revoke_invitation('a3000000-0000-4000-8000-0000000000e3') $$,
     '22023', NULL, 'revoke: already revoked invitation cannot be revoked again');
+RESET ROLE;
 
--- Mixed-case auth e-mail accepts the lower-cased invitation.
+-- Mixed-case auth e-mail accepts the lower-cased invitation (function owner).
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a5","role":"authenticated"}';
 SELECT is(public.accept_invitation((SELECT token FROM issued WHERE label = 'mixed')),
     'a3000000-0000-4000-8000-000000000000'::uuid, 'case: mixed-case account e-mail accepts the invitation');
@@ -209,6 +228,7 @@ SELECT throws_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FRO
 SELECT lives_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FROM issued WHERE label = 'resend-2')),
     'former: joins with the current invitation');
 
+SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
 INSERT INTO invite_actions
 SELECT 'stale', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
@@ -221,17 +241,21 @@ FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'stal
 RESET ROLE;
 SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
+SELECT throws_ok($$ SELECT public.deactivate_member('a3000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000003a6') $$,
+    '42501', NULL, 'inactive: a tenant owner cannot deactivate members');
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
 SELECT lives_ok($$ SELECT public.deactivate_member('a3000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000003a6') $$,
-    'inactive: owner deactivates the member');
+    'inactive: platform admin deactivates the member');
 SELECT is((SELECT status FROM public.tenant_invitations WHERE id = (SELECT id FROM issued WHERE label = 'stale')),
     'revoked', 'inactive: deactivation revokes the member''s pending invitations');
 
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a6","role":"authenticated"}';
 SELECT ok(NOT public.is_tenant_member('a3000000-0000-4000-8000-000000000000'), 'inactive: access removed');
+RESET ROLE;
 SELECT throws_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FROM issued WHERE label = 'stale')),
     '22023', NULL, 'inactive: an old invitation cannot restore access');
 
-SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a4","role":"authenticated"}';
+SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003ad","role":"authenticated","aal":"aal2"}';
 INSERT INTO invite_actions
 SELECT 'rejoin', action_id FROM public.begin_privileged_action('a3000000-0000-4000-8000-000000000000', 'invitation.create');
@@ -242,12 +266,12 @@ SELECT 'rejoin', invitation_id, repeat('f', 64)
 FROM public.create_invitation((SELECT id FROM invite_actions WHERE label = 'rejoin'),
     'a3000000-0000-4000-8000-000000000000', 'former@inv.test', 'viewer', pg_temp.invite_token_hash(repeat('f', 64)));
 RESET ROLE;
-SET LOCAL ROLE authenticated;
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000003a6","role":"authenticated"}';
 SELECT lives_ok(format('SELECT public.accept_invitation(%L)', (SELECT token FROM issued WHERE label = 'rejoin')),
     'inactive: a fresh invitation re-admits the member');
 SELECT results_eq($$ SELECT role, status FROM public.tenant_memberships WHERE user_id = '00000000-0000-4000-8000-0000000003a6' $$,
     $$ VALUES ('viewer'::text, 'active'::text) $$, 'inactive: re-admitted with the newly invited role');
+SET LOCAL ROLE authenticated;
 
 -- -----------------------------------------------------
 -- token_hash and direct writes, even for an aal2 platform admin

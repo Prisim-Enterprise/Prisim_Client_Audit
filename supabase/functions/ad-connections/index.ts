@@ -14,6 +14,10 @@ function dependencies(): AdConnectionDependencies {
       const { data, error } = await service.auth.getUser(jwt);
       return error || !data.user ? null : data.user.id;
     },
+    async isPlatformAdmin(jwt) {
+      const { data, error } = await userClient(config, jwt).rpc("get_my_context");
+      return !error && (data as { is_platform_admin?: boolean } | null)?.is_platform_admin === true;
+    },
     async beginAction(jwt, tenantId, action, targetId) {
       const { data, error } = await userClient(config, jwt).rpc("begin_privileged_action", {
         p_tenant_id: tenantId,

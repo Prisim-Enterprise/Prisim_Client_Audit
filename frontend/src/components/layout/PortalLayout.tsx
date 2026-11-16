@@ -11,7 +11,6 @@ import {
   Menu,
   ShieldCheck,
   TriangleAlert,
-  UserCog,
   Users,
   X,
 } from "lucide-react";
@@ -48,7 +47,6 @@ const clientNavigation = [
   { label: "Campaigns", path: "campaigns", icon: BarChart3 },
   { label: "Audit findings", path: "audits", icon: ShieldCheck },
   { label: "Reports", path: "reports", icon: FileText },
-  { label: "Team", path: "team", icon: UserCog, minimumRole: "admin" as const },
 ];
 
 export function PortalLayout({ portal }: { portal: Portal }) {
@@ -57,10 +55,9 @@ export function PortalLayout({ portal }: { portal: Portal }) {
   const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
   const currentMembership = memberships.find((membership) => membership.slug === tenantSlug) ?? null;
-  const canManageTeam = currentMembership ? ["owner", "admin"].includes(currentMembership.role) : false;
   const navigation = portal === "staff"
     ? staffNavigation
-    : clientNavigation.filter((item) => !("minimumRole" in item) || canManageTeam);
+    : clientNavigation;
   const root = portal === "staff" ? "/admin" : `/app/${tenantSlug}`;
   const displayName = profile?.full_name?.trim() || user?.email?.split("@")[0] || "Account";
   const initials = displayName.slice(0, 1).toUpperCase();

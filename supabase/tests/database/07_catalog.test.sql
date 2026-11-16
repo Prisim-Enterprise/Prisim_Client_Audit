@@ -42,7 +42,6 @@ SELECT results_eq(
        WHERE nspname = 'public' AND has_function_privilege('authenticated', oid, 'EXECUTE')
        ORDER BY 1 $$,
     $$ VALUES
-        ('accept_invitation(text)'),
         ('begin_privileged_action(uuid,text,uuid)'),
         ('change_member_role(uuid,uuid,text)'),
         ('deactivate_member(uuid,uuid)'),
@@ -99,6 +98,30 @@ SELECT results_eq(
         ('store_oauth_tokens(uuid,text,text,timestamp with time zone,uuid)'),
         ('upsert_discovered_ad_accounts(uuid,uuid,jsonb,text,text,text[])') $$,
     'service_role-only public functions are exactly the approved RPCs');
+
+-- Retired invitation acceptance (20261113120000): no API role may call it.
+SELECT ok(NOT has_function_privilege('authenticated', 'public.accept_invitation(text)', 'EXECUTE')
+          AND NOT has_function_privilege('service_role', 'public.accept_invitation(text)', 'EXECUTE')
+          AND NOT has_function_privilege('anon', 'public.accept_invitation(text)', 'EXECUTE'),
+    'accept_invitation is not executable by any API role');
+
+-- Client read policies removed by 20261113120000 stay removed.
+SELECT is_empty(
+    $$ SELECT tablename || ': ' || policyname FROM pg_policies
+       WHERE schemaname = 'public'
+         AND policyname IN ('Tenant admins read tenant memberships', 'Tenant admins read invitations',
+                            'Tenant admins read tenant audit logs', 'Tenant managers read connections',
+                            'Tenant managers read member profiles') $$,
+    'client read policies for staff-managed data are absent');
+
+-- Every write-capable policy on client-management tables requires a platform admin.
+SELECT is_empty(
+    $$ SELECT tablename || ': ' || policyname FROM pg_policies
+       WHERE schemaname = 'public'
+         AND tablename IN ('tenants', 'tenant_memberships', 'tenant_invitations', 'oauth_connections', 'ad_accounts')
+         AND cmd <> 'SELECT'
+         AND COALESCE(qual, '') || COALESCE(with_check, '') NOT LIKE '%is_platform_admin()%' $$,
+    'client-management tables: every non-SELECT policy requires a platform admin');
 
 -- private.use_privileged_action binds identities; only definer RPCs may call it.
 SELECT ok(NOT has_function_privilege('service_role',  'private.use_privileged_action(uuid,text,uuid,uuid)', 'EXECUTE'),

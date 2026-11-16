@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, ClipboardCheck } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Circle, ClipboardCheck } from "lucide-react";
 import { useEffect } from "react";
 import { useForm } from "react-hook-form";
 import { Link, useParams, useSearchParams } from "react-router-dom";
@@ -13,25 +13,24 @@ import { Field } from "../../components/ui/Field";
 import { Input } from "../../components/ui/Input";
 import { LoadingState } from "../../components/ui/LoadingState";
 import { EmptyState, ErrorState, PageHeader, QueryView, SectionCard } from "../../components/ui/States";
-import { useAuth } from "../../context/AuthProvider";
 import { PerformancePanel } from "../../features/analytics/PerformancePanel";
 import { AuditRunTable, RunAuditButton } from "../../features/audits/AuditComponents";
 import { ConnectionsPanel } from "../../features/connections/ConnectionsPanel";
 import { ReportsTable } from "../../features/reports/ReportsTable";
-import { TeamPanel } from "../../features/team/TeamPanel";
+import { ClientUsersPanel } from "../../features/team/TeamPanel";
 import { queryKeys, useApi, useRealtime } from "../../lib/api/ApiProvider";
 import { errorMessage } from "../../lib/api/errors";
-import type { Tenant, TenantInput, TenantStatus } from "../../lib/api/types";
+import type { AdAccount, Tenant, TenantInput, TenantStatus } from "../../lib/api/types";
 import { ActivityList } from "./ActivityPage";
 import { tenantSchema } from "./ClientsPage";
 
-type Tab = "overview" | "team" | "connections" | "audits" | "reports" | "activity";
+type Tab = "overview" | "users" | "connections" | "audits" | "reports" | "activity";
 const TABS: Array<{ value: Tab; label: string }> = [
   { value: "overview", label: "Overview" },
+  { value: "users", label: "Users" },
   { value: "connections", label: "Connections" },
   { value: "audits", label: "Audits" },
   { value: "reports", label: "Reports" },
-  { value: "team", label: "Team" },
   { value: "activity", label: "Activity" },
 ];
 
@@ -59,21 +58,22 @@ export function ClientDetailPage() {
         actions={tenant.status === "active" ? <RunAuditButton tenantId={tenant.id} /> : undefined}
       />
       <Tabs label="Client sections" value={tab} onChange={(value) => setParams({ tab: value }, { replace: true })} items={TABS} />
-      {tab === "overview" && <OverviewTab tenant={tenant} />}
+      {tab === "overview" && <OverviewTab tenant={tenant} openTab={(value) => setParams({ tab: value }, { replace: true })} />}
+      {tab === "users" && <ClientUsersPanel tenantId={tenant.id} tenantActive={tenant.status === "active"} />}
       {tab === "connections" && <ConnectionsPanel tenantId={tenant.id} canManage />}
       {tab === "audits" && <AuditsTab tenantId={tenant.id} />}
       {tab === "reports" && <ReportsTab tenantId={tenant.id} />}
-      {tab === "team" && <TeamTab tenantId={tenant.id} />}
       {tab === "activity" && <SectionCard title="Activity"><ActivityList tenantId={tenant.id} /></SectionCard>}
     </div>
   );
 }
 
-function OverviewTab({ tenant }: { tenant: Tenant }) {
+function OverviewTab({ tenant, openTab }: { tenant: Tenant; openTab: (tab: Tab) => void }) {
   const api = useApi();
   const accounts = useQuery({ queryKey: queryKeys.adAccounts(tenant.id), queryFn: () => api.listAdAccounts(tenant.id) });
   return (
     <div className="space-y-6">
+      <OnboardingChecklist tenant={tenant} accounts={accounts.data} openTab={openTab} />
       <ProfileForm tenant={tenant} />
       <div>
         <h2 className="mb-3 text-lg font-semibold text-ink-950">Performance</h2>
@@ -179,7 +179,46 @@ function ReportsTab({ tenantId }: { tenantId: string }) {
   );
 }
 
-function TeamTab({ tenantId }: { tenantId: string }) {
-  const { user } = useAuth();
-  return <TeamPanel tenantId={tenantId} actorRole="platform_admin" currentUserId={user?.id ?? null} />;
+
+/**
+ * Onboarding status derived from the client's existing records (no separate
+ * status field): each step links to the tab where staff complete it.
+ */
+function OnboardingChecklist({ tenant, accounts, openTab }: { tenant: Tenant; accounts: AdAccount[] | undefined; openTab: (tab: Tab) => void }) {
+  const api = useApi();
+  const members = useQuery({ queryKey: queryKeys.members(tenant.id), queryFn: () => api.listMembers(tenant.id) });
+  const runs = useQuery({ queryKey: queryKeys.auditRuns(tenant.id), queryFn: () => api.listAuditRuns(tenant.id) });
+  const reports = useQuery({ queryKey: queryKeys.reports(tenant.id), queryFn: () => api.listReports(tenant.id) });
+  if (!accounts || members.isLoading || runs.isLoading || reports.isLoading) return null;
+
+  const steps: Array<{ label: string; done: boolean; tab: Tab }> = [
+    { label: "Business and contact details", done: Boolean(tenant.email && tenant.primary_contact_name), tab: "overview" },
+    { label: "Client owner account created", done: (members.data ?? []).some((member) => member.role === "owner" && member.status === "active"), tab: "users" },
+    { label: "Ad account connected", done: accounts.length > 0, tab: "connections" },
+    { label: "Campaign data synced", done: accounts.some((account) => account.last_synced_at), tab: "connections" },
+    { label: "First audit published", done: (runs.data ?? []).some((run) => run.status === "published"), tab: "audits" },
+    { label: "Report shared with the client", done: (reports.data ?? []).some((report) => report.visibility === "client" && report.status === "ready"), tab: "reports" },
+  ];
+  const complete = steps.filter((step) => step.done).length;
+  return (
+    <SectionCard title="Onboarding" description={complete === steps.length ? "Onboarding complete." : `${complete} of ${steps.length} steps complete.`}>
+      <ol className="grid gap-2 p-5 sm:grid-cols-2 sm:p-6 xl:grid-cols-3">
+        {steps.map((step) => (
+          <li key={step.label}>
+            <button
+              type="button"
+              onClick={() => openTab(step.tab)}
+              className="flex w-full items-center gap-2.5 rounded-lg border border-slate-200 px-3 py-2.5 text-left text-sm transition hover:border-slate-300 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent-500"
+            >
+              {step.done
+                ? <CheckCircle2 aria-hidden="true" className="h-4 w-4 shrink-0 text-emerald-600" />
+                : <Circle aria-hidden="true" className="h-4 w-4 shrink-0 text-slate-300" />}
+              <span className={step.done ? "text-slate-500" : "font-medium text-ink-950"}>{step.label}</span>
+              <span className="sr-only">{step.done ? "(done)" : "(to do)"}</span>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </SectionCard>
+  );
 }

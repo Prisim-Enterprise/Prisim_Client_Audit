@@ -9,9 +9,11 @@
 //   disconnect  -> oauth.disconnect action, provider revocation (best
 //                  effort) and Vault purge
 //
-// Tokens never leave this function. Every user-initiated change goes through
-// begin_privileged_action with the caller's own JWT, so SQL decides who may
-// act and the audit trail names the real user.
+// Only PRISIM staff (aal2 platform admins) may use this function: client
+// users never start, complete or remove connections. The handler checks this
+// first; the database enforces it again (begin_privileged_action is staff-only
+// since 20261113120000), so SQL decides who may act and the audit trail
+// names the staff member. Tokens never leave this function.
 
 import { HttpError, isUuid, json, readBody } from "../_shared/http.ts";
 import { pkceChallenge, pkceVerifier, randomNonce, signState, verifyState } from "../_shared/oauth-state.ts";
@@ -23,6 +25,8 @@ export type ConnectionRow = { id: string; tenant_id: string; provider: "meta" | 
 export type AdConnectionDependencies = {
   env: EnvReader;
   authenticate(jwt: string): Promise<string | null>;
+  /** get_my_context().is_platform_admin with the caller's JWT (listed + aal2). */
+  isPlatformAdmin(jwt: string): Promise<boolean>;
   beginAction(jwt: string, tenantId: string, action: "oauth.connect" | "oauth.disconnect", targetId?: string): Promise<string | null>;
   cleanupPendingConnections(tenantId: string): Promise<void>;
   createConnection(actionId: string, tenantId: string, provider: "meta" | "google"): Promise<string | null>;
@@ -48,9 +52,10 @@ function provider(value: unknown): "meta" | "google" {
 export function createAdConnectionsHandler(deps: AdConnectionDependencies) {
   return async (request: Request, origin: string, jwt: string | null): Promise<Response> => {
     if (!jwt) throw new HttpError(401, "not_authenticated");
-    const body = await readBody(request);
     const userId = await deps.authenticate(jwt);
     if (!userId) throw new HttpError(401, "not_authenticated");
+    if (!(await deps.isPlatformAdmin(jwt))) throw new HttpError(403, "platform_admin_required");
+    const body = await readBody(request);
     const status = providerStatus(deps.env);
 
     switch (body.action) {

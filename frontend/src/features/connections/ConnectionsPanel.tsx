@@ -119,7 +119,8 @@ function ProviderCard({
     mutationFn: () => api.startOAuth(tenantId, provider),
     onSuccess: ({ authorizeUrl }) => {
       try {
-        sessionStorage.setItem(OAUTH_RETURN_KEY, location.pathname);
+        // Keep the query (e.g. ?tab=connections on the staff client page).
+        sessionStorage.setItem(OAUTH_RETURN_KEY, location.pathname + location.search);
       } catch {
         // Storage unavailable: the callback falls back to the workspace home.
       }

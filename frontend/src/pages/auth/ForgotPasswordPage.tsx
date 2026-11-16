@@ -41,6 +41,7 @@ export function ForgotPasswordPage() {
           <h1 className="text-3xl font-semibold tracking-tight text-ink-950">Check your inbox</h1>
           <p className="mt-3 text-sm leading-6 text-slate-500">
             If an account matches that email address, a password reset link is on its way.
+            If nothing arrives within a few minutes, ask your PRISIM team for a new password link.
           </p>
           <Link to="/login" className="mt-8 inline-flex items-center gap-2 text-sm font-medium text-accent-700 hover:text-accent-800">
             <ArrowLeft aria-hidden="true" className="h-4 w-4" /> Back to sign in
@@ -54,7 +55,8 @@ export function ForgotPasswordPage() {
             </Link>
             <h1 className="mt-4 text-3xl font-semibold tracking-tight text-ink-950">Reset your password</h1>
             <p className="mt-3 text-sm leading-6 text-slate-500">
-              Enter your account email and we’ll send a secure reset link.
+              Enter your account email and we’ll send a secure reset link. You can also ask your
+              PRISIM team for a new password link at any time.
             </p>
           </div>
           {formError && <Alert tone="error" className="mb-5">{formError}</Alert>}

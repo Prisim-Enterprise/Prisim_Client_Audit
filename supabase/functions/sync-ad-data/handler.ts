@@ -1,6 +1,6 @@
 // sync-ad-data: pulls campaigns and daily campaign metrics from Meta / Google.
 //
-//   start          (user JWT)  manager+ or aal2 staff queues a manual sync or
+//   start          (user JWT)  aal2 PRISIM staff only: queues a manual sync or
 //                              backfill for one connection; processed in the
 //                              background after the 202 response
 //   run-scheduled  (cron)      authenticated by the x-prisim-cron-secret header;
@@ -16,6 +16,8 @@ import type { ClaimedJob } from "../_shared/sync.ts";
 export type SyncHandlerDependencies = {
   cronSecret: string | undefined;
   authenticate(jwt: string): Promise<string | null>;
+  /** get_my_context().is_platform_admin with the caller's JWT (listed + aal2). */
+  isPlatformAdmin(jwt: string): Promise<boolean>;
   connectionTenant(connectionId: string): Promise<string | null>;
   beginSyncAction(jwt: string, tenantId: string, connectionId: string): Promise<string | null>;
   startJob(actionId: string, connectionId: string, jobType: "manual_sync" | "backfill"): Promise<{ jobId: string } | { conflict: true } | null>;
@@ -68,6 +70,7 @@ export function createSyncHandler(deps: SyncHandlerDependencies) {
       if (!jwt) throw new HttpError(401, "not_authenticated");
       const userId = await deps.authenticate(jwt);
       if (!userId) throw new HttpError(401, "not_authenticated");
+      if (!(await deps.isPlatformAdmin(jwt))) throw new HttpError(403, "platform_admin_required");
       if (!isUuid(body.connectionId)) throw new HttpError(400, "invalid_request");
       const jobType = body.jobType === "backfill" ? "backfill" : "manual_sync";
 

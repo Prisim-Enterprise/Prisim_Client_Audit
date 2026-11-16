@@ -59,6 +59,10 @@ function dependencies(): SyncHandlerDependencies {
       const { data, error } = await service.auth.getUser(jwt);
       return error || !data.user ? null : data.user.id;
     },
+    async isPlatformAdmin(jwt) {
+      const { data, error } = await userClient(config, jwt).rpc("get_my_context");
+      return !error && (data as { is_platform_admin?: boolean } | null)?.is_platform_admin === true;
+    },
     async connectionTenant(connectionId) {
       const { data } = await service.from("oauth_connections").select("tenant_id").eq("id", connectionId).maybeSingle();
       return data?.tenant_id ?? null;

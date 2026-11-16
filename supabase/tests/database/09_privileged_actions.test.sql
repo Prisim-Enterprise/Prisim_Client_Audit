@@ -3,11 +3,16 @@
 --      authenticated user who initiated it
 -- Run locally with: npx supabase test db
 --
+-- Since 20261113120000 only aal2 platform admins (PRISIM staff) may start
+-- privileged actions (connect, disconnect, sync, report, invitation), and
+-- service_role RPCs accept only actions started by a platform admin.
+--
 -- Fixture map
 --   Tenant A  a9...  active:    owner ...09a1, manager ...09a2, client ...09a3
---   Tenant B  b9...  active:    manager ...09b1
+--   Tenant B  b9...  active:    owner ...09b1
 --   Tenant S  c9...  suspended: manager ...09c1
 --   ...09ad   platform admin
+--   ...09ae   second platform admin (later revoked)
 --   Connections: A ...a9..c0 (connected), B ...b9..c0 (connected)
 --
 -- Note: in production every PostgREST call is its own transaction. These
@@ -22,10 +27,13 @@ INSERT INTO auth.users (id, email, email_confirmed_at, aud, role) VALUES
     ('00000000-0000-4000-8000-0000000009a1', 'owner@a9.test',   NOW(), 'authenticated', 'authenticated'),
     ('00000000-0000-4000-8000-0000000009a2', 'manager@a9.test', NOW(), 'authenticated', 'authenticated'),
     ('00000000-0000-4000-8000-0000000009a3', 'client@a9.test',  NOW(), 'authenticated', 'authenticated'),
-    ('00000000-0000-4000-8000-0000000009b1', 'manager@b9.test', NOW(), 'authenticated', 'authenticated'),
+    ('00000000-0000-4000-8000-0000000009b1', 'owner@b9.test',   NOW(), 'authenticated', 'authenticated'),
     ('00000000-0000-4000-8000-0000000009c1', 'manager@c9.test', NOW(), 'authenticated', 'authenticated'),
-    ('00000000-0000-4000-8000-0000000009ad', 'staff@p9.test',   NOW(), 'authenticated', 'authenticated');
-INSERT INTO public.platform_admins (user_id) VALUES ('00000000-0000-4000-8000-0000000009ad');
+    ('00000000-0000-4000-8000-0000000009ad', 'staff@p9.test',   NOW(), 'authenticated', 'authenticated'),
+    ('00000000-0000-4000-8000-0000000009ae', 'staff2@p9.test',  NOW(), 'authenticated', 'authenticated');
+INSERT INTO public.platform_admins (user_id) VALUES
+    ('00000000-0000-4000-8000-0000000009ad'),
+    ('00000000-0000-4000-8000-0000000009ae');
 
 INSERT INTO public.tenants (id, business_name, slug, status) VALUES
     ('a9000000-0000-4000-8000-000000000000', 'Actions A', 'actions-a', 'active'),
@@ -47,15 +55,45 @@ INSERT INTO public.oauth_connections (id, tenant_id, provider, status) VALUES
 CREATE TEMP TABLE acts (label TEXT PRIMARY KEY, id UUID);
 GRANT ALL ON acts TO authenticated, service_role;
 
+-- A manager-authority action as created before 20261113120000 (still within
+-- its 15 minutes). Inserted as the table owner: no API role can do this.
+INSERT INTO private.privileged_actions (id, tenant_id, actor_id, actor_authority, action)
+VALUES ('a9000000-0000-4000-8000-0000000000e0', 'a9000000-0000-4000-8000-000000000000',
+        '00000000-0000-4000-8000-0000000009a2', 'manager', 'oauth.connect');
+INSERT INTO acts VALUES ('legacy-manager', 'a9000000-0000-4000-8000-0000000000e0');
+
 
 -- =====================================================
 -- Step 1: begin_privileged_action with the user's own JWT
 -- =====================================================
 SET LOCAL ROLE authenticated;
 
+-- Every tenant role is denied every action, for its own tenant too.
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009a3","role":"authenticated"}';
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
     '42501', NULL, 'client: cannot start privileged actions');
+
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009a2","role":"authenticated"}';
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
+    '42501', NULL, 'manager: cannot start an OAuth connection');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.disconnect', 'a9000000-0000-4000-8000-0000000000c0') $$,
+    '42501', NULL, 'manager: cannot disconnect');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'sync.start', 'a9000000-0000-4000-8000-0000000000c0') $$,
+    '42501', NULL, 'manager: cannot start a sync');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'report.generate') $$,
+    '42501', NULL, 'manager: cannot authorize report generation');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('b9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
+    '42501', NULL, 'manager A: cannot start actions for tenant B');
+
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009a1","role":"authenticated"}';
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
+    '42501', NULL, 'owner: cannot start an OAuth connection');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'sync.start', 'a9000000-0000-4000-8000-0000000000c0') $$,
+    '42501', NULL, 'owner: cannot start a sync');
+-- An aal2 session does not turn a tenant owner into staff.
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009a1","role":"authenticated","aal":"aal2"}';
+SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
+    '42501', NULL, 'owner with aal2: still cannot start privileged actions');
 
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009c1","role":"authenticated"}';
 SELECT throws_ok($$ SELECT public.begin_privileged_action('c9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
@@ -69,37 +107,44 @@ SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009ad","
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
     '42501', NULL, 'platform admin aal1: cannot start privileged actions');
 
-SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009a2","role":"authenticated"}';
-SELECT throws_ok($$ SELECT public.begin_privileged_action('b9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
-    '42501', NULL, 'manager A: cannot start actions for tenant B');
+-- Platform admin (aal2): validation of action and target still applies.
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009ad","role":"authenticated","aal":"aal2"}';
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'sync.start', 'b9000000-0000-4000-8000-0000000000c0') $$,
-    '22023', NULL, 'manager A: cannot target another tenant''s connection');
+    '22023', NULL, 'platform admin: cannot target another tenant''s connection');
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'tenant.delete') $$,
     '22023', NULL, 'unknown action rejected');
 SELECT throws_ok($$ SELECT public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'sync.start') $$,
     '22023', NULL, 'sync.start requires a target connection');
+SELECT throws_ok($$ SELECT public.begin_privileged_action('d9000000-0000-4000-8000-000000000000', 'oauth.connect') $$,
+    '22023', NULL, 'unknown tenant rejected');
 
 INSERT INTO acts SELECT 'connect',    action_id FROM public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect');
 INSERT INTO acts SELECT 'sync',       action_id FROM public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'sync.start', 'a9000000-0000-4000-8000-0000000000c0');
 INSERT INTO acts SELECT 'disconnect', action_id FROM public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.disconnect', 'a9000000-0000-4000-8000-0000000000c0');
 INSERT INTO acts SELECT 'expiring',   action_id FROM public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect');
-SELECT is((SELECT count(*)::int FROM acts), 4, 'manager A: starts privileged actions for own tenant');
+INSERT INTO acts SELECT 'admin-connect', action_id FROM public.begin_privileged_action('b9000000-0000-4000-8000-000000000000', 'oauth.connect');
+SELECT is((SELECT count(*)::int FROM acts WHERE label <> 'legacy-manager'), 5, 'platform admin aal2: starts actions for any tenant');
 
 SELECT throws_ok($$ SELECT * FROM private.privileged_actions $$,
     '42501', NULL, 'authenticated: cannot read the privileged action table');
 SELECT throws_ok($$ SELECT public.create_oauth_connection((SELECT id FROM acts WHERE label = 'connect'), 'a9000000-0000-4000-8000-000000000000', 'google') $$,
     '42501', NULL, 'authenticated: cannot call service_role workflow RPCs');
 
-SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009ad","role":"authenticated","aal":"aal2"}';
-INSERT INTO acts SELECT 'admin-connect', action_id FROM public.begin_privileged_action('b9000000-0000-4000-8000-000000000000', 'oauth.connect');
-SELECT ok(EXISTS (SELECT 1 FROM acts WHERE label = 'admin-connect'), 'platform admin aal2: can start actions for any tenant');
+-- The second admin starts an action and is then revoked (below).
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000009ae","role":"authenticated","aal":"aal2"}';
+INSERT INTO acts SELECT 'revoked-admin', action_id FROM public.begin_privileged_action('a9000000-0000-4000-8000-000000000000', 'oauth.connect');
 
 RESET ROLE;
 SELECT results_eq(
     $$ SELECT user_id, actor_role FROM public.audit_logs
        WHERE action = 'privileged_actions.insert' AND entity_id = (SELECT id FROM acts WHERE label = 'connect') $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000009a2'::uuid, 'authenticated'::text) $$,
-    'audit: starting a privileged action is recorded against the user');
+    $$ VALUES ('00000000-0000-4000-8000-0000000009ad'::uuid, 'authenticated'::text) $$,
+    'audit: starting a privileged action is recorded against the staff member');
+SELECT is((SELECT count(*)::int FROM private.privileged_actions
+           WHERE actor_id IN ('00000000-0000-4000-8000-0000000009a1', '00000000-0000-4000-8000-0000000009a2',
+                              '00000000-0000-4000-8000-0000000009a3', '00000000-0000-4000-8000-0000000009c1')
+             AND id <> 'a9000000-0000-4000-8000-0000000000e0'),
+    0, 'no tenant user created a privileged action');
 
 
 -- =====================================================
@@ -107,6 +152,10 @@ SELECT results_eq(
 -- =====================================================
 SET LOCAL ROLE service_role;
 SET LOCAL request.jwt.claims TO '{"role":"service_role"}';
+
+-- A manager action from before the migration is void.
+SELECT throws_ok(format('SELECT public.create_oauth_connection(%L, %L, %L)', (SELECT id FROM acts WHERE label = 'legacy-manager'), 'a9000000-0000-4000-8000-000000000000', 'google'),
+    '42501', NULL, 'legacy manager action is rejected by service_role RPCs');
 
 CREATE TEMP TABLE new_conn AS
 SELECT public.create_oauth_connection((SELECT id FROM acts WHERE label = 'connect'),
@@ -157,24 +206,28 @@ SELECT throws_ok($$ SELECT * FROM private.privileged_actions $$,
 
 RESET ROLE;
 
--- Expired actions and initiators who lost their role are rejected.
+-- Expired actions and initiators who lost staff status are rejected.
 UPDATE private.privileged_actions SET expires_at = NOW() - INTERVAL '1 minute'
 WHERE id = (SELECT id FROM acts WHERE label = 'expiring');
-UPDATE public.tenant_memberships SET role = 'client'
-WHERE user_id = '00000000-0000-4000-8000-0000000009a2';
+DELETE FROM public.platform_admins WHERE user_id = '00000000-0000-4000-8000-0000000009ae';
 
 SET LOCAL ROLE service_role;
 SELECT throws_ok(format('SELECT public.create_oauth_connection(%L, %L, %L)', (SELECT id FROM acts WHERE label = 'expiring'), 'a9000000-0000-4000-8000-000000000000', 'meta'),
     '42501', NULL, 'expired action is rejected');
-SELECT throws_ok(format('SELECT public.delete_oauth_tokens(%L, %L)', 'a9000000-0000-4000-8000-0000000000c0', (SELECT id FROM acts WHERE label = 'disconnect')),
-    '42501', NULL, 'action is rejected once the initiator is no longer manager+');
+SELECT throws_ok(format('SELECT public.create_oauth_connection(%L, %L, %L)', (SELECT id FROM acts WHERE label = 'revoked-admin'), 'a9000000-0000-4000-8000-000000000000', 'meta'),
+    '42501', NULL, 'action is rejected once the initiator is no longer a platform admin');
 
--- Platform-admin action
+-- Disconnect by the staff member who started it.
+SELECT set_config('prisim.privileged_action_id', '', TRUE);
+SELECT lives_ok(format('SELECT public.delete_oauth_tokens(%L, %L)', 'a9000000-0000-4000-8000-0000000000c0', (SELECT id FROM acts WHERE label = 'disconnect')),
+    'platform admin disconnect action: usable by service_role');
+
+-- Platform-admin action for another tenant
 SELECT set_config('prisim.privileged_action_id', '', TRUE);
 SELECT lives_ok(format('SELECT public.create_oauth_connection(%L, %L, %L)', (SELECT id FROM acts WHERE label = 'admin-connect'), 'b9000000-0000-4000-8000-000000000000', 'google'),
     'platform admin action: usable by service_role');
 
--- A binding never leaks into another tenant's rows in the same transaction.
+-- A binding (now: tenant B) never leaks into another tenant's rows in the same transaction.
 UPDATE public.tenants SET business_name = 'Actions A (renamed)' WHERE id = 'a9000000-0000-4000-8000-000000000000';
 SELECT set_config('prisim.privileged_action_id', 'not-a-uuid', TRUE);
 UPDATE public.tenants SET business_name = 'Actions S (renamed)' WHERE id = 'c9000000-0000-4000-8000-000000000000';
@@ -182,19 +235,19 @@ RESET ROLE;
 
 
 -- =====================================================
--- Step 3: the audit trail names the initiating user
+-- Step 3: the audit trail names the initiating staff member
 -- =====================================================
 SELECT results_eq(
     $$ SELECT user_id, actor_role, details ->> 'privileged_action_id' FROM public.audit_logs
        WHERE action = 'oauth_connections.insert' AND entity_id = (SELECT id FROM new_conn) $$,
-    format($$ VALUES ('00000000-0000-4000-8000-0000000009a2'::uuid, 'service_role'::text, %L::text) $$,
+    format($$ VALUES ('00000000-0000-4000-8000-0000000009ad'::uuid, 'service_role'::text, %L::text) $$,
            (SELECT id FROM acts WHERE label = 'connect')),
-    'audit: connection creation attributed to the manager, executed by service_role');
+    'audit: connection creation attributed to the staff member, executed by service_role');
 SELECT results_eq(
     $$ SELECT user_id FROM public.audit_logs
        WHERE action = 'oauth_credentials.insert' AND entity_id = (SELECT id FROM new_conn) $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000009a2'::uuid) $$,
-    'audit: token storage attributed to the manager');
+    $$ VALUES ('00000000-0000-4000-8000-0000000009ad'::uuid) $$,
+    'audit: token storage attributed to the staff member');
 SELECT results_eq(
     $$ SELECT user_id, details ? 'privileged_action_id' FROM public.audit_logs
        WHERE action = 'oauth_credentials.update' AND entity_id = (SELECT id FROM new_conn) $$,
@@ -203,13 +256,12 @@ SELECT results_eq(
 SELECT results_eq(
     $$ SELECT user_id FROM public.audit_logs
        WHERE action = 'sync_jobs.insert' AND entity_id = (SELECT id FROM new_job) $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000009a2'::uuid) $$,
-    'audit: manual sync attributed to the manager');
-SELECT results_eq(
-    $$ SELECT user_id FROM public.audit_logs
-       WHERE action = 'oauth_connections.insert' AND tenant_id = 'b9000000-0000-4000-8000-000000000000' AND actor_role = 'service_role' $$,
     $$ VALUES ('00000000-0000-4000-8000-0000000009ad'::uuid) $$,
-    'audit: platform-admin initiated work attributed to the platform admin');
+    'audit: manual sync attributed to the staff member');
+SELECT ok(EXISTS (SELECT 1 FROM public.audit_logs
+                  WHERE action = 'oauth_connections.insert' AND tenant_id = 'b9000000-0000-4000-8000-000000000000'
+                    AND actor_role = 'service_role' AND user_id = '00000000-0000-4000-8000-0000000009ad'),
+    'audit: platform-admin initiated work for tenant B attributed to the platform admin');
 SELECT results_eq(
     $$ SELECT user_id FROM public.audit_logs
        WHERE action = 'tenants.update' AND tenant_id = 'a9000000-0000-4000-8000-000000000000' $$,

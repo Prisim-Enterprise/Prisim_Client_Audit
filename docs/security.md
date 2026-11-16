@@ -38,7 +38,9 @@ pre-flight) and [edge-function-contract.md](edge-function-contract.md)
 | Unattributed or spoofed service-role work | Service-role workflows for a user require a **privileged action** that the user created with their own JWT (`begin_privileged_action`: role-checked, tenant- and target-bound, 15-minute expiry, revalidated on use). The audit trigger takes `user_id` from that action, never from a request. `service_role` can neither read nor create actions, and cannot set the binding through the API. |
 | `SECURITY DEFINER` hijack via `search_path` | All application functions use `SET search_path = ''` and schema-qualified names (asserted by `07_catalog.test.sql`) |
 | New function accidentally exposed | `07_catalog.test.sql` holds exact allowlists of functions executable by `authenticated` and `service_role` |
-| Open sign-up | Sign-ups disabled; accounts are created only by invitation |
+| Open sign-up | Sign-ups disabled; client accounts are created only by aal2 PRISIM staff (`manage-tenant-user`) |
+| Client self-service onboarding | None in the client portal: no team page, invitations or connection management. Staff create users, assign roles, connect ad accounts and remove access. |
+| Password link misuse | Links are Supabase recovery tokens: single use, expire with the Auth e-mail link expiry, issued only for active members of the given client and never for staff accounts (`platform_admins`). The token is removed from the address bar on arrival; no password is ever generated or sent. |
 
 ## Keys and secrets
 
@@ -96,7 +98,7 @@ hosted Auth, Storage and API settings are in
 [deployment-checklist.md](deployment-checklist.md), Phase B. Key points:
 
 - Public sign-up is off. Staff accounts are created by the project owner
-  (checklist C1); clients join only through invitations.
+  (checklist C1); client accounts are created only by PRISIM staff.
 - "Confirm email" must be on. Invitations are bound to a **confirmed** e-mail
   address (checklist P2 covers existing unconfirmed users).
 - MFA (TOTP) must be enabled. Platform-admin privileges require an `aal2`
@@ -140,3 +142,25 @@ authoritative procedure. It covers:
 Its "Hard rules" list the commands that must never be run against the hosted
 project, including `db reset --remote`, `migration repair`,
 `test db --remote` and `--include-seed`.
+
+## Client accounts
+
+PRISIM staff manage the whole client onboarding in the staff portal. In a
+client's **Users** tab an aal2 platform admin enters the person's e-mail, name
+and role (owner or viewer). The `manage-tenant-user` Edge Function:
+
+1. verifies the caller's JWT and the database's own admin rule
+   (`get_my_context`, listed + aal2);
+2. creates the Auth user with a confirmed e-mail and **no password** (or reuses
+   an existing non-staff account);
+3. inserts the membership with the **staff member's JWT**, so RLS and the
+   audit trigger apply and the audit log names the staff member;
+4. on request returns a single-use `/reset-password?token_hash=…&type=recovery`
+   link, generated with the Auth admin API. Staff send it to the person, who
+   chooses their own password. The page verifies the token once
+   (`verifyOtp`), works in any browser and strips the token from the URL.
+
+The service-role key is used only for the Auth admin API inside the function.
+Removing access deactivates the membership (`deactivate_member`); restoring
+reactivates it. The older invitation tables and functions are no longer used
+by the application and can be dropped in a later migration.

@@ -33,6 +33,7 @@
     "../supabase/functions/_shared/http.ts",
     "../supabase/functions/_shared/sync.ts",
     "../supabase/functions/ad-connections/handler.ts",
-    "../supabase/functions/sync-ad-data/handler.ts"
+    "../supabase/functions/sync-ad-data/handler.ts",
+    "../supabase/functions/manage-tenant-user/handler.ts"
   ]
 }

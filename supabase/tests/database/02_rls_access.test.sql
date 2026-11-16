@@ -109,7 +109,7 @@ SELECT is_empty($$ SELECT id FROM public.sync_jobs $$,          'client: cannot 
 SELECT is_empty($$ SELECT id FROM public.sync_logs $$,          'client: cannot read sync logs');
 SELECT is_empty($$ SELECT id FROM public.audit_logs $$,         'client: cannot read audit logs');
 SELECT is_empty($$ SELECT id FROM public.tenant_invitations $$, 'client: cannot read invitations');
-SELECT is_empty($$ SELECT id FROM public.oauth_connections $$,  'client: cannot read connections (manager+ only)');
+SELECT is_empty($$ SELECT id FROM public.oauth_connections $$,  'client: cannot read connections (staff only)');
 SELECT is_empty($$ SELECT user_id FROM public.platform_admins $$, 'client: cannot list platform admins');
 
 SELECT results_eq(
@@ -191,21 +191,20 @@ SELECT throws_ok($$ SELECT public.store_oauth_tokens('a0000000-0000-4000-8000-00
 -- =====================================================
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000000a1","role":"authenticated"}';
 
-SELECT is((SELECT count(*)::int FROM public.tenant_memberships), 2, 'owner: sees all memberships of own tenant');
-SELECT ok(NOT EXISTS (SELECT 1 FROM public.tenant_memberships WHERE tenant_id <> 'a0000000-0000-4000-8000-000000000000'),
-    'owner: sees no memberships of other tenants');
-SELECT results_eq($$ SELECT id FROM public.profiles ORDER BY id $$,
-    $$ VALUES ('00000000-0000-4000-8000-0000000000a1'::uuid), ('00000000-0000-4000-8000-0000000000a2'::uuid) $$,
-    'owner: sees profiles of own tenant members only');
-SELECT results_eq($$ SELECT id FROM public.oauth_connections $$,
-    $$ VALUES ('a0000000-0000-4000-8000-0000000000c0'::uuid) $$, 'owner: sees own connections only');
-SELECT results_eq($$ SELECT email FROM public.tenant_invitations $$,
-    $$ VALUES ('invitee@a.test'::text) $$, 'owner: sees own tenant invitations only');
+-- Client management is staff-only (20261113120000): an owner reads the same
+-- business data as any member, but no member directory, invitations,
+-- connections or audit log.
+SELECT results_eq($$ SELECT user_id FROM public.tenant_memberships $$,
+    $$ VALUES ('00000000-0000-4000-8000-0000000000a1'::uuid) $$, 'owner: sees only own membership');
+SELECT results_eq($$ SELECT id FROM public.profiles $$,
+    $$ VALUES ('00000000-0000-4000-8000-0000000000a1'::uuid) $$, 'owner: sees only own profile');
+SELECT is_empty($$ SELECT id FROM public.oauth_connections $$,  'owner: cannot read connections');
+SELECT is_empty($$ SELECT id FROM public.tenant_invitations $$, 'owner: cannot read invitations');
 SELECT throws_ok($$ SELECT token_hash FROM public.tenant_invitations $$,
     '42501', NULL, 'owner: invitation token hash is not selectable');
-SELECT ok((SELECT count(*) FROM public.audit_logs) > 0, 'owner: sees own tenant audit log');
-SELECT ok(NOT EXISTS (SELECT 1 FROM public.audit_logs WHERE tenant_id IS DISTINCT FROM 'a0000000-0000-4000-8000-000000000000'),
-    'owner: sees no audit entries of other tenants or the platform');
+SELECT is_empty($$ SELECT id FROM public.audit_logs $$, 'owner: cannot read the audit log');
+SELECT results_eq($$ SELECT id FROM public.ad_accounts $$,
+    $$ VALUES ('a0000000-0000-4000-8000-0000000000aa'::uuid) $$, 'owner: still reads own ad accounts');
 SELECT is_empty($$ SELECT id FROM public.sync_jobs $$, 'owner: still cannot read raw sync jobs');
 SELECT throws_ok($$ INSERT INTO public.tenant_memberships (tenant_id, user_id, role)
                     VALUES ('a0000000-0000-4000-8000-000000000000', '00000000-0000-4000-8000-0000000000d1', 'client') $$,

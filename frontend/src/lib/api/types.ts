@@ -52,14 +52,20 @@ export type Member = {
   updated_at: string;
 };
 
-export type Invitation = {
-  id: string;
-  tenant_id: string;
+/** Roles PRISIM staff assign to client users. Older memberships may carry other roles. */
+export type ClientUserRole = "owner" | "viewer";
+
+export type CreateTenantUserInput = {
+  tenantId: string;
   email: string;
-  role: TenantRole;
-  status: "pending" | "accepted" | "revoked" | "expired";
-  expires_at: string;
-  created_at: string;
+  fullName?: string;
+  role: ClientUserRole;
+};
+
+export type CreateTenantUserResult = {
+  userId: string;
+  accountCreated: boolean;
+  membership: "created" | "reactivated";
 };
 
 export type ProviderAvailability = {
@@ -256,11 +262,11 @@ export interface PortalApi {
   createTenant(input: TenantInput): Promise<Tenant>;
   updateTenant(tenantId: string, patch: Partial<TenantInput> & { status?: TenantStatus }): Promise<void>;
 
-  // Members and invitations
+  // Client users (PRISIM staff only)
   listMembers(tenantId: string): Promise<Member[]>;
-  listInvitations(tenantId: string): Promise<Invitation[]>;
-  inviteMember(tenantId: string, email: string, role: TenantRole): Promise<void>;
-  revokeInvitation(invitationId: string): Promise<void>;
+  createTenantUser(input: CreateTenantUserInput): Promise<CreateTenantUserResult>;
+  /** Single-use link with which the member sets or resets their own password. */
+  issuePasswordLink(tenantId: string, userId: string): Promise<{ url: string }>;
   changeMemberRole(tenantId: string, userId: string, role: TenantRole): Promise<void>;
   deactivateMember(tenantId: string, userId: string): Promise<void>;
 

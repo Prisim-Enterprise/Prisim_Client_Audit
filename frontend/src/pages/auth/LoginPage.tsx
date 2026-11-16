@@ -13,7 +13,6 @@ import { signInSchema, type SignInValues } from "../../lib/validation";
 
 type LoginLocationState = {
   from?: { pathname?: string };
-  invitationToken?: string;
 };
 
 export function LoginPage() {
@@ -33,14 +32,7 @@ export function LoginPage() {
     setFormError(null);
     try {
       await signIn(email, password);
-      if (state?.invitationToken) {
-        navigate("/accept-invite", {
-          replace: true,
-          state: { invitationToken: state.invitationToken },
-        });
-      } else {
-        navigate(state?.from?.pathname ?? "/", { replace: true });
-      }
+      navigate(state?.from?.pathname ?? "/", { replace: true });
     } catch (error) {
       setFormError(error instanceof Error ? error.message : "We couldn't sign you in. Try again.");
     }

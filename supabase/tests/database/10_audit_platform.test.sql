@@ -87,24 +87,42 @@ SELECT throws_ok(
     '42501', NULL, 'viewer cannot change account selection');
 SELECT throws_ok($$ SELECT public.get_platform_overview() $$, '42501', NULL, 'tenant users cannot read platform overview');
 
--- Manager selects accounts; cross-connection ids are rejected.
+-- Account selection and the member directory are staff-only (20261113120000).
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000000a3","role":"authenticated"}';
-SELECT is(
-    public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['a0000000-0000-4000-8000-0000000000ab']::UUID[]),
-    1, 'manager selects accounts');
 SELECT throws_ok(
-    $$ SELECT public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['b0000000-0000-4000-8000-0000000000aa']::UUID[]) $$,
-    '22023', NULL, 'accounts of another tenant are rejected');
+    $$ SELECT public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['a0000000-0000-4000-8000-0000000000ab']::UUID[]) $$,
+    '42501', NULL, 'manager cannot change account selection');
 SELECT throws_ok(
-    $$ SELECT public.set_ad_account_sync('b0000000-0000-4000-8000-0000000000c0', '{}'::UUID[]) $$,
-    '42501', NULL, 'manager of A cannot change B');
+    $$ SELECT * FROM public.get_tenant_members('a0000000-0000-4000-8000-000000000000') $$,
+    '42501', NULL, 'manager cannot list members');
 
--- Owner lists members.
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000000a1","role":"authenticated"}';
-SELECT is((SELECT count(*)::INT FROM public.get_tenant_members('a0000000-0000-4000-8000-000000000000')), 3, 'owner lists members');
+SELECT throws_ok(
+    $$ SELECT public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['a0000000-0000-4000-8000-0000000000ab']::UUID[]) $$,
+    '42501', NULL, 'owner cannot change account selection');
+SELECT throws_ok(
+    $$ SELECT * FROM public.get_tenant_members('a0000000-0000-4000-8000-000000000000') $$,
+    '42501', NULL, 'owner cannot list members');
 SELECT throws_ok(
     $$ SELECT public.save_audit_run('a0000000-0000-4000-8000-000000000000', '{}'::JSONB, '[]'::JSONB) $$,
     '42501', NULL, 'tenant owner cannot save audits');
+SELECT is((SELECT count(*)::INT FROM public.ad_accounts WHERE sync_enabled), 1, 'client attempts changed no account selection');
+
+-- Platform admin without MFA has no staff rights either.
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-00000000ad01","role":"authenticated","aal":"aal1"}';
+SELECT throws_ok(
+    $$ SELECT public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['a0000000-0000-4000-8000-0000000000ab']::UUID[]) $$,
+    '42501', NULL, 'aal1 staff session cannot change account selection');
+
+-- Staff (aal2) select accounts and list members; cross-tenant ids are rejected.
+SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-00000000ad01","role":"authenticated","aal":"aal2"}';
+SELECT is(
+    public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['a0000000-0000-4000-8000-0000000000aa', 'a0000000-0000-4000-8000-0000000000ab']::UUID[]),
+    2, 'platform admin selects accounts');
+SELECT throws_ok(
+    $$ SELECT public.set_ad_account_sync('a0000000-0000-4000-8000-0000000000c0', ARRAY['b0000000-0000-4000-8000-0000000000aa']::UUID[]) $$,
+    '22023', NULL, 'accounts of another tenant are rejected');
+SELECT is((SELECT count(*)::INT FROM public.get_tenant_members('a0000000-0000-4000-8000-000000000000')), 3, 'platform admin lists members');
 
 -- -----------------------------------------------------
 -- Audit workflow (aal2 platform admin)
