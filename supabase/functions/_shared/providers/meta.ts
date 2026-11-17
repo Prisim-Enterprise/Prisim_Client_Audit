@@ -1,5 +1,16 @@
 // Meta Marketing API client (Graph API). Uses the server-side app secret for
-// the code exchange and appsecret_proof on every user-token call.
+// the code exchange and appsecret_proof on every token call.
+//
+// Two connection modes, chosen by configuration only (never by fallback):
+//   - Facebook Login for Business with a business integration system user
+//     access token (META_LOGIN_CONFIG_ID set). Consent sends config_id,
+//     response_type=code and override_default_response_type=true. The code is
+//     exchanged once; the token is validated with /debug_token (is_valid,
+//     app_id, scopes + granular_scopes) and ad accounts are limited to the
+//     ad account IDs granted to ads_read. No fb_exchange_token, no
+//     /me/permissions, no /me/adaccounts.
+//   - Classic user login with `scope` (no configuration ID): long-lived user
+//     token and /me/permissions, unchanged.
 
 import {
   type AdProvider,
@@ -21,14 +32,36 @@ export type MetaConfig = {
   redirectUri: string;
   apiVersion: string;
   /**
-   * Facebook Login for Business configuration ID (META_LOGIN_CONFIG_ID). When
-   * set, the consent dialog uses `config_id` and the configuration decides the
-   * permissions, so `scope` is not sent. Not a secret.
+   * Facebook Login for Business configuration ID (META_LOGIN_CONFIG_ID) whose
+   * token type is "System user access token". When set, the system user flow
+   * is used and the configuration decides the permissions, so `scope` is not
+   * sent. Not a secret.
    */
   loginConfigId?: string | null;
 };
 
 export const META_SCOPES = ["ads_read", "business_management"];
+
+/** Most ad accounts one system user connection may discover. */
+export const MAX_GRANTED_AD_ACCOUNTS = 200;
+
+const ACCOUNT_FIELDS = "id,account_id,name,currency,timezone_name,account_status";
+
+type DebugTokenData = {
+  is_valid?: unknown;
+  app_id?: unknown;
+  expires_at?: unknown;
+  scopes?: unknown;
+  granular_scopes?: unknown;
+};
+
+/** What a validated system user token may access. Never contains the token. */
+export type MetaTokenGrant = {
+  scopes: string[];
+  /** Numeric ad account IDs granted to ads_read (without the act_ prefix). */
+  adAccountIds: string[];
+  expiresAt: string | null;
+};
 
 // Currencies whose Meta budgets are not expressed in 1/100 units.
 const ZERO_DECIMAL = new Set(["CLP", "COP", "CRC", "HUF", "ISK", "IDR", "JPY", "KRW", "PYG", "TWD", "VND"]);
@@ -52,6 +85,75 @@ async function appSecretProof(token: string, secret: string) {
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(token)));
   return Array.from(signature, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+const SCOPE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
+const NUMERIC_ID = /^[1-9][0-9]{0,24}$/;
+
+/** A Graph ID from JSON. Unsafe integers would have lost precision: reject them. */
+function graphId(value: unknown): string | null {
+  if (typeof value === "string") return NUMERIC_ID.test(value) ? value : null;
+  if (typeof value === "number" && Number.isSafeInteger(value) && value > 0) return String(value);
+  return null;
+}
+
+/**
+ * Validates /debug_token output for this app. Throws a ProviderError whose
+ * detail holds only permission names and counts (never tokens or the full
+ * response). Fails closed when ads_read has no explicitly granted ad accounts.
+ */
+export function evaluateDebugToken(data: DebugTokenData | undefined, appId: string): MetaTokenGrant {
+  const valid = data?.is_valid === true;
+  const appMatch = data !== undefined && (typeof data.app_id === "string" || typeof data.app_id === "number")
+    && String(data.app_id) === appId;
+
+  const names = new Set<string>();
+  if (Array.isArray(data?.scopes)) {
+    for (const scope of data.scopes) if (typeof scope === "string" && SCOPE_NAME.test(scope)) names.add(scope);
+  }
+  const granular = Array.isArray(data?.granular_scopes) ? data.granular_scopes as Array<{ scope?: unknown; target_ids?: unknown }> : [];
+  const adsReadIds = new Set<string>();
+  let adsReadAllTargets = false;
+  let rejectedIds = 0;
+  for (const entry of granular) {
+    if (typeof entry?.scope !== "string" || !SCOPE_NAME.test(entry.scope)) continue;
+    names.add(entry.scope);
+    if (entry.scope !== "ads_read") continue;
+    if (!Array.isArray(entry.target_ids)) {
+      adsReadAllTargets = true;
+      continue;
+    }
+    for (const raw of entry.target_ids) {
+      const id = graphId(raw);
+      if (id) adsReadIds.add(id);
+      else rejectedIds++;
+    }
+  }
+
+  const detail = `meta debug_token valid=${valid} app_match=${appMatch} scopes=[${[...names].sort().join(",")}]`
+    + ` ads_read_targets=${adsReadAllTargets ? "unrestricted" : adsReadIds.size}${rejectedIds ? ` rejected_ids=${rejectedIds}` : ""}`;
+
+  if (!valid || !appMatch) {
+    throw new ProviderError("permission_denied", "Meta could not confirm this connection for PRISIM. Start the connection again.", detail);
+  }
+  if (!names.has("ads_read")) {
+    throw new ProviderError("permission_denied", "The ads_read permission was not granted. Reconnect and allow access to ad accounts.", detail);
+  }
+  if (adsReadIds.size === 0) {
+    // ads_read without explicit ad account IDs cannot be limited to granted assets.
+    throw new ProviderError("permission_denied", "No ad account was shared with PRISIM. Reconnect and select the ad account to share.", detail);
+  }
+  if (adsReadIds.size > MAX_GRANTED_AD_ACCOUNTS) {
+    throw new ProviderError("permission_denied", `More than ${MAX_GRANTED_AD_ACCOUNTS} ad accounts were shared. Share fewer ad accounts.`, detail);
+  }
+
+  const expires = toNumber(data?.expires_at);
+  return {
+    scopes: [...names].sort(),
+    adAccountIds: [...adsReadIds].sort(),
+    // 0 means the system user token does not expire.
+    expiresAt: expires > 0 ? new Date(expires * 1000).toISOString() : null,
+  };
 }
 
 function accountStatus(value: unknown): DiscoveredAccount["status"] {
@@ -141,6 +243,52 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
     };
   }
 
+  const systemUser = Boolean(config.loginConfigId);
+
+  /** Server-side /debug_token with the app access token; the token is never logged. */
+  async function inspectToken(accessToken: string): Promise<MetaTokenGrant> {
+    const body = await call("/debug_token", {
+      input_token: accessToken,
+      access_token: `${config.appId}|${config.appSecret}`,
+    });
+    return evaluateDebugToken(body.data as DebugTokenData | undefined, config.appId);
+  }
+
+  function toDiscovered(row: Record<string, unknown>, clientBusinessId: string | null): DiscoveredAccount {
+    return {
+      external_account_id: `act_${row.account_id as string}`,
+      account_name: typeof row.name === "string" ? row.name : null,
+      currency: typeof row.currency === "string" ? row.currency : null,
+      timezone: typeof row.timezone_name === "string" ? row.timezone_name : null,
+      status: accountStatus(row.account_status),
+      metadata: clientBusinessId
+        ? { granted_via: "business_login", client_business_id: clientBusinessId }
+        : {},
+    };
+  }
+
+  /** Reads exactly the granted ad accounts, one by one; nothing else is listed. */
+  async function grantedAccounts(accessToken: string): Promise<DiscoveredAccount[]> {
+    const grant = await inspectToken(accessToken);
+    const me = await call("/me", { fields: "client_business_id" }, accessToken);
+    const clientBusinessId = graphId(me.client_business_id);
+    const found: DiscoveredAccount[] = [];
+    for (const id of grant.adAccountIds) {
+      let row: Record<string, unknown>;
+      try {
+        row = await call(`/act_${id}`, { fields: ACCOUNT_FIELDS }, accessToken);
+      } catch (error) {
+        // A granted account that is no longer readable is skipped, not guessed.
+        if (error instanceof ProviderError && error.code === "permission_denied") continue;
+        throw error;
+      }
+      // Keep the account only when Meta returns the exact account that was granted.
+      if (row.account_id !== id || row.id !== `act_${id}`) continue;
+      found.push(toDiscovered(row, clientBusinessId));
+    }
+    return found;
+  }
+
   return {
     provider: "meta",
 
@@ -150,8 +298,10 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
       url.searchParams.set("redirect_uri", config.redirectUri);
       url.searchParams.set("state", state);
       url.searchParams.set("response_type", "code");
-      if (config.loginConfigId) {
-        url.searchParams.set("config_id", config.loginConfigId);
+      if (systemUser) {
+        // Facebook Login for Business, system user access token configuration.
+        url.searchParams.set("config_id", config.loginConfigId!);
+        url.searchParams.set("override_default_response_type", "true");
       } else {
         url.searchParams.set("scope", META_SCOPES.join(","));
       }
@@ -159,6 +309,13 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
     },
 
     async exchangeCode(code) {
+      if (systemUser) {
+        // One server-side code exchange. System user tokens are not user
+        // tokens: no fb_exchange_token swap and no /me/permissions.
+        const issued = await exchange({ redirect_uri: config.redirectUri, code });
+        const grant = await inspectToken(issued.accessToken);
+        return { accessToken: issued.accessToken, refreshToken: null, expiresAt: grant.expiresAt, scopes: grant.scopes };
+      }
       const shortLived = await exchange({ redirect_uri: config.redirectUri, code });
       // Long-lived user token (about 60 days). Meta has no refresh token;
       // when it expires the connection is marked expired and must reconnect.
@@ -178,11 +335,22 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
     },
 
     async identity(accessToken): Promise<ProviderIdentity> {
+      if (systemUser) {
+        // /me is the app-scoped system user, not a person. The connection is
+        // identified by the client's business portfolio.
+        const body = await call("/me", { fields: "id,name,client_business_id" }, accessToken);
+        const business = graphId(body.client_business_id);
+        return {
+          id: business,
+          name: business ? `Meta business ${business}` : null,
+        };
+      }
       const body = await call("/me", { fields: "id,name" }, accessToken);
       return { id: typeof body.id === "string" ? body.id : null, name: typeof body.name === "string" ? body.name : null };
     },
 
     async listAccounts(accessToken) {
+      if (systemUser) return grantedAccounts(accessToken);
       const rows = await paged<Record<string, unknown>>(
         "/me/adaccounts",
         { fields: "account_id,name,currency,timezone_name,account_status", limit: "100" },
@@ -255,6 +423,9 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
     },
 
     async revoke(accessToken) {
+      // Best effort. For system user tokens Meta documents removal by the
+      // client (Business Settings > Integrations > Connected apps); the caller
+      // deletes the stored token from Vault either way.
       await call("/me/permissions", {}, accessToken, "DELETE");
     },
   };

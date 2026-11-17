@@ -86,7 +86,7 @@ Secrets (names only; values are set by the owner, never committed):
 | `META_APP_ID`, `META_APP_SECRET` | ad-connections, sync-ad-data | Meta app (Business type) with the Marketing API product |
 | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | ad-connections, sync-ad-data | Google Cloud OAuth client, type Web application |
 | `GOOGLE_ADS_DEVELOPER_TOKEN` | ad-connections, sync-ad-data | Google Ads API developer token (Basic access or higher) |
-| `META_LOGIN_CONFIG_ID` | ad-connections (optional) | Facebook Login for Business configuration ID (token type **User access token**). When set, Meta consent uses `config_id` instead of `scope`; unset keeps the `scope` flow |
+| `META_LOGIN_CONFIG_ID` | ad-connections, sync-ad-data (optional) | Facebook Login for Business configuration ID (token type **System user access token**). When set, Meta consent uses the system user flow (below); unset keeps the classic `scope` flow |
 | `META_API_VERSION`, `GOOGLE_ADS_API_VERSION` | optional | Defaults `v26.0` / `v24`; raise when a version nears sunset |
 
 ```bash
@@ -117,11 +117,26 @@ manually.
   use Business Manager), Business Verification, app in Live mode. Until then
   only app admins/testers can connect.
 - **Meta, Facebook Login for Business** (optional): create a configuration
-  with token type *User access token* and the permissions `ads_read` and
-  `business_management` (add others only if the code uses them), then set
-  `META_LOGIN_CONFIG_ID`. The configuration then decides the permissions; the
-  code still requires `ads_read` to be granted. A *System-user access token*
-  configuration is not supported by the current code.
+  with token type *System user access token*, the permissions `ads_read` and
+  `business_management` (add others only if the code uses them) and ad
+  accounts as the asset type, then set `META_LOGIN_CONFIG_ID`. The flow:
+  - consent sends `config_id`, `response_type=code` and
+    `override_default_response_type=true` (no `scope`);
+  - the code is exchanged once, server-side (no `fb_exchange_token`, no
+    `/me/permissions`);
+  - the token is checked with `/debug_token` using the app token:
+    `is_valid`, `app_id` = `META_APP_ID`, and `ads_read` in `scopes` or
+    `granular_scopes`;
+  - only the ad account IDs listed for `ads_read` in `granular_scopes` are
+    read (`/act_<id>`) and stored. If Meta lists no explicit ad account IDs,
+    the connection fails and nothing is stored (fail closed; `/me/adaccounts`
+    is never used in this mode);
+  - the connection is identified by `client_business_id`; tokens do not
+    expire by default, so there is no refresh.
+  - Disconnect deletes the token from Vault. Meta revocation of a system user
+    token is best effort: the client removes PRISIM in Business Settings →
+    Integrations → Connected apps.
+  A configuration with token type *User access token* is not supported.
 - **Google**: OAuth consent screen with the `https://www.googleapis.com/auth/adwords`
   scope (sensitive scope → verification), developer token with Basic access.
   A test-level token only works with Google Ads test accounts.

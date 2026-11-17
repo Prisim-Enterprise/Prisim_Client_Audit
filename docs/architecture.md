@@ -135,15 +135,19 @@ not possible through the API.
    HMAC-signed `state` (action, connection, tenant, provider, user, nonce,
    10-minute expiry). Google uses PKCE; the verifier is derived from the
    state nonce, so nothing is stored between requests. Meta sends `scope`
-   (`ads_read,business_management`), or `config_id` instead when
-   `META_LOGIN_CONFIG_ID` (Facebook Login for Business, user access token)
-   is set.
+   (`ads_read,business_management`), or, when `META_LOGIN_CONFIG_ID`
+   (Facebook Login for Business, system user access token) is set,
+   `config_id` with `override_default_response_type=true`.
 2. Meta/Google redirect to the SPA at `/oauth/callback`, which posts `code`
    and `state` to `ad-connections` `complete` and clears them from the URL.
    The function verifies the signature, expiry and that the caller is the
-   user who started, exchanges the code server-side (Meta: long-lived token),
-   and stores tokens with `store_oauth_tokens` using the bound action.
-3. Discovered ad accounts (Meta `me/adaccounts`; Google accessible customers
+   user who started, exchanges the code server-side (Meta scope flow:
+   long-lived user token; Meta system user flow: one exchange, then
+   `/debug_token` must show a valid token for this app with `ads_read`
+   granted to explicit ad account IDs), and stores tokens with
+   `store_oauth_tokens` using the bound action.
+3. Discovered ad accounts (Meta scope flow `me/adaccounts`; Meta system user
+   flow only the ad account IDs granted to `ads_read`; Google accessible customers
    and manager clients with their `login-customer-id`) are written with
    `upsert_discovered_ad_accounts`. The user then selects accounts with
    `set_ad_account_sync` (their own JWT, manager+).

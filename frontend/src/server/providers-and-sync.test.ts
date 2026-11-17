@@ -33,12 +33,14 @@ describe("Meta provider", () => {
     expect(url.searchParams.get("redirect_uri")).toBe(config.redirectUri);
     expect(url.searchParams.get("response_type")).toBe("code");
     expect(url.searchParams.has("config_id")).toBe(false);
+    expect(url.searchParams.has("override_default_response_type")).toBe(false);
   });
 
-  it("uses the Business Login configuration instead of scope when a configuration ID is set", () => {
+  it("uses the system user Business Login configuration instead of scope when a configuration ID is set", () => {
     const url = new URL(createMetaProvider({ ...config, loginConfigId: "1234567890" }).authorizeUrl("state-2", "unused"));
     expect(url.origin + url.pathname).toBe("https://www.facebook.com/v26.0/dialog/oauth");
     expect(url.searchParams.get("config_id")).toBe("1234567890");
+    expect(url.searchParams.get("override_default_response_type")).toBe("true");
     expect(url.searchParams.has("scope")).toBe(false);
     expect(url.searchParams.get("client_id")).toBe("app");
     expect(url.searchParams.get("state")).toBe("state-2");
@@ -109,6 +111,137 @@ describe("Meta provider", () => {
     expect(campaigns[0].daily_budget).toBe(1500);
     const failing = fakeFetch([[/./, () => ({ status: 400, body: { error: { code: 190, message: "expired" } } })]]);
     await expect(createMetaProvider(config, failing.fetcher).listAccounts("token")).rejects.toMatchObject({ code: "auth_expired" });
+  });
+});
+
+describe("Meta provider: Business Login system user token", () => {
+  const APP_ID = "4242";
+  const SECRET = "app-secret-value";
+  const TOKEN = "SYSTEM-USER-TOKEN-VALUE";
+  const CODE = "AUTH-CODE-VALUE";
+  const config = { appId: APP_ID, appSecret: SECRET, redirectUri: "https://portal.example/oauth/callback", apiVersion: "v26.0", loginConfigId: "227000000000001" };
+
+  type Debug = Record<string, unknown>;
+  const validDebug = (overrides: Debug = {}): Debug => ({
+    is_valid: true,
+    app_id: APP_ID,
+    expires_at: 0,
+    scopes: ["ads_read", "business_management"],
+    granular_scopes: [
+      { scope: "ads_read", target_ids: ["111", "222"] },
+      { scope: "business_management", target_ids: ["900"] },
+    ],
+    ...overrides,
+  });
+
+  const account = (id: string, extra: Record<string, unknown> = {}) => ({
+    id: `act_${id}`, account_id: id, name: `Account ${id}`, currency: "INR", timezone_name: "Asia/Kolkata", account_status: 1, ...extra,
+  });
+
+  function meta(debug: Debug, accounts: Record<string, unknown> = { "111": account("111"), "222": account("222") }) {
+    return fakeFetch([
+      [/\/oauth\/access_token/, () => ({ body: { access_token: TOKEN, token_type: "bearer" } })],
+      [/\/debug_token/, () => ({ body: { data: debug } })],
+      [/\/me\/adaccounts/, () => ({ body: { data: [account("111"), account("222"), account("999")] } })],
+      [/\/me\?/, () => ({ body: { id: "555", name: "PRISIM system user", client_business_id: "777" } })],
+      [/\/act_(\d+)\?/, ({ url }) => {
+        const id = /\/act_(\d+)\?/.exec(url)![1];
+        return id in accounts ? { body: accounts[id] } : { status: 400, body: { error: { code: 200, message: "no access" } } };
+      }],
+    ]);
+  }
+
+  function noSecrets(text: string) {
+    for (const secret of [TOKEN, CODE, SECRET]) expect(text).not.toContain(secret);
+  }
+
+  it("exchanges the code once, validates with debug_token and never uses the user-token swap", async () => {
+    const { fetcher, calls } = meta(validDebug());
+    const tokens = await createMetaProvider(config, fetcher).exchangeCode(CODE, "verifier");
+    expect(tokens).toEqual({ accessToken: TOKEN, refreshToken: null, expiresAt: null, scopes: ["ads_read", "business_management"] });
+    const exchanges = calls.filter((call) => call.url.includes("/oauth/access_token"));
+    expect(exchanges).toHaveLength(1);
+    expect(new URL(exchanges[0].url).searchParams.get("redirect_uri")).toBe(config.redirectUri);
+    expect(calls.some((call) => call.url.includes("fb_exchange_token"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("/me/permissions"))).toBe(false);
+    const debug = new URL(calls.find((call) => call.url.includes("/debug_token"))!.url);
+    expect(debug.searchParams.get("input_token")).toBe(TOKEN);
+    expect(debug.searchParams.get("access_token")).toBe(`${APP_ID}|${SECRET}`);
+  });
+
+  it("accepts ads_read listed only in granular_scopes and keeps a real expiry when Meta sets one", async () => {
+    const { fetcher } = meta(validDebug({ scopes: ["business_management"], expires_at: 1_900_000_000 }));
+    const tokens = await createMetaProvider(config, fetcher).exchangeCode(CODE, "verifier");
+    expect(tokens.scopes).toEqual(["ads_read", "business_management"]);
+    expect(tokens.expiresAt).toBe(new Date(1_900_000_000 * 1000).toISOString());
+  });
+
+  it.each([
+    ["ads_read is missing", validDebug({ scopes: ["business_management"], granular_scopes: [{ scope: "business_management", target_ids: ["900"] }] }), /ads_read permission was not granted/],
+    ["the token is invalid", validDebug({ is_valid: false }), /could not confirm/],
+    ["the token belongs to another app", validDebug({ app_id: "9999" }), /could not confirm/],
+    ["debug_token returns no data", undefined, /could not confirm/],
+    ["ads_read has no explicit ad account IDs", validDebug({ granular_scopes: [{ scope: "ads_read" }] }), /No ad account was shared/],
+    ["ads_read lists only unusable IDs", validDebug({ granular_scopes: [{ scope: "ads_read", target_ids: ["act_1", -5, 1e30] }] }), /No ad account was shared/],
+  ])("rejects the connection when %s, with a safe error detail", async (_name, debug, message) => {
+    const { fetcher } = meta(debug as Debug);
+    const error = await createMetaProvider(config, fetcher).exchangeCode(CODE, "verifier").catch((caught) => caught);
+    expect(error).toBeInstanceOf(ProviderError);
+    expect(error.code).toBe("permission_denied");
+    expect(error.message).toMatch(message);
+    expect(error.detail).toMatch(/^meta debug_token valid=/);
+    noSecrets(`${error.message} ${error.detail}`);
+  });
+
+  it("rejects more granted ad accounts than one connection may hold", async () => {
+    const ids = Array.from({ length: 201 }, (_, i) => String(1000 + i));
+    const { fetcher } = meta(validDebug({ granular_scopes: [{ scope: "ads_read", target_ids: ids }] }));
+    await expect(createMetaProvider(config, fetcher).exchangeCode(CODE, "verifier")).rejects.toMatchObject({ code: "permission_denied" });
+  });
+
+  it("identifies the connection by the client business, not a person", async () => {
+    const { fetcher, calls } = meta(validDebug());
+    expect(await createMetaProvider(config, fetcher).identity(TOKEN)).toEqual({ id: "777", name: "Meta business 777" });
+    expect(new URL(calls[0].url).searchParams.get("fields")).toBe("id,name,client_business_id");
+  });
+
+  it("discovers only the ad accounts granted to ads_read, never /me/adaccounts", async () => {
+    const { fetcher, calls } = meta(validDebug());
+    const accounts = await createMetaProvider(config, fetcher).listAccounts(TOKEN);
+    expect(accounts.map((item) => item.external_account_id)).toEqual(["act_111", "act_222"]);
+    expect(accounts[0]).toMatchObject({ account_name: "Account 111", currency: "INR", status: "active", metadata: { granted_via: "business_login", client_business_id: "777" } });
+    expect(calls.some((call) => call.url.includes("/me/adaccounts"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("act_999"))).toBe(false);
+    for (const call of calls.filter((item) => /\/act_\d+\?/.test(item.url))) {
+      expect(new URL(call.url).searchParams.get("appsecret_proof")).toMatch(/^[0-9a-f]{64}$/);
+    }
+  });
+
+  it("drops granted IDs Meta does not return as that exact account, and skips unreadable ones", async () => {
+    const { fetcher } = meta(
+      validDebug({ granular_scopes: [{ scope: "ads_read", target_ids: ["111", "222", "333"] }] }),
+      // 111 answers as a different account; 333 is no longer readable.
+      { "111": account("999"), "222": account("222") },
+    );
+    const accounts = await createMetaProvider(config, fetcher).listAccounts(TOKEN);
+    expect(accounts.map((item) => item.external_account_id)).toEqual(["act_222"]);
+  });
+
+  it("fails closed during discovery when the token no longer proves which ad accounts were granted", async () => {
+    const { fetcher, calls } = meta(validDebug({ granular_scopes: [{ scope: "ads_read" }] }));
+    await expect(createMetaProvider(config, fetcher).listAccounts(TOKEN)).rejects.toMatchObject({ code: "permission_denied" });
+    expect(calls.some((call) => call.url.includes("/me/adaccounts") || /\/act_\d+/.test(call.url))).toBe(false);
+  });
+
+  it("the classic scope flow is unchanged when no configuration ID is set", async () => {
+    const { calls, fetcher } = fakeFetch([
+      [/oauth\/access_token.*fb_exchange_token/, () => ({ body: { access_token: "long", expires_in: 5_184_000 } })],
+      [/oauth\/access_token/, () => ({ body: { access_token: "short", expires_in: 3600 } })],
+      [/me\/permissions/, () => ({ body: { data: [{ permission: "ads_read", status: "granted" }] } })],
+    ]);
+    await createMetaProvider({ ...config, loginConfigId: null }, fetcher).exchangeCode(CODE, "verifier");
+    expect(calls.some((call) => call.url.includes("/debug_token"))).toBe(false);
+    expect(calls.some((call) => call.url.includes("fb_exchange_token"))).toBe(true);
   });
 });
 

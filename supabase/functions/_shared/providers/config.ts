@@ -62,7 +62,8 @@ export function createProvider(provider: "meta" | "google", env: EnvReader, fetc
       appSecret: env("META_APP_SECRET")!,
       redirectUri,
       apiVersion: status.apiVersion,
-      // Optional: Facebook Login for Business configuration (user access tokens).
+      // Optional: Facebook Login for Business configuration whose token type is
+      // "System user access token". Set = system user flow; unset = scope flow.
       loginConfigId: env("META_LOGIN_CONFIG_ID")?.trim() || null,
     }, fetcher);
   }

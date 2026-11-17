@@ -2,6 +2,7 @@
 import { type AdConnectionDependencies, createAdConnectionsHandler } from "@functions/ad-connections/handler.ts";
 import { json, withHttp } from "@functions/_shared/http.ts";
 import { signState, verifyState } from "@functions/_shared/oauth-state.ts";
+import { createProvider } from "@functions/_shared/providers/config.ts";
 import { ProviderError } from "@functions/_shared/providers/types.ts";
 import { createSyncHandler, drainQueue, type SyncHandlerDependencies } from "@functions/sync-ad-data/handler.ts";
 import { describe, expect, it, vi } from "vitest";
@@ -200,6 +201,66 @@ describe("ad-connections handler", () => {
     const client = connectionDeps({ isPlatformAdmin: vi.fn(async () => false) });
     const malformed = new Request(ORIGIN + "/fn", { method: "POST", headers: { "Content-Type": "application/json", Origin: ORIGIN, ...auth }, body: "{not json" });
     expect((await client.handler(malformed)).status).toBe(403);
+  });
+
+  describe("Meta system user connection (real Meta provider, fake Graph API)", () => {
+    const TOKEN = "SYSTEM-USER-TOKEN-VALUE";
+    const env = { ...fullEnv, META_APP_ID: "4242", META_APP_SECRET: "app-secret-value", META_LOGIN_CONFIG_ID: "227000000000001" };
+    const account = (id: string) => ({ id: `act_${id}`, account_id: id, name: `Account ${id}`, currency: "INR", timezone_name: "Asia/Kolkata", account_status: 1 });
+
+    function graph(debug: Record<string, unknown>) {
+      const urls: string[] = [];
+      const fetcher = async (url: string) => {
+        urls.push(url);
+        const reply = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status });
+        if (url.includes("/oauth/access_token")) return reply({ access_token: TOKEN });
+        if (url.includes("/debug_token")) return reply({ data: debug });
+        if (url.includes("/me/adaccounts")) return reply({ data: [account("111"), account("999")] });
+        if (/\/me\?/.test(url)) return reply({ id: "555", client_business_id: "777" });
+        const id = /\/act_(\d+)\?/.exec(url)?.[1];
+        if (id === "111" || id === "999") return reply(account(id));
+        return reply({ error: { code: 100 } }, 400);
+      };
+      return { fetcher, urls };
+    }
+
+    async function metaComplete(debug: Record<string, unknown>) {
+      const { fetcher, urls } = graph(debug);
+      const provider = createProvider("meta", (name) => env[name as keyof typeof env], fetcher);
+      const { handler, deps } = connectionDeps({
+        provider: () => provider,
+        getConnection: vi.fn(async () => ({ id: CONNECTION, tenant_id: TENANT, provider: "meta" as const, status: "pending" })),
+      }, env);
+      const state = await signState({ v: 1, a: ACTION, c: CONNECTION, t: TENANT, p: "meta", u: USER, n: "nonce-value-123456789", e: 1_900_000_600 } as never, SECRET);
+      const response = await handler(request({ action: "complete", code: "AUTH-CODE-VALUE", state }, auth));
+      return { response, deps, urls, text: await response.text() };
+    }
+
+    const granted = { is_valid: true, app_id: "4242", expires_at: 0, scopes: ["ads_read"], granular_scopes: [{ scope: "ads_read", target_ids: ["111"] }] };
+
+    it("stores the token in Vault and saves only the granted ad account; the browser never sees the token", async () => {
+      const { response, deps, urls, text } = await metaComplete(granted);
+      expect(response.status).toBe(200);
+      expect(JSON.parse(text)).toEqual({ connectionId: CONNECTION, tenantId: TENANT, provider: "meta", accountsDiscovered: 1, warning: null });
+      expect(text).not.toContain(TOKEN);
+      expect(deps.storeTokens).toHaveBeenCalledWith(CONNECTION, { accessToken: TOKEN, refreshToken: null, expiresAt: null, scopes: ["ads_read"] }, ACTION);
+      const saved = (deps.saveAccounts as ReturnType<typeof vi.fn>).mock.calls[0] as unknown[];
+      expect((saved[2] as Array<{ external_account_id: string }>).map((item) => item.external_account_id)).toEqual(["act_111"]);
+      expect(saved[3]).toEqual({ id: "777", name: "Meta business 777" });
+      expect(saved[4]).toEqual(["ads_read"]);
+      // The ungranted account is never requested, so it cannot be discovered or stored.
+      expect(urls.some((url) => url.includes("act_999") || url.includes("/me/adaccounts"))).toBe(false);
+    });
+
+    it("stores nothing when ads_read was not granted to an explicit ad account", async () => {
+      const { response, deps, text } = await metaComplete({ ...granted, granular_scopes: [{ scope: "ads_read" }] });
+      expect(response.status).toBe(502);
+      expect(JSON.parse(text)).toEqual({ error: "provider_error", message: "No ad account was shared with PRISIM. Reconnect and select the ad account to share." });
+      expect(text).not.toContain(TOKEN);
+      expect(deps.storeTokens).not.toHaveBeenCalled();
+      expect(deps.saveAccounts).not.toHaveBeenCalled();
+      expect(deps.markConnectionError).toHaveBeenCalledWith(CONNECTION);
+    });
   });
 
   it("disconnects with an oauth.disconnect action bound to the connection", async () => {
