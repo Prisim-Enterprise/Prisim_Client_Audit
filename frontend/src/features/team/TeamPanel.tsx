@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Copy, KeyRound, UserPlus, UserRoundCheck, UserX, Users } from "lucide-react";
 import { useState } from "react";
 import { useForm } from "react-hook-form";
+import { Link } from "react-router-dom";
 import { toast } from "sonner";
 import { z } from "zod";
 import { Alert } from "../../components/ui/Alert";
@@ -97,7 +98,7 @@ export function ClientUsersPanel({ tenantId, tenantActive }: { tenantId: string;
     <div className="space-y-5">
       <SectionCard
         title="Add a client user"
-        description="Creates the person's account and gives them access to this client only. They set their own password with a single-use link; no password is ever sent."
+        description={<>Creates the person&apos;s account and gives them access to this client only. They set their own password with a single-use link; no password is ever sent. Their details are handled under the <Link to="/privacy-policy" target="_blank" className="font-medium text-accent-700 hover:underline">Privacy Policy</Link>.</>}
       >
         {tenantActive ? (
           <form

@@ -2,7 +2,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { App } from "../app/App";
 import { renderPrivacyPolicyMarkup } from "../prerender/privacyPolicy";
-import { PRISIM_REGISTERED_ADDRESS, PRIVACY_CONTACT_EMAIL } from "./PrivacyPolicyPage";
+import { PRISIM_ADDRESS_LINES, PRIVACY_CONTACT_EMAIL } from "./PrivacyPolicyPage";
 
 // Signed-out visitor whose session is still being restored: protected routes
 // would show a loading screen or redirect to /login. The policy must not.
@@ -21,52 +21,83 @@ vi.mock("../context/AuthProvider", () => ({
 
 afterEach(cleanup);
 
+async function renderPolicy() {
+  window.history.pushState({}, "", "/privacy-policy");
+  const view = render(<App />);
+  await screen.findByRole("heading", { level: 1, name: "Privacy Policy" });
+  return view;
+}
+
 describe("public privacy policy", () => {
   it("renders at /privacy-policy without signing in", async () => {
-    window.history.pushState({}, "", "/privacy-policy");
-    render(<App />);
-    expect(await screen.findByRole("heading", { level: 1, name: "Privacy Policy" })).toBeInTheDocument();
+    await renderPolicy();
     expect(window.location.pathname).toBe("/privacy-policy");
     expect(screen.queryByText(/Restoring your secure session/)).not.toBeInTheDocument();
   });
 
-  it("shows the confirmed PRISIM details and no placeholders", async () => {
-    window.history.pushState({}, "", "/privacy-policy");
-    const { container } = render(<App />);
-    await screen.findByRole("heading", { level: 1, name: "Privacy Policy" });
+  it("has all 36 sections with linkable headings and a table of contents", async () => {
+    const { container } = await renderPolicy();
+    const headings = container.querySelectorAll("main section > h2");
+    expect(headings).toHaveLength(36);
+    const toc = screen.getByRole("navigation", { name: "Contents" });
+    const links = toc.querySelectorAll("a");
+    expect(links).toHaveLength(36);
+    for (const link of links) {
+      const id = link.getAttribute("href")!.slice(1);
+      expect(container.querySelector(`section#${id}`)).not.toBeNull();
+    }
+    expect(container.textContent).toMatch(/Effective date:\s*17 November 2026/);
+    expect(container.textContent).toMatch(/Last updated:\s*17 November 2026/);
+  });
+
+  it("shows the confirmed PRISIM details and no placeholders or invented roles", async () => {
+    const { container } = await renderPolicy();
     const text = container.textContent ?? "";
-    expect(text).toContain(PRISIM_REGISTERED_ADDRESS);
-    expect(text).toContain("Mathikere, Bangalore - 560054");
+    for (const line of PRISIM_ADDRESS_LINES) expect(text).toContain(line);
     expect(screen.getAllByRole("link", { name: PRIVACY_CONTACT_EMAIL })[0]).toHaveAttribute("href", "mailto:info@prisim.co.in");
     expect(text).not.toMatch(/\[[A-Z _]+\]|placeholder|TBD|TODO|lorem/i);
+    expect(text).not.toMatch(/Data Protection Officer|Grievance Officer|\+91|telephone/i);
+    expect(text).not.toMatch(/ISO 27001|SOC 2|certified|fully compliant|we guarantee|100% secure/i);
+    expect(text).toContain("we cannot guarantee absolute security");
+  });
+
+  it("lists every Meta permission and the Google Limited Use statement", async () => {
+    const { container } = await renderPolicy();
+    const meta = container.querySelector("#meta")?.textContent ?? "";
+    for (const permission of ["ads_read", "business_management", "pages_show_list", "pages_read_engagement"]) {
+      expect(meta).toContain(permission);
+    }
+    expect(meta).toContain("does not currently use them to retrieve or store any Page");
+    expect(container.querySelector("#google")?.textContent).toMatch(/Limited Use requirements/);
+  });
+
+  it("describes retention as implemented, without promising immediate deletion", async () => {
+    const { container } = await renderPolicy();
+    const retention = container.querySelector("#retention")?.textContent ?? "";
+    expect(retention).toMatch(/approximately 14 days/);
+    expect(retention).toMatch(/approximately 90 days/);
+    expect(retention).toMatch(/approximately 30 days/);
+    expect(retention).toMatch(/Activity \(audit\) log\s*No automatic expiry/);
+    expect(retention).toMatch(/Disconnecting an advertising account does not delete them/);
+    expect(container.querySelector("#deletion")?.textContent).toMatch(/does not delete data already synchronised/);
+    expect(container.textContent).not.toMatch(/immediately delete|deleted immediately|permanently erased/i);
+  });
+
+  it("discloses that no self-service rights centre exists and gives the email route", async () => {
+    const { container } = await renderPolicy();
+    const requests = container.querySelector("#requests")?.textContent ?? "";
+    expect(requests).toMatch(/does not yet have a self-service privacy or data-rights centre/);
+    expect(requests).toContain(PRIVACY_CONTACT_EMAIL);
+    expect(container.querySelector("#grievances")?.textContent).toMatch(/ninety days/);
   });
 
   it("prerenders the complete policy as static HTML without scripts", () => {
     const markup = renderPrivacyPolicyMarkup();
     expect(markup).toContain("<h1");
-    expect(markup).toContain(PRISIM_REGISTERED_ADDRESS);
+    for (const line of PRISIM_ADDRESS_LINES) expect(markup).toContain(line);
     expect(markup).toContain('href="mailto:info@prisim.co.in"');
     expect(markup).toContain('href="/login"');
-    for (const permission of ["ads_read", "business_management", "pages_show_list", "pages_read_engagement"]) {
-      expect(markup).toContain(permission);
-    }
     expect(markup).toContain('id="contact"');
     expect(markup).not.toContain("<script");
-  });
-
-  it("describes retention without fixed overall periods or promises of immediate deletion", async () => {
-    window.history.pushState({}, "", "/privacy-policy");
-    const { container } = render(<App />);
-    await screen.findByRole("heading", { level: 1, name: "Privacy Policy" });
-    const retention = container.querySelector("#retention")?.textContent ?? "";
-    expect(retention).toContain("does not expire automatically");
-    expect(retention).toContain("append-only");
-    expect(retention).toMatch(/backups and logs maintained by our infrastructure providers/);
-    expect(retention).toMatch(/approximately 14 days/);
-    expect(retention).toMatch(/approximately 90\s+days/);
-    expect(retention).toMatch(/approximately 30 days/);
-    expect(retention).toMatch(/no\s+automatic expiry/);
-    expect(retention).toMatch(/does not automatically delete historical campaign and performance data, audits,\s+reports/);
-    expect(container.textContent).not.toMatch(/immediately delete|deleted immediately|permanently erased/i);
   });
 });

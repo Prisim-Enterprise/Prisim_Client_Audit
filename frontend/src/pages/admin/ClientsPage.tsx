@@ -131,7 +131,10 @@ function CreateClientButton() {
       <Dialog open={open} onOpenChange={(next) => !create.isPending && setOpen(next)}>
         <DialogContent className="max-w-xl">
           <DialogTitle>New client organization</DialogTitle>
-          <DialogDescription>After creating the client, add its owner account from the Users tab.</DialogDescription>
+          <DialogDescription>
+            After creating the client, add its owner account from the Users tab. Contact details are handled under the{" "}
+            <Link to="/privacy-policy" target="_blank" className="font-medium text-accent-700 hover:underline">Privacy Policy</Link>.
+          </DialogDescription>
           <form className="mt-5 grid gap-4 sm:grid-cols-2" noValidate onSubmit={form.handleSubmit((values) => create.mutate(values))}>
             <div className="sm:col-span-2">
               <Field label="Business name" htmlFor="client-name" error={errors.business_name?.message}>

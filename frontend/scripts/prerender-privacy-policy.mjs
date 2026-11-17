@@ -20,7 +20,7 @@ await build({
 try {
   const module = await import(pathToFileURL(resolve(ssrDir, "privacyPolicy.js")).href);
   const markup = module.renderPrivacyPolicyMarkup();
-  for (const required of ["Privacy Policy", "info@prisim.co.in", "Mathikere, Bangalore - 560054"]) {
+  for (const required of ["Privacy Policy", "info@prisim.co.in", "MSR Road, Mathikere,", "Bangalore - 560054."]) {
     if (!markup.includes(required)) throw new Error(`Prerendered privacy policy is missing: ${required}`);
   }
 

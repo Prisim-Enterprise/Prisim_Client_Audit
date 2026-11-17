@@ -15,7 +15,7 @@ import {
   X,
 } from "lucide-react";
 import { useState } from "react";
-import { NavLink, Outlet, useNavigate, useParams } from "react-router-dom";
+import { Link, NavLink, Outlet, useNavigate, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { Brand } from "../Brand";
 import { Button } from "../ui/Button";
@@ -234,7 +234,10 @@ export function PortalLayout({ portal }: { portal: Portal }) {
           <Outlet />
         </main>
         <footer className="flex flex-col gap-2 border-t border-slate-200/80 px-5 py-5 text-xs text-slate-400 sm:flex-row sm:items-center sm:justify-between sm:px-9">
-          <span>PRISIM Client Audit Portal</span>
+          <span>
+            PRISIM Client Audit Portal ·{" "}
+            <Link to="/privacy-policy" className="font-medium text-slate-500 hover:text-accent-700">Privacy Policy</Link>
+          </span>
           <a href="https://prisim.in" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-slate-600">
             Powered by PRISIM <ArrowUpRight aria-hidden="true" className="h-3.5 w-3.5" />
           </a>
