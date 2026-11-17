@@ -1,5 +1,6 @@
 import { ArrowUpRight, BarChart3, CheckCircle2, ShieldCheck } from "lucide-react";
 import type { PropsWithChildren, ReactNode } from "react";
+import { Link } from "react-router-dom";
 import { Brand } from "../Brand";
 
 export function AuthShell({ children, eyebrow = "A clearer view of performance" }: PropsWithChildren<{ eyebrow?: string }>) {
@@ -44,7 +45,8 @@ export function AuthShell({ children, eyebrow = "A clearer view of performance" 
           <div className="w-full max-w-[430px]">{children}</div>
         </div>
         <p className="text-center text-xs text-slate-400 lg:text-right">
-          Secure access for PRISIM teams and clients
+          Secure access for PRISIM teams and clients ·{" "}
+          <Link to="/privacy-policy" className="font-medium text-slate-500 hover:text-accent-700">Privacy Policy</Link>
         </p>
       </section>
     </main>

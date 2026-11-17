@@ -25,6 +25,7 @@ const ClientAuditsPage = lazy(() => import("../pages/client/ClientPages").then((
 const ClientAuditDetailPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientAuditDetailPage })));
 const ClientReportsPage = lazy(() => import("../pages/client/ClientPages").then((module) => ({ default: module.ClientReportsPage })));
 const OAuthCallbackPage = lazy(() => import("../pages/OAuthCallbackPage").then((module) => ({ default: module.OAuthCallbackPage })));
+const PrivacyPolicyPage = lazy(() => import("../pages/PrivacyPolicyPage").then((module) => ({ default: module.PrivacyPolicyPage })));
 // Statically removed from non-demo builds (Vite replaces import.meta.env.MODE).
 const DemoLoginPage = import.meta.env.MODE === "demo" || import.meta.env.MODE === "test"
   ? lazy(() => import("../demo/DemoLoginPage").then((module) => ({ default: module.DemoLoginPage })))
@@ -35,6 +36,8 @@ export function App() {
     <BrowserRouter>
       <Suspense fallback={<LoadingState />}>
         <Routes>
+          {/* Public: no sign-in required, for signed-in and signed-out visitors alike. */}
+          <Route path="/privacy-policy" element={<PrivacyPolicyPage />} />
           <Route path="/login" element={<GuestOnly><LoginRoute /></GuestOnly>} />
           <Route path="/forgot-password" element={<GuestOnly><ForgotPasswordPage /></GuestOnly>} />
           <Route path="/reset-password" element={<ResetPasswordPage />} />
