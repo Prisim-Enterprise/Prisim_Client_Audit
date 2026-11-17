@@ -62,6 +62,8 @@ export function createProvider(provider: "meta" | "google", env: EnvReader, fetc
       appSecret: env("META_APP_SECRET")!,
       redirectUri,
       apiVersion: status.apiVersion,
+      // Optional: Facebook Login for Business configuration (user access tokens).
+      loginConfigId: env("META_LOGIN_CONFIG_ID")?.trim() || null,
     }, fetcher);
   }
   return createGoogleProvider({

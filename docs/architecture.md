@@ -134,7 +134,10 @@ not possible through the API.
    to it, and the function returns the provider consent URL with an
    HMAC-signed `state` (action, connection, tenant, provider, user, nonce,
    10-minute expiry). Google uses PKCE; the verifier is derived from the
-   state nonce, so nothing is stored between requests.
+   state nonce, so nothing is stored between requests. Meta sends `scope`
+   (`ads_read,business_management`), or `config_id` instead when
+   `META_LOGIN_CONFIG_ID` (Facebook Login for Business, user access token)
+   is set.
 2. Meta/Google redirect to the SPA at `/oauth/callback`, which posts `code`
    and `state` to `ad-connections` `complete` and clears them from the URL.
    The function verifies the signature, expiry and that the caller is the

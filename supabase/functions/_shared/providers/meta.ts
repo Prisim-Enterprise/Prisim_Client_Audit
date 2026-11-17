@@ -20,6 +20,12 @@ export type MetaConfig = {
   appSecret: string;
   redirectUri: string;
   apiVersion: string;
+  /**
+   * Facebook Login for Business configuration ID (META_LOGIN_CONFIG_ID). When
+   * set, the consent dialog uses `config_id` and the configuration decides the
+   * permissions, so `scope` is not sent. Not a secret.
+   */
+  loginConfigId?: string | null;
 };
 
 export const META_SCOPES = ["ads_read", "business_management"];
@@ -144,7 +150,11 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
       url.searchParams.set("redirect_uri", config.redirectUri);
       url.searchParams.set("state", state);
       url.searchParams.set("response_type", "code");
-      url.searchParams.set("scope", META_SCOPES.join(","));
+      if (config.loginConfigId) {
+        url.searchParams.set("config_id", config.loginConfigId);
+      } else {
+        url.searchParams.set("scope", META_SCOPES.join(","));
+      }
       return url.toString();
     },
 

@@ -86,6 +86,7 @@ Secrets (names only; values are set by the owner, never committed):
 | `META_APP_ID`, `META_APP_SECRET` | ad-connections, sync-ad-data | Meta app (Business type) with the Marketing API product |
 | `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | ad-connections, sync-ad-data | Google Cloud OAuth client, type Web application |
 | `GOOGLE_ADS_DEVELOPER_TOKEN` | ad-connections, sync-ad-data | Google Ads API developer token (Basic access or higher) |
+| `META_LOGIN_CONFIG_ID` | ad-connections (optional) | Facebook Login for Business configuration ID (token type **User access token**). When set, Meta consent uses `config_id` instead of `scope`; unset keeps the `scope` flow |
 | `META_API_VERSION`, `GOOGLE_ADS_API_VERSION` | optional | Defaults `v26.0` / `v24`; raise when a version nears sunset |
 
 ```bash
@@ -115,6 +116,12 @@ manually.
 - **Meta**: App Review for `ads_read` (and `business_management` if clients
   use Business Manager), Business Verification, app in Live mode. Until then
   only app admins/testers can connect.
+- **Meta, Facebook Login for Business** (optional): create a configuration
+  with token type *User access token* and the permissions `ads_read` and
+  `business_management` (add others only if the code uses them), then set
+  `META_LOGIN_CONFIG_ID`. The configuration then decides the permissions; the
+  code still requires `ads_read` to be granted. A *System-user access token*
+  configuration is not supported by the current code.
 - **Google**: OAuth consent screen with the `https://www.googleapis.com/auth/adwords`
   scope (sensitive scope → verification), developer token with Basic access.
   A test-level token only works with Google Ads test accounts.

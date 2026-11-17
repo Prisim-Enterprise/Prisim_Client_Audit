@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { createGoogleProvider, microsToUnits } from "@functions/_shared/providers/google.ts";
 import { createMetaProvider, metaConversions } from "@functions/_shared/providers/meta.ts";
-import { providerStatus } from "@functions/_shared/providers/config.ts";
+import { createProvider, providerStatus } from "@functions/_shared/providers/config.ts";
 import { type AdProvider, ProviderError } from "@functions/_shared/providers/types.ts";
 import { type ClaimedJob, processSyncJob, type SyncDependencies, syncWindow } from "@functions/_shared/sync.ts";
 import { describe, expect, it, vi } from "vitest";
@@ -31,6 +31,32 @@ describe("Meta provider", () => {
     expect(url.searchParams.get("scope")).toBe("ads_read,business_management");
     expect(url.searchParams.get("state")).toBe("state-1");
     expect(url.searchParams.get("redirect_uri")).toBe(config.redirectUri);
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.has("config_id")).toBe(false);
+  });
+
+  it("uses the Business Login configuration instead of scope when a configuration ID is set", () => {
+    const url = new URL(createMetaProvider({ ...config, loginConfigId: "1234567890" }).authorizeUrl("state-2", "unused"));
+    expect(url.origin + url.pathname).toBe("https://www.facebook.com/v26.0/dialog/oauth");
+    expect(url.searchParams.get("config_id")).toBe("1234567890");
+    expect(url.searchParams.has("scope")).toBe(false);
+    expect(url.searchParams.get("client_id")).toBe("app");
+    expect(url.searchParams.get("state")).toBe("state-2");
+    expect(url.searchParams.get("redirect_uri")).toBe(config.redirectUri);
+    expect(url.searchParams.get("response_type")).toBe("code");
+  });
+
+  it("reads META_LOGIN_CONFIG_ID from the function secrets and ignores a blank value", () => {
+    const base = { APP_URL: "https://portal.example/", OAUTH_STATE_SECRET: "s".repeat(40), META_APP_ID: "app", META_APP_SECRET: "secret" };
+    const build = (extra: Record<string, string>) =>
+      new URL(createProvider("meta", (name) => ({ ...base, ...extra } as Record<string, string>)[name]).authorizeUrl("s", "c"));
+    const withConfig = build({ META_LOGIN_CONFIG_ID: " 1234567890 " });
+    expect(withConfig.searchParams.get("config_id")).toBe("1234567890");
+    expect(withConfig.searchParams.has("scope")).toBe(false);
+    expect(withConfig.searchParams.get("redirect_uri")).toBe("https://portal.example/oauth/callback");
+    const blank = build({ META_LOGIN_CONFIG_ID: "  " });
+    expect(blank.searchParams.has("config_id")).toBe(false);
+    expect(blank.searchParams.get("scope")).toBe("ads_read,business_management");
   });
 
   it("de-duplicates overlapping conversion action types", () => {
