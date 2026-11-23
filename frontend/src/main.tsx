@@ -13,7 +13,15 @@ if (!rootElement) throw new Error("The frontend root element is missing.");
 const root = createRoot(rootElement);
 
 function renderApp() {
-  const envResult = parsePublicEnv(import.meta.env, import.meta.env.MODE);
+  // Read each variable by name: passing import.meta.env as a whole would inline
+  // every VITE_* variable into the public bundle, including the Vercel system
+  // variables (commit author, message, repository).
+  const envResult = parsePublicEnv({
+    VITE_SUPABASE_URL: import.meta.env.VITE_SUPABASE_URL,
+    VITE_SUPABASE_PUBLISHABLE_KEY: import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+    VITE_APP_URL: import.meta.env.VITE_APP_URL,
+    VITE_APP_ENV: import.meta.env.VITE_APP_ENV,
+  }, import.meta.env.MODE);
   if (!envResult.success) {
     root.render(
       <StrictMode>
