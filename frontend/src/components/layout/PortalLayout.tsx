@@ -238,7 +238,7 @@ export function PortalLayout({ portal }: { portal: Portal }) {
             PRISIM Client Audit Portal ·{" "}
             <Link to="/privacy-policy" className="font-medium text-slate-500 hover:text-accent-700">Privacy Policy</Link>
           </span>
-          <a href="https://prisim.in" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-slate-600">
+          <a href="https://www.prisim.co.in" target="_blank" rel="noreferrer" className="inline-flex items-center gap-1 hover:text-slate-600">
             Powered by PRISIM <ArrowUpRight aria-hidden="true" className="h-3.5 w-3.5" />
           </a>
         </footer>

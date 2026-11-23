@@ -262,11 +262,14 @@ export function createSupabaseApi(typedClient: SupabaseClient<never> | SupabaseC
     },
 
     async deleteReport(report) {
+      // Record first: if it cannot be deleted, the file stays and the report
+      // keeps working. A file left behind after the record is gone is never
+      // readable by clients (storage access requires the shared report row).
+      unwrap(await supabase.from("reports").delete().eq("id", report.id));
       if (report.storage_path) {
         const { error } = await supabase.storage.from("reports").remove([report.storage_path]);
-        if (error) throw new ApiError("The report file could not be deleted.", "storage_error");
+        if (error) throw new ApiError("The report was deleted, but its PDF file could not be removed. Try deleting it again from storage.", "storage_error");
       }
-      unwrap(await supabase.from("reports").delete().eq("id", report.id));
     },
 
     async downloadReport(report) {

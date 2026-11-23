@@ -27,7 +27,7 @@ export function AuthShell({ children, eyebrow = "A clearer view of performance" 
             <Feature icon={<CheckCircle2 />} title="Audits built for action" />
           </div>
           <a
-            href="https://prisim.in"
+            href="https://www.prisim.co.in"
             target="_blank"
             rel="noreferrer"
             className="mt-9 inline-flex items-center gap-2 text-sm text-slate-300 transition hover:text-white"

@@ -46,8 +46,12 @@ export function ClientDashboard() {
   });
   const reports = useQuery({ queryKey: queryKeys.reports(tenantId), queryFn: () => api.listReports(tenantId) });
 
+  // Totals are only meaningful in one currency. Check the returned rows too:
+  // campaigns of accounts whose sync was later disabled can still be in range.
+  const reportedCurrencies = currenciesOf([...synced, ...(campaigns.data ?? [])]);
+  const mixedCurrencies = reportedCurrencies.length > 1;
   const totals = totalsFromCampaigns(campaigns.data ?? []);
-  const currency = currencies[0] ?? null;
+  const currency = reportedCurrencies[0] ?? null;
   const trend = dailyTotals(daily.data ?? [], range).map((day) => ({ date: day.date, value: day.spend }));
   const lastSync = synced.map((account) => account.last_synced_at).filter(Boolean).sort().at(-1) ?? null;
 
@@ -68,9 +72,9 @@ export function ClientDashboard() {
             action={<Link to={`${workspace.base}/accounts`} className="inline-flex items-center gap-1 text-sm font-semibold text-accent-700">Go to ad accounts <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>}
           />
         </Card>
-      ) : !singleCurrency ? (
+      ) : mixedCurrencies ? (
         <Card className="p-5 text-sm text-slate-600">
-          Your accounts report in different currencies ({currencies.join(", ")}). See <Link className="font-medium text-accent-700" to={`${workspace.base}/campaigns`}>Campaigns</Link> for per-account performance.
+          Your accounts report in different currencies ({reportedCurrencies.join(", ")}). See <Link className="font-medium text-accent-700" to={`${workspace.base}/campaigns`}>Campaigns</Link> for per-account performance.
         </Card>
       ) : (
         <section className="grid gap-4 lg:grid-cols-[1fr_1fr_1.6fr]">
