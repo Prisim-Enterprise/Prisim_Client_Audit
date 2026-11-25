@@ -1,6 +1,8 @@
-// Google Ads API client (REST). OAuth 2.0 with PKCE and offline access; API
-// calls need an approved developer token and, for client accounts managed
-// through a manager (MCC), the manager id as login-customer-id.
+// Google Ads API client (REST). OAuth 2.0 with PKCE and offline access. API
+// access levels belong to the Google Cloud project that owns the OAuth client
+// (developer tokens were retired on 9 September 2026, so none is sent). Client
+// accounts managed through a manager (MCC) need the manager id as
+// login-customer-id.
 
 import {
   type AdProvider,
@@ -18,7 +20,6 @@ import {
 export type GoogleConfig = {
   clientId: string;
   clientSecret: string;
-  developerToken: string;
   redirectUri: string;
   apiVersion: string;
 };
@@ -38,8 +39,16 @@ function googleError(status: number, body: GoogleErrorBody): ProviderError {
   if (status === 401 || reason === "invalid_grant" || reason === "UNAUTHENTICATED") {
     return new ProviderError("auth_expired", "The Google Ads connection has expired or was revoked. Reconnect the account.", detail);
   }
-  if (/DEVELOPER_TOKEN_NOT_APPROVED|DEVELOPER_TOKEN_PROHIBITED/.test(text)) {
-    return new ProviderError("permission_denied", "The Google Ads developer token is not approved for this account (test access only).", detail);
+  // A Test-access Cloud project calling a production account: v25 and later
+  // report CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION, v24 and earlier
+  // ACTION_NOT_PERMITTED. The DEVELOPER_TOKEN_* reasons predate the sunset.
+  const access = /CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION|ACTION_NOT_PERMITTED|DEVELOPER_TOKEN_NOT_APPROVED|DEVELOPER_TOKEN_PROHIBITED/.exec(text);
+  if (access) {
+    return new ProviderError(
+      "permission_denied",
+      "The Google Cloud project used for Google Ads does not have production Google Ads API access. Request Explorer or Basic access for the project on the Google Ads API Overview page in Google Cloud Console.",
+      `${detail} ${access[0]}`,
+    );
   }
   if (status === 403 || reason === "PERMISSION_DENIED") {
     return new ProviderError("permission_denied", "Google Ads denied access to this account.", detail);
@@ -95,7 +104,6 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
   function headers(accessToken: string, loginCustomerId?: string) {
     const result: Record<string, string> = {
       Authorization: `Bearer ${accessToken}`,
-      "developer-token": config.developerToken,
       "Content-Type": "application/json",
     };
     if (loginCustomerId) result["login-customer-id"] = loginCustomerId;

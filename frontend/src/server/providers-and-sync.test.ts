@@ -246,7 +246,7 @@ describe("Meta provider: Business Login system user token", () => {
 });
 
 describe("Google Ads provider", () => {
-  const config = { clientId: "id", clientSecret: "secret", developerToken: "dev", redirectUri: "https://portal.example/oauth/callback", apiVersion: "v24" };
+  const config = { clientId: "id", clientSecret: "secret", redirectUri: "https://portal.example/oauth/callback", apiVersion: "v24" };
 
   it("uses PKCE and offline access", () => {
     const url = new URL(createGoogleProvider(config).authorizeUrl("st", "challenge"));
@@ -263,7 +263,8 @@ describe("Google Ads provider", () => {
     const rows = await createGoogleProvider(config, fetcher).fetchMetrics("token", { ...account, external_account_id: "1234567890", metadata: { login_customer_id: "9999999999" } }, "2026-10-01", "2026-10-01");
     expect(rows[0]).toEqual({ external_campaign_id: "77", date: "2026-10-01", impressions: 100, reach: 0, clicks: 9, spend: 2.5, conversions: 1.5, conversion_value: 30 });
     const headers = calls[0].init?.headers as Record<string, string>;
-    expect(headers["developer-token"]).toBe("dev");
+    expect(headers.Authorization).toBe("Bearer token");
+    expect(headers).not.toHaveProperty("developer-token");
     expect(headers["login-customer-id"]).toBe("9999999999");
     expect(calls[0].url).toBe("https://googleads.googleapis.com/v24/customers/1234567890/googleAds:search");
     expect(microsToUnits("1000000")).toBe(1);
@@ -283,10 +284,16 @@ describe("Google Ads provider", () => {
     expect(accounts).toEqual([{ external_account_id: "2222222222", account_name: "Client", currency: "INR", timezone: "Asia/Kolkata", status: "active", metadata: { login_customer_id: "1111111111" } }]);
   });
 
-  it("reports an unapproved developer token clearly", async () => {
-    const { fetcher } = fakeFetch([[/./, () => ({ status: 403, body: { error: { code: 403, status: "PERMISSION_DENIED", details: [{ errors: [{ errorCode: { authorizationError: "DEVELOPER_TOKEN_NOT_APPROVED" } }] }] } } })]]);
+  it.each(["CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION", "ACTION_NOT_PERMITTED"])("explains missing Cloud project access (%s)", async (reason) => {
+    const { fetcher } = fakeFetch([[/./, () => ({ status: 403, body: { error: { code: 403, status: "PERMISSION_DENIED", details: [{ errors: [{ errorCode: { authorizationError: reason } }] }] } } })]]);
     await expect(createGoogleProvider(config, fetcher).fetchCampaigns("t", { ...account, external_account_id: "1234567890" }))
-      .rejects.toMatchObject({ code: "permission_denied", message: expect.stringMatching(/developer token/i) });
+      .rejects.toMatchObject({ code: "permission_denied", message: expect.stringMatching(/Google Cloud project.*Explorer or Basic access/), detail: expect.stringContaining(reason) });
+  });
+
+  it("keeps the plain permission error for other denials", async () => {
+    const { fetcher } = fakeFetch([[/./, () => ({ status: 403, body: { error: { code: 403, status: "PERMISSION_DENIED", details: [{ errors: [{ errorCode: { authorizationError: "USER_PERMISSION_DENIED" } }] }] } } })]]);
+    await expect(createGoogleProvider(config, fetcher).fetchCampaigns("t", { ...account, external_account_id: "1234567890" }))
+      .rejects.toMatchObject({ code: "permission_denied", message: "Google Ads denied access to this account." });
   });
 });
 
@@ -294,8 +301,15 @@ describe("provider configuration", () => {
   it("lists missing secret names without values", () => {
     const status = providerStatus((name) => ({ APP_URL: "https://x.example", OAUTH_STATE_SECRET: "s".repeat(40), META_APP_ID: "1" } as Record<string, string>)[name]);
     expect(status.meta).toMatchObject({ configured: false, missing: ["META_APP_SECRET"] });
-    expect(status.google.missing).toEqual(["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_ADS_DEVELOPER_TOKEN"]);
+    expect(status.google.missing).toEqual(["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"]);
     expect(providerStatus(() => undefined).meta.missing).toContain("OAUTH_STATE_SECRET");
+  });
+
+  it("configures Google with the OAuth client only, without a developer token", () => {
+    const env: Record<string, string> = { APP_URL: "https://x.example", OAUTH_STATE_SECRET: "s".repeat(40), GOOGLE_OAUTH_CLIENT_ID: "id", GOOGLE_OAUTH_CLIENT_SECRET: "secret" };
+    expect(providerStatus((name) => env[name]).google).toMatchObject({ configured: true, missing: [], apiVersion: "v24" });
+    const url = new URL(createProvider("google", (name) => env[name]).authorizeUrl("st", "challenge"));
+    expect(url.searchParams.get("redirect_uri")).toBe("https://x.example/oauth/callback");
   });
 });
 

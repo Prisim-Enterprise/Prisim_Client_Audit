@@ -12,7 +12,9 @@ export const DEFAULT_GOOGLE_ADS_API_VERSION = "v24";
 
 const REQUIRED = {
   meta: ["META_APP_ID", "META_APP_SECRET"],
-  google: ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET", "GOOGLE_ADS_DEVELOPER_TOKEN"],
+  // Google Ads API access is granted to the Google Cloud project that owns the
+  // OAuth client; developer tokens were retired on 9 September 2026.
+  google: ["GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET"],
 } as const;
 
 const SHARED = ["APP_URL", "OAUTH_STATE_SECRET"] as const;
@@ -70,7 +72,6 @@ export function createProvider(provider: "meta" | "google", env: EnvReader, fetc
   return createGoogleProvider({
     clientId: env("GOOGLE_OAUTH_CLIENT_ID")!,
     clientSecret: env("GOOGLE_OAUTH_CLIENT_SECRET")!,
-    developerToken: env("GOOGLE_ADS_DEVELOPER_TOKEN")!,
     redirectUri,
     apiVersion: status.apiVersion,
   }, fetcher);
