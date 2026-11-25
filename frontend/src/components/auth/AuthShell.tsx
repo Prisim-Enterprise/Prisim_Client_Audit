@@ -47,6 +47,8 @@ export function AuthShell({ children, eyebrow = "A clearer view of performance" 
         <p className="text-center text-xs text-slate-400 lg:text-right">
           Secure access for PRISIM teams and clients ·{" "}
           <Link to="/privacy-policy" className="font-medium text-slate-500 hover:text-accent-700">Privacy Policy</Link>
+          {" · "}
+          <Link to="/terms-of-service" className="font-medium text-slate-500 hover:text-accent-700">Terms of Service</Link>
         </p>
       </section>
     </main>
