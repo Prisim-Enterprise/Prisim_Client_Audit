@@ -1,0 +1,62 @@
+# Database tests: applies every migration to a fresh, isolated local Supabase
+# stack inside the GitHub runner and runs the pgTAP suite (supabase/tests).
+#
+# Isolation: no repository or environment secrets are used, the checkout is
+# never linked to a hosted project, and the stack is destroyed with the
+# runner. This workflow cannot reach or change the production database.
+name: Database tests
+
+on:
+  pull_request:
+    paths:
+      - "supabase/**"
+      - "scripts/ci-db-test.sh"
+      - ".github/workflows/database-tests.yml"
+      - "package.json"
+      - "package-lock.json"
+  push:
+    paths:
+      - "supabase/**"
+      - "scripts/ci-db-test.sh"
+      - ".github/workflows/database-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: database-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pgtap:
+    name: Migrations + pgTAP (isolated)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Installs the pinned Supabase CLI (package-lock.json) and the other
+      # root dev tools; no production configuration is involved.
+      - name: Install tools
+        run: npm ci
+
+      - name: Run migrations and database tests
+        run: bash scripts/ci-db-test.sh
+
+      - name: Upload test output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: database-test-results
+          path: test-results/db
+          retention-days: 14
