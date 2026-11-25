@@ -21,7 +21,6 @@ const fullEnv: Record<string, string> = {
   META_APP_SECRET: "secret",
   GOOGLE_OAUTH_CLIENT_ID: "client",
   GOOGLE_OAUTH_CLIENT_SECRET: "secret",
-  GOOGLE_ADS_DEVELOPER_TOKEN: "dev",
 };
 
 function request(body: unknown, headers: Record<string, string> = {}) {

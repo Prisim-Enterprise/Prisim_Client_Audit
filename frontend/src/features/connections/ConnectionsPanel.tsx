@@ -25,7 +25,7 @@ const PROVIDER_COPY: Record<Provider, { name: string; approval: string; scopes: 
   },
   google: {
     name: "Google Ads",
-    approval: "Live access also needs an approved Google Ads developer token (Basic access) and a verified OAuth consent screen.",
+    approval: "Live access also needs Explorer or Basic Google Ads API access for the Google Cloud project that owns the OAuth client, and a verified OAuth consent screen.",
     scopes: "Read-only reporting access through the Google Ads API (adwords scope).",
   },
 };

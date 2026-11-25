@@ -84,8 +84,7 @@ Secrets (names only; values are set by the owner, never committed):
 | `OAUTH_STATE_SECRET` | ad-connections | Random, ≥ 32 characters |
 | `CRON_SECRET` | sync-ad-data | Random, ≥ 32 characters (same value as Vault `prisim_cron_secret`) |
 | `META_APP_ID`, `META_APP_SECRET` | ad-connections, sync-ad-data | Meta app (Business type) with the Marketing API product |
-| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | ad-connections, sync-ad-data | Google Cloud OAuth client, type Web application |
-| `GOOGLE_ADS_DEVELOPER_TOKEN` | ad-connections, sync-ad-data | Google Ads API developer token (Basic access or higher) |
+| `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET` | ad-connections, sync-ad-data | Google Cloud OAuth client, type Web application. Google Ads API access comes from the Cloud project that owns this client (section 6); no developer token is used |
 | `META_LOGIN_CONFIG_ID` | ad-connections, sync-ad-data (optional) | Facebook Login for Business configuration ID (token type **System user access token**). When set, Meta consent uses the system user flow (below); unset keeps the classic `scope` flow |
 | `META_API_VERSION`, `GOOGLE_ADS_API_VERSION` | optional | Defaults `v26.0` / `v24`; raise when a version nears sunset |
 
@@ -137,9 +136,25 @@ manually.
     token is best effort: the client removes PRISIM in Business Settings →
     Integrations → Connected apps.
   A configuration with token type *User access token* is not supported.
-- **Google**: OAuth consent screen with the `https://www.googleapis.com/auth/adwords`
-  scope (sensitive scope → verification), developer token with Basic access.
-  A test-level token only works with Google Ads test accounts.
+- **Google**: Google retired Google Ads API developer tokens on 9 September
+  2026. API access levels now belong to the Google Cloud project that owns
+  the OAuth client (`GOOGLE_OAUTH_CLIENT_ID`), and the app sends no
+  `developer-token` header.
+  - In that project, enable the Google Ads API and create an OAuth client of
+    type Web application with the redirect URI above.
+  - OAuth consent screen with the `https://www.googleapis.com/auth/adwords`
+    scope (sensitive scope → verification). Set the publishing status to
+    *In production*: while it is *Testing*, refresh tokens expire after 7
+    days.
+  - Access levels: **Test** (default for a new project; Google Ads test
+    accounts only), **Explorer**, **Basic** and **Standard**. Real client
+    accounts need Explorer or Basic access or higher, requested on the
+    Google Ads API Overview page in Google Cloud Console. Basic and Standard
+    require brand verification.
+  - A project without production access fails on real accounts with
+    `CLOUD_PROJECT_NOT_APPROVED_FOR_PRODUCTION` (API v25 and later) or
+    `ACTION_NOT_PERMITTED` (v24 and earlier). The portal reports this as
+    missing Google Ads API access for the Cloud project.
 
 ## 7. Supabase Auth and Vercel
 
