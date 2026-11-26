@@ -35,6 +35,14 @@ export type AccountSyncResult = {
    *   unverified  - totals could not be read or prove nothing
    */
   reconciliation: "matched" | "mismatch" | "unverified";
+  /**
+   * Whether a day of this window without rows may be read as "no delivery".
+   * Requires all of: every page read, every fetched row stored, account
+   * totals reconciled, AND a platform that documents omitting all-zero rows
+   * for date-segmented reports (Google). Period totals alone cannot place a
+   * value on a specific day, so Meta windows are never zero-verified.
+   */
+  zero_days_verified: boolean;
   account_totals: { impressions: number; spend: number } | null;
   row_totals: { impressions: number; spend: number };
   /** Platform values that were present but not numeric (stored as 0). */
@@ -58,8 +66,13 @@ function agrees(a: number, b: number, unit: number) {
   return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * RECONCILE_TOLERANCE + unit;
 }
 
-/** Google documents that all-zero rows are omitted when segmenting; Meta does not document it. */
-const DOCUMENTED_ZERO_OMISSION: Record<"meta" | "google", boolean> = { google: true, meta: false };
+/**
+ * Google documents that rows whose selected metrics are all zero are omitted
+ * when a report is segmented (segments.date). Meta documents no such rule, so
+ * a Meta day without rows cannot be told apart from a day that was not
+ * returned; reconciled window totals do not change that.
+ */
+export const DOCUMENTED_ZERO_OMISSION: Record<"meta" | "google", boolean> = { google: true, meta: false };
 
 export function reconcile(
   provider: "meta" | "google",
@@ -177,6 +190,7 @@ export async function processSyncJob(job: ClaimedJob, deps: SyncDependencies): P
         persisted_rows: 0,
         unresolved_campaigns: 0,
         reconciliation: "unverified",
+        zero_days_verified: false,
         account_totals: null,
         row_totals: { impressions: 0, spend: 0 },
         invalid_values: 0,
@@ -241,6 +255,7 @@ export async function processSyncJob(job: ClaimedJob, deps: SyncDependencies): P
           }
         }
         result.reconciliation = reconcile(job.provider, result.account_totals, result.row_totals);
+        result.zero_days_verified = result.reconciliation === "matched" && DOCUMENTED_ZERO_OMISSION[job.provider];
         result.status = "succeeded";
         stats.accounts = (stats.accounts as number) + 1;
         stats.campaigns = (stats.campaigns as number) + first.campaigns;

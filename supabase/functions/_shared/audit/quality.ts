@@ -270,7 +270,10 @@ export function assessAccount(input: AuditInput, account: AuditAccount, generate
       ratio > 0.5 ? "blocking" : ratio > 0.1 ? "major" : "minor",
       account,
       `${unverified.length} retrieved day(s) have no metric rows, but the sync could not prove that nothing was delivered on them ` +
-        "(no reconciled account totals for that sync). They are treated as unknown, not as zero.",
+        (account.provider === "meta"
+          ? "(Meta does not document that days without delivery are omitted, and window totals cannot place delivery on a specific day). "
+          : "(no reconciled account totals for that sync). ") +
+        "They are treated as unknown, not as zero.",
       { unverified_days: unverified.length, period_days: periodDays },
     ));
   }

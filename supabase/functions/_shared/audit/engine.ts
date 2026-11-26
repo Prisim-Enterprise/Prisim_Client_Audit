@@ -392,6 +392,7 @@ export function runAudit(input: AuditInput): AuditResult {
       },
       platformCategoryScores,
       lastSuccessfulSync,
+      findingCounts: Object.fromEntries(SEVERITY_ORDER.map((severity) => [severity, findings.filter((finding) => finding.category !== "data_quality" && finding.severity === severity).length])) as Record<Severity, number>,
       limitations: buildLimitations(input, qualities, providers),
       metricNotes: [
         "Conversions and conversion value are as attributed by each platform and are not de-duplicated across platforms.",
@@ -470,7 +471,12 @@ function buildSummary(input: AuditInput, result: AuditResult, findings: AuditFin
   if (Object.keys(platforms).length > 1) parts.push("Google Ads and Meta Ads are scored separately; no combined score is given.");
   const performance = findings.filter((finding) => finding.category !== "data_quality");
   const urgent = performance.filter((finding) => finding.severity === "critical" || finding.severity === "high");
-  if (urgent.length > 0) parts.push(`${urgent.length} high-priority finding${urgent.length === 1 ? "" : "s"}, led by: ${urgent[0].title}.`);
+  const unscored = Object.values(platforms).some((platform) => platform?.score === null);
+  if (urgent.length > 0 && unscored) {
+    parts.push(
+      `Not scored does not mean the account is healthy: ${urgent.length} critical or high-priority finding${urgent.length === 1 ? "" : "s"} need${urgent.length === 1 ? "s" : ""} action, led by: ${urgent[0].title}.`,
+    );
+  } else if (urgent.length > 0) parts.push(`${urgent.length} high-priority finding${urgent.length === 1 ? "" : "s"}, led by: ${urgent[0].title}.`);
   else if (performance.length > 0) parts.push(`No critical or high-priority performance issues were found; ${performance.length} other finding(s) are listed.`);
   const dataProblems = findings.filter((finding) => finding.category === "data_quality" && finding.severity !== "info" && finding.severity !== "low");
   if (dataProblems.length > 0) parts.push(`${dataProblems.length} data-quality problem(s) should be resolved before relying on this audit.`);

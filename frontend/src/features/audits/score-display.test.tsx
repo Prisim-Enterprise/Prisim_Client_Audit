@@ -69,6 +69,12 @@ describe("score display", () => {
     expect(screen.getByRole("status")).toHaveTextContent(/Not scored/);
   });
 
+  it("a Not scored audit with critical findings says it is not healthy", () => {
+    const kpis = { ...platforms({ score: null, status: "unscored" }), findingCounts: { critical: 1, high: 2, medium: 0, low: 0, info: 0 } };
+    render(<ScoreStatusBanner run={run({ kpis })} />);
+    expect(screen.getByRole("status")).toHaveTextContent("Not scored does not mean healthy: 1 critical and 2 high-priority findings need action");
+  });
+
   it("final scores need no banner; pre-2.1 audits keep their stored platform scores", () => {
     const { container } = render(<ScoreStatusBanner run={run({ platform_scores: { google: 90 }, kpis: platforms({ score: 90, status: "scored" }) })} />);
     expect(container).toBeEmptyDOMElement();

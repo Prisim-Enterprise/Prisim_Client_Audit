@@ -132,7 +132,7 @@ describe("sync outcomes", () => {
     expect(outcome.success).toBe(true); // partial
     expect(results(fake)).toEqual([
       expect.objectContaining({ ad_account_id: "a1", status: "failed", pagination: "incomplete", reconciliation: "unverified" }),
-      expect.objectContaining({ ad_account_id: "a2", status: "succeeded", pagination: "complete", fetched_rows: 1, persisted_rows: 1, reconciliation: "matched" }),
+      expect.objectContaining({ ad_account_id: "a2", status: "succeeded", pagination: "complete", fetched_rows: 1, persisted_rows: 1, reconciliation: "matched", zero_days_verified: true }),
     ]);
   });
 
@@ -162,14 +162,29 @@ describe("sync outcomes", () => {
     expect(reconcile("google", null, { impressions: 0, spend: 0 })).toBe("unverified");
   });
 
-  it("only complete, fully stored, reconciled runs verify zero days", () => {
-    const accounts: AuditAccount[] = [{ id: "a1", provider: "meta", name: "M", currency: "INR", connectionId: "conn" }];
+  it("only complete, fully stored, reconciled runs that the sync marked zero-verified verify zero days", () => {
+    const accounts: AuditAccount[] = [{ id: "a1", provider: "google", name: "G", currency: "INR", connectionId: "conn" }];
     const job = (result: Record<string, unknown>) => ({ id: "j", connection_id: "conn", job_type: "daily_sync", status: "completed", completed_at: "2026-11-25T00:00:00Z", error_message: null, stats: { account_results: [{ ad_account_id: "a1", status: "succeeded", since: START, until: END, ...result }] } });
     const verified = (result: Record<string, unknown>) => toSyncRuns([job(result)], accounts)[0].zeroDaysVerified;
-    expect(verified({ pagination: "complete", reconciliation: "matched", fetched_rows: 5, persisted_rows: 5 })).toBe(true);
-    expect(verified({ pagination: "complete", reconciliation: "unverified", fetched_rows: 5, persisted_rows: 5 })).toBe(false);
-    expect(verified({ pagination: "complete", reconciliation: "matched", fetched_rows: 5, persisted_rows: 4 })).toBe(false);
+    const proof = { pagination: "complete", reconciliation: "matched", fetched_rows: 5, persisted_rows: 5, zero_days_verified: true };
+    expect(verified(proof)).toBe(true);
+    expect(verified({ ...proof, zero_days_verified: false })).toBe(false); // e.g. a Meta window
+    expect(verified({ ...proof, reconciliation: "unverified" })).toBe(false);
+    expect(verified({ ...proof, persisted_rows: 4 })).toBe(false);
+    expect(verified({ ...proof, pagination: "incomplete" })).toBe(false);
     expect(verified({})).toBe(false); // engine 2.0 results (no proof recorded)
+  });
+
+  it("Meta windows are never zero-verified, even when the window totals reconcile", async () => {
+    // Rows for 1 day; the account total equals them, so totals reconcile - but a
+    // window total cannot say on which day delivery happened, so empty days stay unknown.
+    const fake = deps({ fetchAccountTotals: vi.fn(async () => ({ impressions: 10, spend: 1 })) });
+    await processSyncJob({ ...job("meta"), accounts: [job().accounts[0]] }, fake);
+    expect(results(fake)[0]).toMatchObject({ status: "succeeded", reconciliation: "matched", zero_days_verified: false });
+    // Same rows on Google: Google documents that all-zero date rows are omitted.
+    const google = deps({});
+    await processSyncJob({ ...job("google"), accounts: [job().accounts[0]] }, google);
+    expect(results(google)[0]).toMatchObject({ reconciliation: "matched", zero_days_verified: true });
   });
 });
 
@@ -230,15 +245,24 @@ const metaAccount: AuditAccount = { id: META, provider: "meta", name: "Meta", cu
 const googleAccount: AuditAccount = { id: GOOGLE, provider: "google", name: "Google", currency: "INR" };
 
 describe("unverified zero delivery (D4)", () => {
-  it("Meta: retrieved days without rows stay unknown unless the run reconciled totals", () => {
+  it("Meta: retrieved days without rows stay unknown, even with reconciled totals", () => {
     const idle = campaign({ id: "m1", adAccountId: META, provider: "meta", objective: "OUTCOME_LEADS" });
-    const unproven = runAudit(engineInput({ accounts: [metaAccount], campaigns: [idle], syncRuns: [run(META, { zeroDaysVerified: false, reconciliation: "unverified" })] }));
+    // The record a Meta sync writes: complete, stored, reconciled - but not zero-verified.
+    const metaRun = toSyncRuns([{
+      id: "j", connection_id: "c", job_type: "manual_sync", status: "completed", completed_at: "2026-11-25T11:00:00Z", error_message: null,
+      stats: { account_results: [{ ad_account_id: META, status: "succeeded", since: "2026-08-27", until: END, pagination: "complete", reconciliation: "matched", fetched_rows: 0, persisted_rows: 0, zero_days_verified: false }] },
+    }], [{ ...metaAccount, connectionId: "c" }]);
+    const unproven = runAudit(engineInput({ accounts: [metaAccount], campaigns: [idle], syncRuns: metaRun }));
     expect(unproven.kpis.accounts[0].coverage).toMatchObject({ retrievedDays: 30, zeroDeliveryDays: 0, unverifiedDays: 30, coverageRatio: 0 });
-    expect(unproven.findings.map((finding) => finding.ruleId)).toContain("data_quality.zero_delivery_unverified");
-    expect(unproven.findings.map((finding) => finding.ruleId)).not.toContain("structure.no_account_delivery");
-    const proven = runAudit(engineInput({ accounts: [metaAccount], campaigns: [idle], syncRuns: [run(META)] }));
+    const finding = unproven.findings.find((item) => item.ruleId === "data_quality.zero_delivery_unverified");
+    expect(finding?.description).toContain("Meta does not document");
+    expect(unproven.findings.map((item) => item.ruleId)).not.toContain("structure.no_account_delivery");
+    expect(unproven.overallScore).toBeNull();
+    // A Google record with the documented zero-row rule proves the same days.
+    const idleGoogle = campaign({ id: "g1", adAccountId: GOOGLE, provider: "google", channelType: "SEARCH" });
+    const proven = runAudit(engineInput({ accounts: [googleAccount], campaigns: [idleGoogle], syncRuns: [run(GOOGLE)] }));
     expect(proven.kpis.accounts[0].coverage).toMatchObject({ zeroDeliveryDays: 30, unverifiedDays: 0 });
-    expect(proven.findings.map((finding) => finding.ruleId)).toContain("structure.no_account_delivery");
+    expect(proven.findings.map((item) => item.ruleId)).toContain("structure.no_account_delivery");
   });
 
   it("a mismatch between account totals and rows is a data problem", () => {

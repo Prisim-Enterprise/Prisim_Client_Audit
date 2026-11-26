@@ -87,11 +87,18 @@ export function ScoreStatusBanner({ run }: { run: AuditRun }) {
   if (provisional.length === 0 && unscored.length === 0 && !(platforms.length === 0 && run.overall_score === null)) return null;
   const reasons = [...provisional, ...unscored].map((item) => `${PLATFORM_LABEL[item.provider]}: ${item.reason ?? (item.score === null ? "not scored" : "provisional")}`);
   const allUnscored = platforms.length === 0 ? run.overall_score === null : unscored.length === platforms.length;
+  const counts = run.kpis?.findingCounts;
+  const urgent = counts ? counts.critical + counts.high : 0;
   return (
-    <div role="status" className={`rounded-xl border-2 p-4 ${allUnscored ? "border-slate-300 bg-slate-50" : "border-amber-400 bg-amber-50"}`}>
+    <div role="status" className={`rounded-xl border-2 p-4 ${urgent > 0 && unscored.length > 0 ? "border-rose-400 bg-rose-50" : allUnscored ? "border-slate-300 bg-slate-50" : "border-amber-400 bg-amber-50"}`}>
       <p className={`text-sm font-semibold ${allUnscored ? "text-slate-800" : "text-amber-900"}`}>
         {allUnscored ? "Not scored: there is not enough verified data for a performance score." : "Provisional score: the data behind it is incomplete or not fully verified."}
       </p>
+      {urgent > 0 && unscored.length > 0 && (
+        <p className="mt-1 text-sm font-semibold text-rose-800">
+          Not scored does not mean healthy: {counts!.critical} critical and {counts!.high} high-priority finding{urgent === 1 ? "" : "s"} need action (listed under Findings, with evidence).
+        </p>
+      )}
       {reasons.length > 0 && (
         <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs leading-5 text-slate-700">
           {reasons.map((reason) => <li key={reason}>{reason}</li>)}

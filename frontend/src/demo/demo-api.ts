@@ -218,6 +218,8 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
                   reconciliation: "matched",
                   fetched_rows: 0,
                   persisted_rows: 0,
+                  // Same rule as production: only Google proves days without rows.
+                  zero_days_verified: account.provider === "google",
                 })),
             },
           };

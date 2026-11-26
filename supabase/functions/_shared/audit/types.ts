@@ -417,6 +417,11 @@ export type AuditResult = {
     /** Category scores per platform (categories of different platforms are not comparable). */
     platformCategoryScores?: Partial<Record<Provider, Partial<Record<ScoredCategory, number>>>>;
     lastSuccessfulSync?: string | null;
+    /**
+     * Performance findings (data-quality findings excluded) by severity at
+     * audit time, so a Not scored audit can still say what needs action.
+     */
+    findingCounts?: Record<Severity, number>;
     limitations?: string[];
     metricNotes?: string[];
     generatedAt?: string;

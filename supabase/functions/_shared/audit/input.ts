@@ -279,7 +279,10 @@ export function toSyncRuns(jobs: SyncJobRow[], accounts: AuditAccount[]): SyncRu
           legacy: false,
           reconciliation: result.reconciliation === "matched" || result.reconciliation === "mismatch" ? result.reconciliation : "unverified",
           unresolvedCampaigns: num(result.unresolved_campaigns as number),
-          zeroDaysVerified: result.status === "succeeded"
+          // The sync decides (complete pages, all rows stored, reconciled totals,
+          // documented zero-row omission); the checks are repeated here.
+          zeroDaysVerified: result.zero_days_verified === true
+            && result.status === "succeeded"
             && result.pagination === "complete"
             && result.reconciliation === "matched"
             && typeof result.fetched_rows === "number"

@@ -303,6 +303,14 @@ function drawCover(writer: Writer) {
       { size: 8.5, color: COLORS.slate, lineHeight: 12 },
     );
   }
+  const urgentCount = data.findings.filter((finding) => finding.status !== "dismissed" && (finding.severity === "critical" || finding.severity === "high") && finding.category !== "data_quality").length;
+  if (urgentCount > 0 && platforms.some((item) => item.score === null)) {
+    writer.space(4);
+    writer.text(
+      `NOT SCORED DOES NOT MEAN HEALTHY: ${urgentCount} critical or high-priority finding${urgentCount === 1 ? "" : "s"} need action. See Findings and recommendations.`,
+      { size: 9, font: writer.bold, color: COLORS.critical, lineHeight: 12 },
+    );
+  }
   const provisionalPlatforms = platforms.filter((item) => item.score !== null && item.status === "provisional");
   if (provisionalPlatforms.length > 0) {
     writer.space(4);
