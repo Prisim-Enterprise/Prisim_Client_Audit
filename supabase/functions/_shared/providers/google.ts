@@ -5,8 +5,12 @@
 // login-customer-id.
 
 import {
+  type AccountDiagnostics,
   type AdProvider,
+  type CampaignDetails,
   type CampaignRecord,
+  checkedNumber,
+  diagnosticSection,
   type DiscoveredAccount,
   type FetchLike,
   type MetricRecord,
@@ -78,6 +82,17 @@ export function microsToUnits(value: unknown): number {
 }
 
 type SearchRow = Record<string, Record<string, unknown> | undefined>;
+
+function text(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+/** A metric that may legitimately be absent (e.g. impression share not reported). */
+function nullableNumber(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const parsed = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
 
 export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = fetch): AdProvider {
   const api = `https://googleads.googleapis.com/${config.apiVersion}`;
@@ -232,23 +247,54 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
     },
 
     async fetchCampaigns(accessToken, account): Promise<CampaignRecord[]> {
+      // Fields checked against the v24 field reference (campaign and the
+      // attributed campaign_budget resource). campaign.start_date/end_date do
+      // not exist in v24; start_date_time/end_date_time are in the customer's
+      // time zone ("yyyy-MM-dd HH:mm:ss").
       const rows = await search(
         accessToken,
         account.external_account_id,
-        "SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign.bidding_strategy_type, campaign_budget.amount_micros FROM campaign WHERE campaign.status != 'REMOVED'",
+        "SELECT campaign.id, campaign.name, campaign.status, campaign.serving_status, campaign.primary_status, " +
+          "campaign.primary_status_reasons, campaign.advertising_channel_type, campaign.advertising_channel_sub_type, " +
+          "campaign.bidding_strategy_type, campaign.start_date_time, campaign.end_date_time, campaign_budget.id, " +
+          "campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, " +
+          "campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign WHERE campaign.status != 'REMOVED'",
         loginId(account),
       );
+      const capturedAt = new Date().toISOString();
       return rows
         .filter((row) => row.campaign?.id !== undefined)
-        .map((row) => ({
-          external_id: String(row.campaign?.id),
-          name: typeof row.campaign?.name === "string" ? row.campaign.name : null,
-          objective: typeof row.campaign?.advertisingChannelType === "string" ? row.campaign.advertisingChannelType : null,
-          status: typeof row.campaign?.status === "string" ? row.campaign.status : null,
-          daily_budget: row.campaignBudget?.amountMicros === undefined ? null : microsToUnits(row.campaignBudget.amountMicros),
-          bid_strategy: typeof row.campaign?.biddingStrategyType === "string" ? row.campaign.biddingStrategyType : null,
-          channel_type: typeof row.campaign?.advertisingChannelType === "string" ? row.campaign.advertisingChannelType : null,
-        }));
+        .map((row) => {
+          const campaign = row.campaign ?? {};
+          const budget = row.campaignBudget;
+          const reasons = Array.isArray(campaign.primaryStatusReasons)
+            ? (campaign.primaryStatusReasons as unknown[]).filter((reason): reason is string => typeof reason === "string")
+            : [];
+          const details: CampaignDetails = {
+            channel_sub_type: text(campaign.advertisingChannelSubType),
+            serving_status: text(campaign.servingStatus),
+            primary_status: text(campaign.primaryStatus),
+            primary_status_reasons: reasons,
+            start: text(campaign.startDateTime),
+            end: text(campaign.endDateTime),
+            budget_id: budget?.id === undefined ? null : String(budget.id),
+            budget_shared: typeof budget?.explicitlyShared === "boolean" ? budget.explicitlyShared : null,
+            budget_period: text(budget?.period),
+            budget_reference_count: budget?.referenceCount === undefined ? null : toNumber(budget.referenceCount),
+            lifetime_budget: budget?.totalAmountMicros === undefined ? null : microsToUnits(budget.totalAmountMicros),
+            captured_at: capturedAt,
+          };
+          return {
+            external_id: String(campaign.id),
+            name: text(campaign.name),
+            objective: text(campaign.advertisingChannelType),
+            status: text(campaign.status),
+            daily_budget: budget?.amountMicros === undefined ? null : microsToUnits(budget.amountMicros),
+            bid_strategy: text(campaign.biddingStrategyType),
+            channel_type: text(campaign.advertisingChannelType),
+            details,
+          };
+        });
     },
 
     async fetchMetrics(accessToken, account, since, until): Promise<MetricRecord[]> {
@@ -261,18 +307,146 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
         `SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}' AND campaign.status != 'REMOVED'`,
         loginId(account),
       );
+      // Google omits campaign/day rows without activity, so an absent day in a
+      // successfully synced window means no reported delivery, not missing data.
       return rows
         .filter((row) => row.campaign?.id !== undefined && typeof row.segments?.date === "string")
-        .map((row) => ({
-          external_campaign_id: String(row.campaign?.id),
-          date: row.segments?.date as string,
-          impressions: Math.round(toNumber(row.metrics?.impressions)),
-          reach: 0, // Not reported per campaign/day by Google Ads.
-          clicks: Math.round(toNumber(row.metrics?.clicks)),
-          spend: microsToUnits(row.metrics?.costMicros),
-          conversions: toNumber(row.metrics?.conversions),
-          conversion_value: toNumber(row.metrics?.conversionsValue),
-        }));
+        .map((row) => {
+          const invalid: string[] = [];
+          const metrics = row.metrics ?? {};
+          const record: MetricRecord = {
+            external_campaign_id: String(row.campaign?.id),
+            date: row.segments?.date as string,
+            impressions: Math.round(checkedNumber(metrics.impressions, "impressions", invalid)),
+            reach: 0, // Not reported per campaign/day by Google Ads.
+            clicks: Math.round(checkedNumber(metrics.clicks, "clicks", invalid)),
+            spend: checkedNumber(metrics.costMicros, "cost_micros", invalid) / 1_000_000,
+            conversions: checkedNumber(metrics.conversions, "conversions", invalid),
+            conversion_value: checkedNumber(metrics.conversionsValue, "conversions_value", invalid),
+          };
+          return invalid.length > 0 ? { ...record, invalid_fields: invalid } : record;
+        });
+    },
+
+    async fetchDiagnostics(accessToken, account, since, until): Promise<AccountDiagnostics> {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+        throw new ProviderError("provider_error", "Invalid diagnostics window.");
+      }
+      const id = account.external_account_id;
+      const login = loginId(account);
+      const during = `segments.date BETWEEN '${since}' AND '${until}'`;
+      const run = (query: string, map: (row: SearchRow) => Record<string, unknown>, limit: number) =>
+        diagnosticSection(async () => {
+          const rows = await search(accessToken, id, query, login, limit);
+          return { rows: rows.slice(0, limit).map(map), truncated: rows.length >= limit };
+        });
+      // Every field below was checked against the v24 field reference.
+      const sections: AccountDiagnostics["sections"] = {
+        conversion_actions: await run(
+          "SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.type, " +
+            "conversion_action.category, conversion_action.origin, conversion_action.primary_for_goal, " +
+            "conversion_action.include_in_conversions_metric, conversion_action.counting_type, " +
+            "conversion_action.value_settings.default_value, conversion_action.value_settings.always_use_default_value " +
+            "FROM conversion_action WHERE conversion_action.status != 'REMOVED'",
+          (row) => {
+            const action = row.conversionAction ?? {};
+            const value = (action.valueSettings ?? {}) as Record<string, unknown>;
+            return {
+              id: action.id === undefined ? null : String(action.id),
+              name: text(action.name),
+              status: text(action.status),
+              type: text(action.type),
+              category: text(action.category),
+              origin: text(action.origin),
+              primary_for_goal: typeof action.primaryForGoal === "boolean" ? action.primaryForGoal : null,
+              include_in_conversions_metric: typeof action.includeInConversionsMetric === "boolean" ? action.includeInConversionsMetric : null,
+              counting_type: text(action.countingType),
+              default_value: nullableNumber(value.defaultValue),
+              always_use_default_value: typeof value.alwaysUseDefaultValue === "boolean" ? value.alwaysUseDefaultValue : null,
+            };
+          },
+          500,
+        ),
+        // Impression share is a ratio, so it is read for the whole window
+        // (segments.date only in WHERE); daily values cannot be summed.
+        search_impression_share: await run(
+          "SELECT campaign.id, metrics.impressions, metrics.search_impression_share, " +
+            "metrics.search_budget_lost_impression_share, metrics.search_rank_lost_impression_share " +
+            `FROM campaign WHERE campaign.advertising_channel_type = 'SEARCH' AND campaign.status != 'REMOVED' AND ${during}`,
+          (row) => ({
+            campaign_id: String(row.campaign?.id ?? ""),
+            impressions: toNumber(row.metrics?.impressions),
+            search_impression_share: nullableNumber(row.metrics?.searchImpressionShare),
+            search_budget_lost_impression_share: nullableNumber(row.metrics?.searchBudgetLostImpressionShare),
+            search_rank_lost_impression_share: nullableNumber(row.metrics?.searchRankLostImpressionShare),
+          }),
+          500,
+        ),
+        ads: await run(
+          "SELECT campaign.id, ad_group_ad.ad.id, ad_group_ad.ad.type, ad_group_ad.status, ad_group_ad.ad_strength, " +
+            "ad_group_ad.policy_summary.approval_status, ad_group_ad.policy_summary.review_status " +
+            "FROM ad_group_ad WHERE ad_group_ad.status != 'REMOVED' AND campaign.status != 'REMOVED'",
+          (row) => {
+            const ad = row.adGroupAd ?? {};
+            const policy = (ad.policySummary ?? {}) as Record<string, unknown>;
+            const inner = (ad.ad ?? {}) as Record<string, unknown>;
+            return {
+              campaign_id: String(row.campaign?.id ?? ""),
+              ad_type: text(inner.type),
+              status: text(ad.status),
+              ad_strength: text(ad.adStrength),
+              approval_status: text(policy.approvalStatus),
+              review_status: text(policy.reviewStatus),
+            };
+          },
+          5000,
+        ),
+        keywords: await run(
+          "SELECT campaign.id, ad_group_criterion.keyword.text, ad_group_criterion.keyword.match_type, " +
+            "ad_group_criterion.quality_info.quality_score, ad_group_criterion.quality_info.creative_quality_score, " +
+            "ad_group_criterion.quality_info.post_click_quality_score, ad_group_criterion.quality_info.search_predicted_ctr, " +
+            "metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions FROM keyword_view " +
+            `WHERE ad_group_criterion.status = 'ENABLED' AND ad_group_criterion.negative = FALSE AND ${during} ` +
+            "ORDER BY metrics.cost_micros DESC LIMIT 300",
+          (row) => {
+            const criterion = row.adGroupCriterion ?? {};
+            const keyword = (criterion.keyword ?? {}) as Record<string, unknown>;
+            const quality = (criterion.qualityInfo ?? {}) as Record<string, unknown>;
+            return {
+              campaign_id: String(row.campaign?.id ?? ""),
+              text: text(keyword.text),
+              match_type: text(keyword.matchType),
+              quality_score: nullableNumber(quality.qualityScore),
+              creative_quality: text(quality.creativeQualityScore),
+              landing_page_quality: text(quality.postClickQualityScore),
+              expected_ctr: text(quality.searchPredictedCtr),
+              impressions: toNumber(row.metrics?.impressions),
+              clicks: toNumber(row.metrics?.clicks),
+              cost: microsToUnits(row.metrics?.costMicros),
+              conversions: toNumber(row.metrics?.conversions),
+            };
+          },
+          300,
+        ),
+        // search_term_view excludes Performance Max (Google documents
+        // campaign_search_term_view for that), so this covers Search/Shopping.
+        search_terms: await run(
+          "SELECT campaign.id, search_term_view.search_term, search_term_view.status, metrics.impressions, " +
+            "metrics.clicks, metrics.cost_micros, metrics.conversions FROM search_term_view " +
+            `WHERE metrics.cost_micros > 0 AND ${during} ORDER BY metrics.cost_micros DESC LIMIT 300`,
+          (row) => ({
+            campaign_id: String(row.campaign?.id ?? ""),
+            search_term: text(row.searchTermView?.searchTerm),
+            status: text(row.searchTermView?.status),
+            impressions: toNumber(row.metrics?.impressions),
+            clicks: toNumber(row.metrics?.clicks),
+            cost: microsToUnits(row.metrics?.costMicros),
+            conversions: toNumber(row.metrics?.conversions),
+          }),
+          300,
+        ),
+      };
+      return { provider: "google", window: { since, until }, captured_at: new Date().toISOString(), sections };
     },
 
     async revoke(accessToken, refreshToken) {

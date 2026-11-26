@@ -13,8 +13,11 @@
 //     token and /me/permissions, unchanged.
 
 import {
+  type AccountDiagnostics,
   type AdProvider,
   type CampaignRecord,
+  checkedNumber,
+  diagnosticSection,
   type DiscoveredAccount,
   type FetchLike,
   type MetricRecord,
@@ -371,22 +374,40 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
 
     async fetchCampaigns(accessToken, account: SyncAccount): Promise<CampaignRecord[]> {
       const divisor = ZERO_DECIMAL.has(account.currency ?? "") ? 1 : 100;
+      // Campaign fields from the Marketing API Campaign reference. start_time
+      // and stop_time are read-only at campaign level (merged from ad sets).
+      // A campaign budget (daily or lifetime) means Advantage campaign budget;
+      // without one, budgets live on the ad sets.
       const rows = await paged<Record<string, unknown>>(
         `/${account.external_account_id}/campaigns`,
-        { fields: "id,name,objective,effective_status,daily_budget,bid_strategy,buying_type", limit: "200" },
+        { fields: "id,name,objective,effective_status,status,daily_budget,lifetime_budget,bid_strategy,buying_type,start_time,stop_time", limit: "200" },
         accessToken,
       );
+      const capturedAt = new Date().toISOString();
       return rows
         .filter((row) => typeof row.id === "string")
-        .map((row) => ({
-          external_id: row.id as string,
-          name: typeof row.name === "string" ? row.name : null,
-          objective: typeof row.objective === "string" ? row.objective : null,
-          status: typeof row.effective_status === "string" ? row.effective_status : null,
-          daily_budget: row.daily_budget === undefined ? null : toNumber(row.daily_budget) / divisor,
-          bid_strategy: typeof row.bid_strategy === "string" ? row.bid_strategy : null,
-          channel_type: typeof row.buying_type === "string" ? row.buying_type : null,
-        }));
+        .map((row) => {
+          const hasDaily = row.daily_budget !== undefined && row.daily_budget !== null && row.daily_budget !== "";
+          const hasLifetime = row.lifetime_budget !== undefined && row.lifetime_budget !== null && row.lifetime_budget !== "" && toNumber(row.lifetime_budget) > 0;
+          return {
+            external_id: row.id as string,
+            name: typeof row.name === "string" ? row.name : null,
+            objective: typeof row.objective === "string" ? row.objective : null,
+            status: typeof row.effective_status === "string" ? row.effective_status : null,
+            daily_budget: hasDaily ? toNumber(row.daily_budget) / divisor : null,
+            bid_strategy: typeof row.bid_strategy === "string" ? row.bid_strategy : null,
+            channel_type: typeof row.buying_type === "string" ? row.buying_type : null,
+            details: {
+              serving_status: typeof row.status === "string" ? row.status : null,
+              start: typeof row.start_time === "string" ? row.start_time : null,
+              end: typeof row.stop_time === "string" ? row.stop_time : null,
+              lifetime_budget: hasLifetime ? toNumber(row.lifetime_budget) / divisor : null,
+              budget_level: hasDaily || hasLifetime ? "campaign" : "ad_set",
+              budget_shared: false,
+              captured_at: capturedAt,
+            },
+          };
+        });
     },
 
     async fetchMetrics(accessToken, account, since, until): Promise<MetricRecord[]> {
@@ -398,28 +419,97 @@ export function createMetaProvider(config: MetaConfig, fetcher: FetchLike = fetc
         limit: "500",
       });
       let rows: Array<Record<string, unknown>>;
+      let reachAvailable = true;
       try {
         rows = await paged(`/${account.external_account_id}/insights`, params("campaign_id,impressions,reach,clicks,spend,actions,action_values,date_start"), accessToken, 20000);
       } catch (error) {
         // Some API versions restrict `reach` with daily breakdowns; retry without it.
         if (!(error instanceof ProviderError) || error.code !== "provider_error") throw error;
+        reachAvailable = false;
         rows = await paged(`/${account.external_account_id}/insights`, params("campaign_id,impressions,clicks,spend,actions,action_values,date_start"), accessToken, 20000);
       }
+      // Meta returns no insights row for a campaign/day without delivery.
       return rows
         .filter((row) => typeof row.campaign_id === "string" && typeof row.date_start === "string")
         .map((row) => {
+          const invalid: string[] = reachAvailable ? [] : ["reach_unavailable"];
           const { conversions, conversionValue } = metaConversions(row.actions as ActionStat[], row.action_values as ActionStat[]);
-          return {
+          const record: MetricRecord = {
             external_campaign_id: row.campaign_id as string,
             date: row.date_start as string,
-            impressions: Math.round(toNumber(row.impressions)),
-            reach: Math.round(toNumber(row.reach)),
-            clicks: Math.round(toNumber(row.clicks)),
-            spend: toNumber(row.spend),
+            impressions: Math.round(checkedNumber(row.impressions, "impressions", invalid)),
+            reach: Math.round(checkedNumber(row.reach, "reach", invalid)),
+            clicks: Math.round(checkedNumber(row.clicks, "clicks", invalid)),
+            spend: checkedNumber(row.spend, "spend", invalid),
             conversions,
             conversion_value: conversionValue,
           };
+          return invalid.length > 0 ? { ...record, invalid_fields: invalid } : record;
         });
+    },
+
+    async fetchDiagnostics(accessToken, account, since, until): Promise<AccountDiagnostics> {
+      const divisor = ZERO_DECIMAL.has(account.currency ?? "") ? 1 : 100;
+      const id = account.external_account_id;
+      const money = (value: unknown) => (value === undefined || value === null || value === "" ? null : toNumber(value) / divisor);
+      const sections: AccountDiagnostics["sections"] = {
+        // learning_stage_info is only returned for active ad sets, not for
+        // Dynamic Creative ad sets, and not for every ad account (Meta docs).
+        ad_sets: await diagnosticSection(async () => {
+          const rows = await paged<Record<string, unknown>>(
+            `/${id}/adsets`,
+            { fields: "id,campaign_id,effective_status,optimization_goal,billing_event,daily_budget,lifetime_budget,learning_stage_info,destination_type,is_dynamic_creative", limit: "200" },
+            accessToken,
+            1000,
+          );
+          return {
+            truncated: rows.length >= 1000,
+            rows: rows.map((row) => {
+              const learning = (row.learning_stage_info ?? null) as Record<string, unknown> | null;
+              return {
+                id: typeof row.id === "string" ? row.id : null,
+                campaign_id: typeof row.campaign_id === "string" ? row.campaign_id : null,
+                effective_status: typeof row.effective_status === "string" ? row.effective_status : null,
+                optimization_goal: typeof row.optimization_goal === "string" ? row.optimization_goal : null,
+                billing_event: typeof row.billing_event === "string" ? row.billing_event : null,
+                daily_budget: money(row.daily_budget),
+                lifetime_budget: money(row.lifetime_budget),
+                destination_type: typeof row.destination_type === "string" ? row.destination_type : null,
+                is_dynamic_creative: typeof row.is_dynamic_creative === "boolean" ? row.is_dynamic_creative : null,
+                learning_status: learning && typeof learning.status === "string" ? learning.status : null,
+                learning_conversions: learning && learning.conversions !== undefined ? toNumber(learning.conversions) : null,
+              };
+            }),
+          };
+        }),
+        ads: await diagnosticSection(async () => {
+          const rows = await paged<Record<string, unknown>>(
+            `/${id}/ads`,
+            { fields: "id,campaign_id,adset_id,effective_status", limit: "200" },
+            accessToken,
+            2000,
+          );
+          return {
+            truncated: rows.length >= 2000,
+            rows: rows.map((row) => ({
+              campaign_id: typeof row.campaign_id === "string" ? row.campaign_id : null,
+              effective_status: typeof row.effective_status === "string" ? row.effective_status : null,
+            })),
+          };
+        }),
+        pixels: await diagnosticSection(async () => {
+          const rows = await paged<Record<string, unknown>>(`/${id}/adspixels`, { fields: "id,name,last_fired_time,is_unavailable", limit: "50" }, accessToken, 50);
+          return {
+            rows: rows.map((row) => ({
+              id: typeof row.id === "string" ? row.id : null,
+              name: typeof row.name === "string" ? row.name : null,
+              last_fired_time: typeof row.last_fired_time === "string" ? row.last_fired_time : null,
+              is_unavailable: typeof row.is_unavailable === "boolean" ? row.is_unavailable : null,
+            })),
+          };
+        }),
+      };
+      return { provider: "meta", window: { since, until }, captured_at: new Date().toISOString(), sections };
     },
 
     async revoke(accessToken) {

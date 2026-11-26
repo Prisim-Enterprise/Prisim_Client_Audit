@@ -1,35 +1,51 @@
-// PRISIM advertising audit engine.
+// PRISIM advertising audit engine 2.0.
 //
-// Deterministic, side-effect free: the same input always produces the same
-// findings and scores. Rules work on period totals per campaign and per-day
-// totals per ad account, so they apply equally to Meta and Google data.
-// Money is never summed across different currencies.
+// Deterministic and side-effect free: the same input (including generatedAt)
+// always produces the same findings and scores. Order of work:
+//   1. data quality per account (quality.ts): coverage, consistency, freshness;
+//   2. rules (rules.ts), each declaring whether it had enough evidence;
+//   3. scoring (scoring.ts), only where the evidence is sufficient.
+// Money is never summed across different currencies. Missing data is never
+// treated as zero performance.
 
+import { daysBetweenInclusive, formatMoney, formatMultiple, formatNumber, round } from "../format.ts";
+import { campaignGoal, campaignKind } from "./classify.ts";
+import { assessAccount, type AccountQuality, summarizeQuality, validatePeriod } from "./quality.ts";
+import { type Draft, RULES, type RuleContext, THRESHOLDS, toEvidence } from "./rules.ts";
 import {
-  daysBetweenInclusive,
-  formatMoney,
-  formatMultiple,
-  formatNumber,
-  formatPercent,
-  ratio,
-  round,
-} from "../format.ts";
+  BASIS_FACTOR,
+  CATEGORY_WEIGHTS,
+  combineScores,
+  SCORED_CATEGORIES,
+  SCORING_METHOD,
+  scoreAccount,
+  type ScoredFinding,
+  scoreLabel,
+  SEVERITY_PENALTY,
+} from "./scoring.ts";
 import type {
   AccountKpis,
-  AuditAccount,
+  AccountScoring,
   AuditCampaign,
-  AuditDailyRow,
   AuditFinding,
   AuditInput,
   AuditResult,
+  Benchmark,
+  CampaignKpis,
+  DataIssue,
   DerivedKpis,
+  FindingBasis,
   FindingCategory,
   Provider,
+  ScoredCategory,
   Severity,
   Totals,
 } from "./types.ts";
 
-export const ENGINE_VERSION = "prisim-audit-1.0.0";
+export const ENGINE_VERSION = "prisim-audit-2.0.0";
+
+export { BASIS_FACTOR, CATEGORY_WEIGHTS, SCORING_METHOD, scoreLabel, SEVERITY_PENALTY, THRESHOLDS };
+export { scoreFindings } from "./scoring.ts";
 
 export const SEVERITY_ORDER: Severity[] = ["critical", "high", "medium", "low", "info"];
 export const CATEGORIES: FindingCategory[] = [
@@ -42,47 +58,13 @@ export const CATEGORIES: FindingCategory[] = [
   "data_quality",
 ];
 
-const CATEGORY_WEIGHTS: Record<FindingCategory, number> = {
-  tracking: 0.25,
-  efficiency: 0.25,
-  engagement: 0.15,
-  structure: 0.1,
-  budget: 0.1,
-  trend: 0.1,
-  data_quality: 0.05,
-};
-
-const SEVERITY_PENALTY: Record<Severity, number> = {
-  critical: 35,
-  high: 18,
-  medium: 9,
-  low: 4,
-  info: 0,
-};
-
-/** CTR benchmarks by platform/channel (conservative industry medians). */
-export function ctrBenchmark(provider: Provider, channelType: string | null): number {
-  if (provider === "meta") return 0.009;
-  switch ((channelType ?? "").toUpperCase()) {
-    case "SEARCH":
-      return 0.03;
-    case "SHOPPING":
-      return 0.007;
-    case "DISPLAY":
-    case "DISCOVERY":
-    case "DEMAND_GEN":
-      return 0.004;
-    case "VIDEO":
-      return 0.004;
-    case "PERFORMANCE_MAX":
-      return 0.006;
-    default:
-      return 0.01;
-  }
+/**
+ * CTR benchmark for a campaign kind, only from sourced benchmarks supplied in
+ * the input. The engine ships no built-in industry benchmarks.
+ */
+export function ctrBenchmark(benchmarks: Benchmark[], provider: Provider, kind: string): Benchmark | null {
+  return benchmarks.find((item) => item.metric === "ctr" && item.provider === provider && item.kind === kind) ?? null;
 }
-
-const MANUAL_BIDDING = new Set(["MANUAL_CPC", "MANUAL_CPM", "MANUAL_CPV", "ENHANCED_CPC"]);
-const ACTIVE_STATUSES = new Set(["ACTIVE", "ENABLED"]);
 
 function emptyTotals(): Totals {
   return { impressions: 0, reach: 0, clicks: 0, spend: 0, conversions: 0, conversionValue: 0 };
@@ -98,6 +80,8 @@ function addTotals(target: Totals, row: Totals) {
 }
 
 export function deriveKpis(totals: Totals): DerivedKpis {
+  const ratio = (a: number, b: number) => (Number.isFinite(a) && Number.isFinite(b) && b > 0 ? a / b : null);
+  const cpm = ratio(totals.spend, totals.impressions);
   return {
     ...totals,
     spend: round(totals.spend, 4),
@@ -105,545 +89,137 @@ export function deriveKpis(totals: Totals): DerivedKpis {
     conversionValue: round(totals.conversionValue, 4),
     ctr: ratio(totals.clicks, totals.impressions),
     cpc: ratio(totals.spend, totals.clicks),
-    cpm: (() => {
-      const value = ratio(totals.spend, totals.impressions);
-      return value === null ? null : value * 1000;
-    })(),
+    cpm: cpm === null ? null : cpm * 1000,
     cpa: ratio(totals.spend, totals.conversions),
     conversionRate: ratio(totals.conversions, totals.clicks),
     roas: ratio(totals.conversionValue, totals.spend),
   };
 }
 
-function isActive(campaign: AuditCampaign) {
-  return ACTIVE_STATUSES.has((campaign.status ?? "").toUpperCase());
-}
-
-type Context = {
-  input: AuditInput;
-  periodDays: number;
-  account: AuditAccount;
-  kpis: AccountKpis;
-  campaigns: AuditCampaign[];
-  daily: AuditDailyRow[];
-};
-
-type Draft = Omit<AuditFinding, "platform" | "adAccountId" | "impactCurrency"> & {
-  campaign?: AuditCampaign;
-};
-
-function money(ctx: Context, value: number | null) {
-  return formatMoney(value, ctx.account.currency);
-}
-
-// ---------------------------------------------------------------------------
-// Rules
-// ---------------------------------------------------------------------------
-
-type Rule = (ctx: Context) => Draft[];
-
-const noConversionTracking: Rule = (ctx) => {
-  const { kpis } = ctx;
-  if (kpis.spend <= 0 || kpis.conversions > 0 || kpis.clicks < 100) return [];
-  return [{
-    ruleId: "tracking.no_conversions",
-    category: "tracking",
-    severity: "critical",
-    campaignId: null,
-    title: `No conversions recorded for ${ctx.account.name}`,
-    description:
-      `${money(ctx, kpis.spend)} was spent and ${formatNumber(kpis.clicks)} clicks were received during the period, ` +
-      "but no conversions were reported. Either conversion tracking is missing or broken, or campaigns are " +
-      "optimizing toward actions that never complete.",
-    recommendation:
-      ctx.account.provider === "meta"
-        ? "Verify the Meta Pixel and Conversions API events in Events Manager, confirm the optimization event fires on the thank-you page, and check event deduplication."
-        : "Check Google Ads conversion actions (Tools > Conversions): confirm the tag or GA4 import is active, set the right primary actions, and test with Tag Assistant.",
-    evidence: { spend: round(kpis.spend), clicks: kpis.clicks, conversions: 0 },
-    estimatedImpact: round(kpis.spend),
-  }];
-};
-
-const missingConversionValue: Rule = (ctx) => {
-  const { kpis } = ctx;
-  if (kpis.conversions < 10 || kpis.conversionValue > 0 || kpis.spend <= 0) return [];
-  const salesObjective = ctx.campaigns.some((campaign) =>
-    /SALES|CONVERSION|PURCHASE|SHOPPING|PERFORMANCE_MAX/i.test(`${campaign.objective ?? ""} ${campaign.channelType ?? ""}`)
-  );
-  if (!salesObjective) return [];
-  return [{
-    ruleId: "tracking.no_conversion_value",
-    category: "tracking",
-    severity: "medium",
-    campaignId: null,
-    title: "Conversion value is not being reported",
-    description:
-      `${formatNumber(kpis.conversions, 0)} conversions were recorded with no conversion value, ` +
-      "so return on ad spend cannot be measured or optimized for sales-focused campaigns.",
-    recommendation:
-      "Pass purchase value and currency with every conversion event (or assign values to lead conversions) so value-based bidding and ROAS reporting become possible.",
-    evidence: { conversions: round(kpis.conversions), conversion_value: 0 },
-    estimatedImpact: null,
-  }];
-};
-
-const campaignSpendWithoutConversions: Rule = (ctx) => {
-  const { kpis } = ctx;
-  if (kpis.conversions <= 0 || kpis.spend <= 0) return [];
-  return ctx.campaigns
-    .filter((campaign) => campaign.spend >= kpis.spend * 0.08 && campaign.conversions === 0 && campaign.clicks >= 50)
-    .map((campaign) => ({
-      ruleId: "efficiency.spend_without_conversions",
-      category: "efficiency" as const,
-      severity: "high" as const,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" spent without converting`,
-      description:
-        `${money(ctx, campaign.spend)} (${formatPercent(campaign.spend / kpis.spend, 1)} of account spend) ` +
-        `produced ${formatNumber(campaign.clicks)} clicks and no conversions, while the rest of the account converted.`,
-      recommendation:
-        "Pause or restructure this campaign: review targeting, search terms or audiences, landing page relevance and the optimization goal before reallocating budget to converting campaigns.",
-      evidence: { spend: round(campaign.spend), clicks: campaign.clicks, conversions: 0 },
-      estimatedImpact: round(campaign.spend),
-    }));
-};
-
-const highCpaCampaign: Rule = (ctx) => {
-  const accountCpa = ctx.kpis.cpa;
-  if (accountCpa === null || ctx.kpis.conversions < 5) return [];
-  return ctx.campaigns.flatMap((campaign) => {
-    if (campaign.conversions < 1 || campaign.spend < ctx.kpis.spend * 0.05) return [];
-    const cpa = campaign.spend / campaign.conversions;
-    if (cpa < accountCpa * 2) return [];
-    const excess = campaign.spend - campaign.conversions * accountCpa;
-    return [{
-      ruleId: "efficiency.high_cpa_campaign",
-      category: "efficiency" as const,
-      severity: (cpa >= accountCpa * 3 ? "high" : "medium") as Severity,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" acquires customers at ${formatMultiple(cpa / accountCpa, 1)} the account average`,
-      description:
-        `Cost per acquisition is ${money(ctx, cpa)} against an account average of ${money(ctx, accountCpa)} ` +
-        `across ${formatNumber(campaign.conversions, 0)} conversions.`,
-      recommendation:
-        "Tighten targeting to the best-converting audiences or keywords, test new creative or ad copy, and move budget toward campaigns at or below the account CPA.",
-      evidence: {
-        campaign_cpa: round(cpa),
-        account_cpa: round(accountCpa),
-        spend: round(campaign.spend),
-        conversions: round(campaign.conversions),
-      },
-      estimatedImpact: round(Math.max(excess, 0)),
-    }];
-  });
-};
-
-const lowRoasCampaign: Rule = (ctx) => {
-  if (ctx.kpis.conversionValue <= 0) return [];
-  return ctx.campaigns.flatMap((campaign) => {
-    if (campaign.spend < ctx.kpis.spend * 0.05 || campaign.conversions < 1) return [];
-    const roas = campaign.conversionValue / campaign.spend;
-    if (roas >= 1) return [];
-    return [{
-      ruleId: "efficiency.low_roas_campaign",
-      category: "efficiency" as const,
-      severity: "high" as const,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" returns less than it spends`,
-      description:
-        `Return on ad spend is ${formatMultiple(roas)}: ${money(ctx, campaign.conversionValue)} of conversion value ` +
-        `from ${money(ctx, campaign.spend)} of spend.`,
-      recommendation:
-        "Set a target ROAS, exclude low-value products or audiences, and review whether the reported conversion value reflects actual revenue.",
-      evidence: { roas: round(roas), spend: round(campaign.spend), conversion_value: round(campaign.conversionValue) },
-      estimatedImpact: round(campaign.spend - campaign.conversionValue),
-    }];
-  });
-};
-
-const accountRoas: Rule = (ctx) => {
-  const { roas, conversionValue, spend } = ctx.kpis;
-  if (roas === null || conversionValue <= 0 || roas >= 2) return [];
-  return [{
-    ruleId: "efficiency.account_roas",
-    category: "efficiency",
-    severity: roas < 1 ? "high" : "medium",
-    campaignId: null,
-    title: `Account return on ad spend is ${formatMultiple(roas)}`,
-    description:
-      `${ctx.account.name} generated ${money(ctx, conversionValue)} of conversion value from ${money(ctx, spend)} ` +
-      "of spend. Most businesses need at least 2-3x ROAS to be profitable after margins.",
-    recommendation:
-      "Prioritize budget for the highest-ROAS campaigns, adopt value-based bidding where data volume allows, and confirm margin-based ROAS targets with the business.",
-    evidence: { roas: round(roas), spend: round(spend), conversion_value: round(conversionValue) },
-    estimatedImpact: null,
-  }];
-};
-
-const lowCtr: Rule = (ctx) =>
-  ctx.campaigns.flatMap((campaign) => {
-    if (campaign.impressions < 5000) return [];
-    const ctr = campaign.clicks / campaign.impressions;
-    const benchmark = ctrBenchmark(campaign.provider, campaign.channelType);
-    if (ctr >= benchmark) return [];
-    const severe = ctr < benchmark * 0.5;
-    return [{
-      ruleId: "engagement.low_ctr",
-      category: "engagement" as const,
-      severity: (severe ? "medium" : "low") as Severity,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" has a below-benchmark click-through rate`,
-      description:
-        `CTR is ${formatPercent(ctr)} on ${formatNumber(campaign.impressions)} impressions, against a benchmark of ` +
-        `${formatPercent(benchmark, 1)} for ${campaign.provider === "meta" ? "Meta campaigns" : `${(campaign.channelType ?? "Google").toLowerCase()} campaigns`}.`,
-      recommendation:
-        campaign.provider === "meta"
-          ? "Refresh creative (new hooks, formats and offers), check audience relevance and test placements; low CTR raises CPM and CPC."
-          : "Improve ad relevance: tighten keyword-to-ad grouping, add responsive search ad variations and sitelinks, and add negative keywords.",
-      evidence: { ctr: round(ctr * 100, 3), benchmark_ctr: round(benchmark * 100, 2), impressions: campaign.impressions },
-      estimatedImpact: null,
-    }];
-  });
-
-const highFrequency: Rule = (ctx) => {
-  if (ctx.account.provider !== "meta") return [];
-  return ctx.campaigns.flatMap((campaign) => {
-    if (campaign.impressions < 10000 || campaign.reach <= 0) return [];
-    const frequency = campaign.impressions / campaign.reach;
-    if (frequency < 2.5) return [];
-    return [{
-      ruleId: "engagement.high_frequency",
-      category: "engagement" as const,
-      severity: (frequency >= 4 ? "high" : "medium") as Severity,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" shows signs of ad fatigue`,
-      description:
-        `Average daily frequency is ${formatNumber(frequency, 1)} impressions per person. Repeated exposure ` +
-        "usually lowers CTR and raises cost per result.",
-      recommendation:
-        "Broaden the audience or add lookalike/interest expansion, rotate in fresh creative, and cap frequency for awareness campaigns.",
-      evidence: { frequency: round(frequency, 2), impressions: campaign.impressions, reach: campaign.reach },
-      estimatedImpact: null,
-    }];
-  });
-};
-
-const lowConversionRate: Rule = (ctx) => {
-  const { clicks, conversions, conversionRate } = ctx.kpis;
-  if (clicks < 500 || conversions <= 0 || conversionRate === null || conversionRate >= 0.01) return [];
-  return [{
-    ruleId: "engagement.low_conversion_rate",
-    category: "engagement",
-    severity: "medium",
-    campaignId: null,
-    title: `Only ${formatPercent(conversionRate)} of clicks convert`,
-    description:
-      `${formatNumber(clicks)} clicks produced ${formatNumber(conversions, 0)} conversions. A conversion rate under 1% ` +
-      "usually points to landing-page, offer or audience-intent problems rather than media buying.",
-    recommendation:
-      "Audit landing page speed and mobile experience, align page messaging with ad promises, simplify forms or checkout, and test stronger offers.",
-    evidence: { conversion_rate: round(conversionRate * 100, 2), clicks, conversions: round(conversions) },
-    estimatedImpact: null,
-  }];
-};
-
-const spendConcentration: Rule = (ctx) => {
-  const spending = ctx.campaigns.filter((campaign) => campaign.spend > 0);
-  if (spending.length < 3 || ctx.kpis.spend <= 0) return [];
-  const top = spending.reduce((best, campaign) => (campaign.spend > best.spend ? campaign : best));
-  const share = top.spend / ctx.kpis.spend;
-  if (share < 0.7) return [];
-  return [{
-    ruleId: "budget.spend_concentration",
-    category: "budget",
-    severity: "low",
-    campaignId: top.id,
-    campaign: top,
-    title: `${formatPercent(share, 0)} of spend runs through one campaign`,
-    description:
-      `"${top.name}" accounts for ${money(ctx, top.spend)} of ${money(ctx, ctx.kpis.spend)}. Heavy concentration ` +
-      "makes results fragile if that campaign's performance changes.",
-    recommendation:
-      "Keep a structured testing budget (10-20%) in other campaigns or audiences so new winners can be found before the main campaign saturates.",
-    evidence: { top_campaign_share: round(share * 100, 1), campaigns_with_spend: spending.length },
-    estimatedImpact: null,
-  }];
-};
-
-const underspendingBudgets: Rule = (ctx) =>
-  ctx.campaigns.flatMap((campaign) => {
-    if (!isActive(campaign) || !campaign.dailyBudget || campaign.dailyBudget <= 0) return [];
-    const averageDaily = campaign.spend / Math.max(ctx.periodDays, 1);
-    if (averageDaily >= campaign.dailyBudget * 0.5) return [];
-    return [{
-      ruleId: "budget.underspend",
-      category: "budget" as const,
-      severity: "low" as const,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" spends well below its daily budget`,
-      description:
-        `Average daily spend is ${money(ctx, averageDaily)} against a daily budget of ${money(ctx, campaign.dailyBudget)}. ` +
-        "Delivery is limited by bids, audience size, ad approval or quality.",
-      recommendation:
-        "Check delivery diagnostics: widen targeting, raise bid caps or targets, resolve disapproved ads, or reallocate the unused budget.",
-      evidence: { average_daily_spend: round(averageDaily), daily_budget: round(campaign.dailyBudget) },
-      estimatedImpact: null,
-    }];
-  });
-
-const fragmentation: Rule = (ctx) => {
-  const spending = ctx.campaigns.filter((campaign) => campaign.spend > 0);
-  if (spending.length < 8 || ctx.kpis.spend <= 0) return [];
-  const tiny = spending.filter((campaign) => campaign.spend / ctx.kpis.spend < 0.03);
-  if (tiny.length < spending.length / 2) return [];
-  return [{
-    ruleId: "structure.fragmentation",
-    category: "structure",
-    severity: "medium",
-    campaignId: null,
-    title: "Budget is fragmented across many small campaigns",
-    description:
-      `${tiny.length} of ${spending.length} spending campaigns each receive less than 3% of spend. Thin budgets ` +
-      "slow down automated bidding and keep campaigns in the learning phase.",
-    recommendation:
-      "Consolidate campaigns with the same goal and audience, use fewer, larger ad sets or ad groups, and let automated bidding work with more data per campaign.",
-    evidence: { small_campaigns: tiny.length, campaigns_with_spend: spending.length },
-    estimatedImpact: null,
-  }];
-};
-
-const limitedLearning: Rule = (ctx) => {
-  if (ctx.account.provider !== "meta" || ctx.periodDays < 7) return [];
-  const weeks = ctx.periodDays / 7;
-  return ctx.campaigns.flatMap((campaign) => {
-    if (campaign.spend < ctx.kpis.spend * 0.1 || campaign.conversions <= 0) return [];
-    if (!/SALES|LEADS|CONVERSION|APP_PROMOTION/i.test(campaign.objective ?? "")) return [];
-    const weekly = campaign.conversions / weeks;
-    if (weekly >= 50) return [];
-    return [{
-      ruleId: "structure.limited_learning",
-      category: "structure" as const,
-      severity: (weekly < 10 ? "medium" : "low") as Severity,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" may not exit the learning phase`,
-      description:
-        `The campaign averages ${formatNumber(weekly, 1)} conversions per week; Meta needs about 50 optimization ` +
-        "events per ad set per week to stabilize delivery.",
-      recommendation:
-        "Consolidate ad sets, broaden audiences, or optimize for a higher-volume event earlier in the funnel until volume supports the final event.",
-      evidence: { weekly_conversions: round(weekly, 1), conversions: round(campaign.conversions) },
-      estimatedImpact: null,
-    }];
-  });
-};
-
-const manualBidding: Rule = (ctx) => {
-  if (ctx.account.provider !== "google") return [];
-  return ctx.campaigns.flatMap((campaign) => {
-    const strategy = (campaign.bidStrategy ?? "").toUpperCase();
-    if (!MANUAL_BIDDING.has(strategy) || campaign.conversions < 30) return [];
-    return [{
-      ruleId: "structure.manual_bidding",
-      category: "structure" as const,
-      severity: "medium" as const,
-      campaignId: campaign.id,
-      campaign,
-      title: `"${campaign.name}" uses manual bidding despite strong conversion data`,
-      description:
-        `The campaign uses ${strategy.replace(/_/g, " ").toLowerCase()} and recorded ${formatNumber(campaign.conversions, 0)} ` +
-        "conversions in the period, enough for Smart Bidding to learn from.",
-      recommendation:
-        "Test Maximize Conversions with a target CPA (or Maximize Conversion Value with a target ROAS) using a campaign experiment against the current setup.",
-      evidence: { bid_strategy: strategy, conversions: round(campaign.conversions) },
-      estimatedImpact: null,
-    }];
-  });
-};
-
-const inactiveCampaigns: Rule = (ctx) => {
-  const idle = ctx.campaigns.filter((campaign) => isActive(campaign) && campaign.impressions === 0);
-  if (idle.length === 0) return [];
-  return [{
-    ruleId: "structure.idle_campaigns",
-    category: "structure",
-    severity: "low",
-    campaignId: null,
-    title: `${idle.length} active campaign${idle.length === 1 ? "" : "s"} delivered no impressions`,
-    description:
-      `Campaigns marked active but not delivering: ${idle.slice(0, 5).map((campaign) => `"${campaign.name}"`).join(", ")}` +
-      `${idle.length > 5 ? ` and ${idle.length - 5} more` : ""}.`,
-    recommendation:
-      "Check for disapproved ads, exhausted lifetime budgets, empty ad sets or ad groups, or end dates; pause campaigns that are no longer needed.",
-    evidence: { idle_campaigns: idle.length },
-    estimatedImpact: null,
-  }];
-};
-
-function splitHalves(rows: AuditDailyRow[]) {
-  const sorted = [...rows].sort((a, b) => a.date.localeCompare(b.date));
-  const middle = Math.floor(sorted.length / 2);
-  const first = emptyTotals();
-  const second = emptyTotals();
-  sorted.slice(0, middle).forEach((row) => addTotals(first, row));
-  sorted.slice(middle).forEach((row) => addTotals(second, row));
-  return { first, second };
-}
-
-const cpaTrend: Rule = (ctx) => {
-  if (ctx.daily.length < 14) return [];
-  const { first, second } = splitHalves(ctx.daily);
-  if (first.conversions < 5 || second.conversions < 5) return [];
-  const before = first.spend / first.conversions;
-  const after = second.spend / second.conversions;
-  if (after < before * 1.3) return [];
-  return [{
-    ruleId: "trend.cpa_rising",
-    category: "trend",
-    severity: after >= before * 1.6 ? "high" : "medium",
-    campaignId: null,
-    title: `Cost per acquisition rose ${formatPercent(after / before - 1, 0)} during the period`,
-    description:
-      `CPA moved from ${money(ctx, before)} in the first half of the period to ${money(ctx, after)} in the second half.`,
-    recommendation:
-      "Look for creative fatigue, rising competition (auction insights), tracking changes or budget increases that pushed delivery into less efficient inventory.",
-    evidence: { cpa_first_half: round(before), cpa_second_half: round(after) },
-    estimatedImpact: round(Math.max(second.spend - second.conversions * before, 0)),
-  }];
-};
-
-const spendVolatility: Rule = (ctx) => {
-  const days = ctx.daily.filter((row) => row.spend > 0);
-  if (days.length < 14) return [];
-  const mean = days.reduce((sum, row) => sum + row.spend, 0) / days.length;
-  const variance = days.reduce((sum, row) => sum + (row.spend - mean) ** 2, 0) / days.length;
-  const cv = Math.sqrt(variance) / mean;
-  if (cv < 0.6) return [];
-  return [{
-    ruleId: "trend.spend_volatility",
-    category: "trend",
-    severity: "low",
-    campaignId: null,
-    title: "Daily spend is highly irregular",
-    description:
-      `Daily spend varies by ${formatPercent(cv, 0)} around an average of ${money(ctx, mean)}. Large swings disrupt ` +
-      "algorithmic learning and make performance hard to read.",
-    recommendation:
-      "Avoid frequent large budget edits (keep changes under ~20% at a time), use campaign budget optimization or shared budgets, and schedule planned bursts.",
-    evidence: { coefficient_of_variation: round(cv, 2), average_daily_spend: round(mean) },
-    estimatedImpact: null,
-  }];
-};
-
-const dataCoverage: Rule = (ctx) => {
-  const dates = new Set(ctx.daily.map((row) => row.date));
-  if (dates.size === 0) {
-    return [{
-      ruleId: "data_quality.no_data",
-      category: "data_quality",
-      severity: "info",
-      campaignId: null,
-      title: `No performance data for ${ctx.account.name}`,
-      description: "No synced metrics exist for this ad account in the audit period.",
-      recommendation:
-        "Confirm the account is selected for sync and has delivered ads in the period, then run a sync before re-running the audit.",
-      evidence: { days_with_data: 0, period_days: ctx.periodDays },
-      estimatedImpact: null,
-    }];
-  }
-  if (dates.size >= ctx.periodDays * 0.8) return [];
-  return [{
-    ruleId: "data_quality.missing_days",
-    category: "data_quality",
-    severity: "info",
-    campaignId: null,
-    title: `Data covers ${dates.size} of ${ctx.periodDays} days`,
-    description:
-      `${ctx.account.name} has no delivery or no synced data on ${ctx.periodDays - dates.size} days of the audit period. ` +
-      "Results reflect only the days with data.",
-    recommendation: "Check whether ads paused intentionally on those days; if not, re-run a backfill sync before publishing.",
-    evidence: { days_with_data: dates.size, period_days: ctx.periodDays },
-    estimatedImpact: null,
-  }];
-};
-
-export const RULES: Rule[] = [
-  noConversionTracking,
-  missingConversionValue,
-  campaignSpendWithoutConversions,
-  highCpaCampaign,
-  lowRoasCampaign,
-  accountRoas,
-  lowCtr,
-  highFrequency,
-  lowConversionRate,
-  spendConcentration,
-  underspendingBudgets,
-  fragmentation,
-  limitedLearning,
-  manualBidding,
-  inactiveCampaigns,
-  cpaTrend,
-  spendVolatility,
-  dataCoverage,
-];
-
-// ---------------------------------------------------------------------------
-// Scoring
-// ---------------------------------------------------------------------------
-
-function penalty(finding: AuditFinding, spendShare: number | null) {
-  const base = SEVERITY_PENALTY[finding.severity];
-  if (spendShare === null) return base;
-  // Campaign-level findings weigh by how much of the account they affect.
-  return base * Math.min(Math.max(0.35 + spendShare, 0.35), 1);
-}
-
-export function scoreFindings(
-  findings: Array<{ finding: AuditFinding; spendShare: number | null }>,
-): { overall: number; categories: Record<FindingCategory, number> } {
-  const categories = Object.fromEntries(CATEGORIES.map((category) => [category, 100])) as Record<FindingCategory, number>;
-  for (const { finding, spendShare } of findings) {
-    categories[finding.category] = Math.max(0, categories[finding.category] - penalty(finding, spendShare));
-  }
-  const overall = CATEGORIES.reduce((sum, category) => sum + categories[category] * CATEGORY_WEIGHTS[category], 0);
-  for (const category of CATEGORIES) categories[category] = round(categories[category], 1);
-  return { overall: round(overall, 1), categories };
-}
-
 function severityRank(severity: Severity) {
   return SEVERITY_ORDER.indexOf(severity);
 }
 
-export function sortFindings<T extends Pick<AuditFinding, "severity" | "estimatedImpact" | "title">>(findings: T[]): T[] {
+const BASIS_RANK: Record<FindingBasis, number> = { verified: 0, target: 1, benchmark: 2, indicative: 3, unavailable: 4 };
+
+export function sortFindings<T extends Pick<AuditFinding, "severity" | "estimatedImpact" | "title"> & { basis?: FindingBasis }>(findings: T[]): T[] {
   return [...findings].sort((a, b) =>
     severityRank(a.severity) - severityRank(b.severity)
+    || BASIS_RANK[a.basis ?? "verified"] - BASIS_RANK[b.basis ?? "verified"]
     || (b.estimatedImpact ?? 0) - (a.estimatedImpact ?? 0)
     || a.title.localeCompare(b.title)
   );
 }
 
 // ---------------------------------------------------------------------------
+// Data-quality findings
+// ---------------------------------------------------------------------------
+
+const ISSUE_SEVERITY: Record<DataIssue["level"], Severity> = { blocking: "high", major: "medium", minor: "low", info: "info" };
+const UNAVAILABLE_CODES = new Set(["missing_days", "sync_never_succeeded", "no_sync_record", "fields_unavailable", "stale_sync", "legacy_sync_record"]);
+
+const ISSUE_TITLES: Record<string, string> = {
+  missing_days: "Part of the audit period has no retrieved data",
+  sync_never_succeeded: "No successful data sync for this account",
+  no_sync_record: "Data completeness cannot be confirmed",
+  sync_failed: "The latest sync for this account failed",
+  stale_sync: "Synced data is out of date",
+  totals_mismatch: "Campaign and daily totals do not agree",
+  duplicate_metric_rows: "Duplicate metric rows were found",
+  duplicate_campaign: "A campaign appears more than once",
+  inconsistent_campaign_id: "Inconsistent campaign identifiers",
+  currency_mismatch: "Rows in different currencies",
+  currency_unknown: "Account currency unknown",
+  invalid_numeric_value: "Invalid numeric values in the data",
+  invalid_platform_values: "Invalid values returned by the platform",
+  fields_unavailable: "Some metrics were not returned by the platform",
+  legacy_sync_record: "Coverage inferred from older sync records",
+  recent_days_may_change: "Recent days may still change",
+  period_includes_today: "The period includes incomplete days",
+  sync_disabled: "Account is not selected for scheduled sync",
+  account_status: "Ad account status",
+  provider_mismatch: "Campaign platform does not match the account",
+  clicks_exceed_impressions: "Clicks exceed impressions on some days",
+  short_period: "Short audit period",
+};
+
+const ISSUE_ACTIONS: Record<string, string> = {
+  missing_days: "Run a backfill sync for this account and re-run the audit before publishing.",
+  sync_never_succeeded: "Check the connection and account selection, run a sync, and re-run the audit.",
+  no_sync_record: "Run a sync so each day's completeness is recorded, then re-run the audit.",
+  sync_failed: "Review the sync error, fix the connection or permission, and re-run the sync.",
+  stale_sync: "Run a sync before publishing this audit.",
+  totals_mismatch: "Re-sync the period; if the difference remains, report it to PRISIM engineering before publishing.",
+  duplicate_metric_rows: "Report this to PRISIM engineering; do not publish until the source data is corrected.",
+  currency_mismatch: "Audit accounts in different currencies separately; amounts were not added together.",
+  legacy_sync_record: "Run a new sync so per-account results are recorded.",
+  recent_days_may_change: "Re-run the audit after a few days if the most recent results matter.",
+  period_includes_today: "Choose a period that ends yesterday or earlier.",
+};
+
+function issueFinding(item: DataIssue, accountProvider: Provider | null, period: { start: string; end: string; days: number }, accountName?: string): AuditFinding {
+  return {
+    ruleId: `data_quality.${item.code}`.slice(0, 80),
+    category: "data_quality",
+    severity: ISSUE_SEVERITY[item.level],
+    basis: UNAVAILABLE_CODES.has(item.code) ? "unavailable" : "verified",
+    platform: accountProvider,
+    adAccountId: item.adAccountId,
+    campaignId: item.campaignId,
+    title: `${ISSUE_TITLES[item.code] ?? item.code.replace(/_/g, " ")}${accountName ? ` (${accountName})` : ""}`,
+    description: item.message,
+    recommendation: ISSUE_ACTIONS[item.code] ?? "Review the data before publishing.",
+    evidence: {
+      observed: item.details,
+      thresholds: {},
+      period,
+      source: "sync records and stored metrics",
+      unavailable: [],
+      account: accountName,
+    },
+    estimatedImpact: null,
+    estimateLabel: null,
+    impactCurrency: null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
+function campaignKpis(campaign: AuditCampaign, goal: CampaignKpis["goal"]): CampaignKpis {
+  return {
+    ...deriveKpis(campaign),
+    campaignId: campaign.id,
+    adAccountId: campaign.adAccountId,
+    provider: campaign.provider,
+    name: campaign.name,
+    currency: campaign.currency ?? null,
+    status: campaign.status,
+    kind: campaignKind(campaign),
+    goal,
+    dailyBudget: campaign.dailyBudget,
+  };
+}
+
 export function runAudit(input: AuditInput): AuditResult {
-  const periodDays = daysBetweenInclusive(input.periodStart, input.periodEnd);
-  if (periodDays <= 0) throw new Error("The audit period is invalid.");
   if (input.accounts.length === 0) throw new Error("Select at least one ad account to audit.");
+  const globalIssues = validatePeriod(input);
+  const periodDays = daysBetweenInclusive(input.periodStart, input.periodEnd);
+  const period = { start: input.periodStart, end: input.periodEnd, days: periodDays };
+  const generatedAt = input.generatedAt ?? null;
 
   const accountKpis: AccountKpis[] = [];
-  const scored: Array<{ finding: AuditFinding; spendShare: number | null }> = [];
+  const qualities: AccountQuality[] = [];
+  const scored: ScoredFinding[] = [];
+  const accountScores: AccountScoring[] = [];
+  const allCampaigns: CampaignKpis[] = [];
 
   for (const account of input.accounts) {
-    const campaigns = input.campaigns.filter((campaign) => campaign.adAccountId === account.id);
-    const daily = input.daily.filter((row) => row.adAccountId === account.id && row.date >= input.periodStart && row.date <= input.periodEnd);
+    // Freshness checks need a clock; without generatedAt they are skipped (deterministic tests).
+    const quality = assessAccount(input, account, generatedAt ?? "");
+    qualities.push(quality);
+    const campaigns = quality.campaigns;
     const totals = emptyTotals();
     campaigns.forEach((campaign) => addTotals(totals, campaign));
     const kpis: AccountKpis = {
@@ -654,103 +230,246 @@ export function runAudit(input: AuditInput): AuditResult {
       currency: account.currency,
       campaignCount: campaigns.length,
       activeCampaignCount: campaigns.filter((campaign) => campaign.spend > 0 || campaign.impressions > 0).length,
+      coverage: quality.coverage,
+      dataConfidence: quality.confidence,
+      confidenceLevel: quality.level,
     };
-    accountKpis.push(kpis);
 
-    const ctx: Context = { input, periodDays, account, kpis, campaigns, daily };
+    const target = input.targets?.find((item) => item.adAccountId === account.id) ?? null;
+    const ctx: RuleContext = {
+      input,
+      period,
+      account,
+      kpis,
+      campaigns,
+      quality,
+      diagnostics: input.diagnostics?.find((item) => item.adAccountId === account.id) ?? null,
+      target,
+      benchmarks: input.benchmarks ?? [],
+    };
+    for (const campaign of campaigns) allCampaigns.push(campaignKpis(campaign, campaignGoal(campaign, target ?? undefined)));
+
+    const checks = Object.fromEntries(CATEGORIES.map((category) => [category, { applicable: [] as string[], skipped: [] as Array<{ ruleId: string; reason: string }> }])) as Record<
+      FindingCategory,
+      { applicable: string[]; skipped: Array<{ ruleId: string; reason: string }> }
+    >;
+    const accountFindings: ScoredFinding[] = [];
+    const push = (draft: Draft) => {
+      const finding: AuditFinding = {
+        ruleId: draft.ruleId,
+        category: draft.category,
+        severity: draft.severity,
+        basis: draft.basis,
+        platform: account.provider,
+        adAccountId: account.id,
+        campaignId: draft.campaign?.id ?? null,
+        title: draft.title,
+        description: draft.description,
+        recommendation: draft.recommendation,
+        evidence: toEvidence(ctx, draft),
+        estimatedImpact: draft.estimatedImpact ?? null,
+        estimateLabel: draft.estimatedImpact ? draft.estimateLabel ?? "Estimate" : null,
+        impactCurrency: draft.estimatedImpact ? account.currency : null,
+      };
+      const spendShare = draft.campaign && kpis.spend > 0 ? draft.campaign.spend / kpis.spend : draft.campaign ? 0 : null;
+      accountFindings.push({ finding, spendShare, scoringGroup: draft.scoringGroup ?? draft.ruleId });
+    };
+
     for (const rule of RULES) {
-      for (const draft of rule(ctx)) {
-        const { campaign, ...rest } = draft;
-        const finding: AuditFinding = {
-          ...rest,
-          platform: account.provider,
-          adAccountId: account.id,
-          impactCurrency: draft.estimatedImpact !== null ? account.currency : null,
-        };
-        const spendShare = campaign && kpis.spend > 0 ? campaign.spend / kpis.spend : null;
-        scored.push({ finding, spendShare });
+      const skip = rule.applies(ctx);
+      if (skip !== null) {
+        checks[rule.category].skipped.push({ ruleId: rule.id, reason: skip });
+        continue;
       }
+      checks[rule.category].applicable.push(rule.id);
+      rule.run(ctx).forEach(push);
     }
+
+    // Confirmed absence of delivery is a finding of its own (not a data gap).
+    const delivered = totals.impressions > 0 || totals.spend > 0;
+    const retrieved = quality.coverage.retrievedDays;
+    if (!delivered && (retrieved >= THRESHOLDS.minEligibleDays || (quality.coverage.basis === "rows_only" && quality.coverage.daysWithRows > 0))) {
+      push({
+        ruleId: "structure.no_account_delivery",
+        category: "structure",
+        severity: "medium",
+        basis: quality.coverage.basis === "rows_only" ? "indicative" : "verified",
+        title: `No advertising delivery recorded for ${account.name}`,
+        description:
+          `The platform reported no impressions and no spend for any of the account's ${campaigns.length} campaign(s) on ${retrieved} retrieved day(s) ` +
+          `of the ${periodDays}-day period` +
+          (quality.coverage.missingDays > 0 ? `; ${quality.coverage.missingDays} day(s) were not retrieved and are unknown.` : ".") +
+          " This confirms no activity, not poor performance, so the account is not scored.",
+        recommendation: "Confirm with the client whether the account was meant to run in this period; if so, check campaign status, billing and policy details in the platform.",
+        observed: { impressions: 0, spend: 0, campaigns: campaigns.length, enabled_campaigns: campaigns.filter((campaign) => ["ACTIVE", "ENABLED"].includes((campaign.status ?? "").toUpperCase())).length, retrieved_days: retrieved, missing_days: quality.coverage.missingDays },
+        thresholds: { min_retrieved_days: THRESHOLDS.minEligibleDays },
+        source: quality.coverage.basis === "rows_only" ? "stored metrics" : "sync records and stored metrics",
+        unavailable: ["campaign status history during the period"],
+        scoringGroup: "structure.delivery_account",
+      });
+    }
+
+    for (const item of quality.issues) accountFindings.push({ finding: issueFinding(item, account.provider, period, account.name), spendShare: null, scoringGroup: item.code });
+
+    const scoring = scoreAccount(quality, accountFindings, checks, delivered);
+    accountScores.push(scoring);
+    kpis.score = scoring.score;
+    kpis.scoreStatus = scoring.status;
+    kpis.scoreReason = scoring.reason;
+    accountKpis.push(kpis);
+    scored.push(...accountFindings);
   }
 
+  for (const item of globalIssues) scored.push({ finding: issueFinding(item, null, period), spendShare: null, scoringGroup: item.code });
+
   const findings = sortFindings(scored.map((item) => item.finding));
-  const { overall, categories } = scoreFindings(scored);
+  const combined = combineScores(accountScores);
 
   const platformScores: Partial<Record<Provider, number>> = {};
   for (const provider of ["meta", "google"] as const) {
-    if (!input.accounts.some((account) => account.provider === provider)) continue;
-    platformScores[provider] = scoreFindings(scored.filter((item) => item.finding.platform === provider)).overall;
+    const items = accountScores.filter((item) => input.accounts.find((account) => account.id === item.adAccountId)?.provider === provider);
+    if (items.length === 0) continue;
+    const result = combineScores(items);
+    if (result.overall !== null) platformScores[provider] = result.overall;
+  }
+
+  const categoryScores: Partial<Record<ScoredCategory, number>> = {};
+  for (const category of SCORED_CATEGORIES) {
+    const values = accountScores
+      .filter((item) => item.status !== "unscored" && item.categories[category].status === "assessed")
+      .map((item) => item.categories[category].score as number);
+    if (values.length > 0) categoryScores[category] = round(values.reduce((sum, value) => sum + value, 0) / values.length, 1);
   }
 
   const currencies = new Set(input.accounts.map((account) => account.currency ?? ""));
   const singleCurrency = currencies.size === 1 ? (input.accounts[0].currency ?? null) : null;
-  let combined: DerivedKpis | null = null;
+  let totals: DerivedKpis | null = null;
   if (currencies.size === 1) {
-    const totals = emptyTotals();
-    accountKpis.forEach((kpis) => addTotals(totals, kpis));
-    combined = deriveKpis(totals);
+    const sum = emptyTotals();
+    accountKpis.forEach((kpis) => addTotals(sum, kpis));
+    totals = deriveKpis(sum);
   }
-  const dataDays = new Set(
-    input.daily.filter((row) => row.date >= input.periodStart && row.date <= input.periodEnd).map((row) => row.date),
-  ).size;
+  const dataDays = new Set(qualities.flatMap((item) => item.daily.map((row) => row.date))).size;
+  const dataQuality = summarizeQuality(input, qualities, globalIssues);
+  const syncs = qualities.map((item) => item.coverage.lastSuccessfulSync).filter((value): value is string => Boolean(value)).sort();
+  // The oldest of the accounts' latest successful syncs: the whole audit is at least this fresh.
+  const lastSuccessfulSync = syncs[0] ?? null;
 
-  return {
+  const limitations = buildLimitations(input, qualities);
+  const result: AuditResult = {
     engineVersion: ENGINE_VERSION,
-    overallScore: overall,
+    overallScore: combined.overall,
+    scoreStatus: combined.status,
     platformScores,
-    categoryScores: categories,
-    kpis: { currency: singleCurrency, totals: combined, accounts: accountKpis, periodDays, dataDays },
+    categoryScores,
+    kpis: {
+      currency: singleCurrency,
+      totals,
+      accounts: accountKpis,
+      periodDays,
+      dataDays,
+      campaigns: [...allCampaigns].sort((a, b) => b.spend - a.spend || b.impressions - a.impressions || a.name.localeCompare(b.name)).slice(0, 50),
+      dataQuality,
+      scoring: {
+        status: combined.status,
+        overall: combined.overall,
+        reason: combined.reason,
+        method: SCORING_METHOD,
+        weights: CATEGORY_WEIGHTS,
+        severityPenalties: SEVERITY_PENALTY,
+        accounts: accountScores,
+      },
+      lastSuccessfulSync,
+      limitations,
+      metricNotes: [
+        "Reach is summed from daily values and is not unique reach for the period.",
+        "Conversions and conversion value are as attributed by each platform and are not de-duplicated across platforms.",
+        "Meta conversions include purchases, leads and registrations only; app installs and other results are not imported.",
+      ],
+      ...(generatedAt ? { generatedAt } : {}),
+    },
     findings,
-    summary: buildSummary(input, findings, overall, accountKpis, combined, singleCurrency),
+    summary: "",
   };
+  result.summary = buildSummary(input, result, findings, accountKpis, totals, singleCurrency);
+  return result;
 }
 
-export function scoreLabel(score: number): string {
-  if (score >= 85) return "Strong";
-  if (score >= 70) return "Healthy with gaps";
-  if (score >= 50) return "Needs attention";
-  return "At risk";
+function buildLimitations(input: AuditInput, qualities: AccountQuality[]): string[] {
+  const items = [
+    "Campaign status and budgets are the values at the last sync; their history during the period is not stored.",
+    "No external industry benchmarks are applied unless a sourced benchmark is listed in a finding.",
+  ];
+  if (!input.targets || input.targets.length === 0) items.push("No business targets (CPA, ROAS) were supplied; efficiency checks compare campaigns with the account's own averages.");
+  const withoutDiagnostics = qualities.filter((item) => !input.diagnostics?.some((d) => d.adAccountId === item.account.id));
+  if (withoutDiagnostics.length > 0) {
+    items.push(`No diagnostics snapshot (conversion setup, ad review, Quality Score, search terms, learning status) for: ${withoutDiagnostics.map((item) => item.account.name).join(", ")}.`);
+  }
+  for (const diag of input.diagnostics ?? []) {
+    const unavailable = Object.entries(diag.sections).filter(([, section]) => section.status === "unavailable").map(([name]) => name.replace(/_/g, " "));
+    const name = qualities.find((item) => item.account.id === diag.adAccountId)?.account.name ?? diag.adAccountId;
+    if (unavailable.length > 0) items.push(`${name}: not available from the platform: ${unavailable.join(", ")}.`);
+    items.push(`${name}: diagnostics cover ${diag.windowStart} to ${diag.windowEnd} (captured ${diag.capturedAt.slice(0, 10)}).`);
+  }
+  if (qualities.some((item) => item.account.provider === "google")) {
+    items.push("Google search terms exclude Performance Max; Quality Score covers Search keywords only.");
+  }
+  return items;
 }
 
 function buildSummary(
   input: AuditInput,
+  result: AuditResult,
   findings: AuditFinding[],
-  overall: number,
   accounts: AccountKpis[],
   totals: DerivedKpis | null,
   currency: string | null,
 ): string {
-  const urgent = findings.filter((finding) => finding.severity === "critical" || finding.severity === "high");
   const parts: string[] = [];
   const accountLabel = `${accounts.length} ad account${accounts.length === 1 ? "" : "s"}`;
+  parts.push(`This audit reviewed ${accountLabel} for ${input.tenantName} from ${input.periodStart} to ${input.periodEnd}.`);
+  const quality = result.kpis.dataQuality!;
   parts.push(
-    `This audit reviewed ${accountLabel} for ${input.tenantName} from ${input.periodStart} to ${input.periodEnd}. ` +
-      `The overall account health score is ${formatNumber(overall, 0)}/100 (${scoreLabel(overall).toLowerCase()}).`,
+    `Data confidence is ${quality.level} (${formatNumber(quality.confidence, 0)}/100): ${formatNumber(quality.coverageRatio * 100, 0)}% of the period's days are known` +
+      (result.kpis.lastSuccessfulSync ? `, last successful sync ${result.kpis.lastSuccessfulSync.slice(0, 16).replace("T", " ")} UTC.` : "; no successful sync is recorded."),
   );
-  if (totals) {
+  if (result.overallScore === null) {
+    parts.push(`No account health score was calculated. ${result.kpis.scoring!.reason}`);
+  } else {
+    const label = scoreLabel(result.overallScore).toLowerCase();
     parts.push(
-      `Total spend was ${formatMoney(totals.spend, currency)} for ${formatNumber(totals.conversions, 0)} conversions` +
-        (totals.cpa !== null ? ` at ${formatMoney(totals.cpa, currency)} per conversion` : "") +
-        (totals.roas !== null && totals.conversionValue > 0 ? ` and ${formatMultiple(totals.roas)} return on ad spend` : "") +
-        ".",
+      result.scoreStatus === "provisional"
+        ? `The provisional account health score is ${formatNumber(result.overallScore, 0)}/100 (${label}). ${result.kpis.scoring!.reason}`
+        : `The account health score is ${formatNumber(result.overallScore, 0)}/100 (${label}).`,
     );
   }
-  if (urgent.length === 0) {
-    parts.push("No critical or high-priority issues were detected.");
-  } else {
+  if (totals && (totals.spend > 0 || totals.impressions > 0)) {
     parts.push(
-      `${urgent.length} high-priority issue${urgent.length === 1 ? " needs" : "s need"} attention, led by: ${urgent[0].title}.`,
+      `Recorded spend was ${formatMoney(totals.spend, currency)} for ${formatNumber(totals.conversions, 0)} conversions` +
+        (totals.cpa !== null ? ` at ${formatMoney(totals.cpa, currency)} per conversion` : "") +
+        (totals.roas !== null && totals.conversionValue > 0 ? ` and ${formatMultiple(totals.roas)} reported return on ad spend` : "") +
+        ".",
     );
-    const impactByCurrency = new Map<string, number>();
-    for (const finding of urgent) {
-      if (finding.estimatedImpact && finding.impactCurrency) {
-        impactByCurrency.set(finding.impactCurrency, (impactByCurrency.get(finding.impactCurrency) ?? 0) + finding.estimatedImpact);
-      }
-    }
-    const impacts = [...impactByCurrency.entries()].map(([code, amount]) => formatMoney(amount, code, 0));
-    if (impacts.length > 0) {
-      parts.push(`An estimated ${impacts.join(" + ")} of spend is at risk across these issues.`);
-    }
+  } else if (totals) {
+    parts.push("No spend or impressions were recorded on the known days.");
+  }
+  const performance = findings.filter((finding) => finding.category !== "data_quality");
+  const urgent = performance.filter((finding) => finding.severity === "critical" || finding.severity === "high");
+  if (urgent.length > 0) {
+    parts.push(`${urgent.length} high-priority finding${urgent.length === 1 ? "" : "s"}, led by: ${urgent[0].title}.`);
+  } else if (performance.length > 0) {
+    parts.push(`No critical or high-priority performance issues were found; ${performance.length} other finding(s) are listed.`);
+  } else if (result.overallScore !== null) {
+    parts.push("No performance issues were found by the checks that had enough data.");
+  }
+  const dataProblems = findings.filter((finding) => finding.category === "data_quality" && finding.severity !== "info" && finding.severity !== "low");
+  if (dataProblems.length > 0) parts.push(`${dataProblems.length} data-quality problem(s) should be resolved before relying on this audit.`);
+  const estimates = new Map<string, number>();
+  for (const finding of urgent) {
+    if (finding.estimatedImpact && finding.impactCurrency) estimates.set(finding.impactCurrency, (estimates.get(finding.impactCurrency) ?? 0) + finding.estimatedImpact);
+  }
+  if (estimates.size > 0) {
+    parts.push(`Estimated spend affected by these findings: ${[...estimates.entries()].map(([code, amount]) => formatMoney(amount, code, 0)).join(" + ")} (an estimate, not a confirmed loss or saving).`);
   }
   return parts.join(" ");
 }

@@ -30,7 +30,42 @@ export type AuditFindingRow = {
   estimated_impact: number | string | null;
   impact_currency: string | null;
   sort_order: number;
+  evidence?: Record<string, unknown> | null;
 };
+
+function scalar(value: unknown) {
+  if (value === null || value === undefined) return "-";
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(2);
+  return String(value);
+}
+
+/** Engine 2.0 evidence -> short lines for the PDF; engine 1.0 evidence -> one line. */
+export function evidenceLines(evidence: Record<string, unknown> | null | undefined): string[] {
+  if (!evidence || typeof evidence !== "object") return [];
+  const observed = evidence.observed as Record<string, unknown> | undefined;
+  if (!observed || typeof observed !== "object") {
+    const flat = Object.entries(evidence).slice(0, 4).map(([key, value]) => `${key.replace(/_/g, " ")}: ${scalar(value)}`);
+    return flat.length > 0 ? [`Evidence: ${flat.join("; ")}`] : [];
+  }
+  const lines: string[] = [];
+  const values = Object.entries(observed).filter(([, value]) => value !== null).slice(0, 8).map(([key, value]) => `${key.replace(/_/g, " ")} ${scalar(value)}`);
+  if (values.length > 0) lines.push(`Observed: ${values.join("; ")}`);
+  const thresholds = Object.entries((evidence.thresholds ?? {}) as Record<string, unknown>).map(([key, value]) => `${key.replace(/_/g, " ")} ${scalar(value)}`);
+  if (thresholds.length > 0) lines.push(`Threshold: ${thresholds.join("; ")}`);
+  const period = evidence.period as { start?: string; end?: string } | undefined;
+  const source = typeof evidence.source === "string" ? evidence.source : null;
+  if (period?.start || source) lines.push(`${period?.start ? `Period ${period.start} to ${period.end}. ` : ""}${source ? `Source: ${source}.` : ""}`);
+  if (typeof evidence.reference === "string") lines.push(`Reference: ${evidence.reference}`);
+  const unavailable = Array.isArray(evidence.unavailable) ? evidence.unavailable.filter((item): item is string => typeof item === "string") : [];
+  if (unavailable.length > 0) lines.push(`Not available: ${unavailable.join("; ")}`);
+  return lines;
+}
+
+function scoreStatus(run: AuditRunRow): "scored" | "provisional" | "unscored" {
+  const status = run.kpis.score_status;
+  if (status === "scored" || status === "provisional" || status === "unscored") return status;
+  return run.overall_score === null ? "unscored" : "scored";
+}
 
 function numberRecord(value: Record<string, number | string> | null | undefined): Record<string, number> {
   return Object.fromEntries(Object.entries(value ?? {}).map(([key, item]) => [key, num(item)]));
@@ -45,6 +80,8 @@ export function toReportData(options: {
   synthetic?: boolean;
 }): ReportData {
   const { run } = options;
+  const quality = (run.kpis.dataQuality ?? null) as Record<string, unknown> | null;
+  const scoring = (run.kpis.scoring ?? null) as Record<string, unknown> | null;
   const accounts = (run.kpis.accounts ?? []).map((account) => ({
     name: String(account.name ?? "Ad account"),
     provider: String(account.provider ?? ""),
@@ -68,6 +105,19 @@ export function toReportData(options: {
     summary: run.summary,
     accounts,
     engineVersion: run.engine_version,
+    scoreStatus: scoreStatus(run),
+    scoreReason: typeof scoring?.reason === "string" ? scoring.reason : null,
+    dataConfidence: quality && typeof quality.confidence === "number"
+      ? {
+        confidence: quality.confidence,
+        level: String(quality.level ?? "none"),
+        coverageRatio: num(quality.coverageRatio as number),
+        explanation: String(quality.explanation ?? ""),
+      }
+      : null,
+    lastSuccessfulSync: typeof run.kpis.lastSuccessfulSync === "string" ? run.kpis.lastSuccessfulSync : null,
+    limitations: Array.isArray(run.kpis.limitations) ? (run.kpis.limitations as unknown[]).filter((item): item is string => typeof item === "string") : [],
+    scoringMethod: typeof scoring?.method === "string" ? scoring.method : null,
     synthetic: options.synthetic,
     findings: [...options.findings]
       .sort((a, b) => a.sort_order - b.sort_order)
@@ -82,6 +132,9 @@ export function toReportData(options: {
         status: finding.status,
         estimatedImpact: finding.estimated_impact === null ? null : num(finding.estimated_impact),
         impactCurrency: finding.impact_currency,
+        basis: typeof finding.evidence?.basis === "string" ? finding.evidence.basis : null,
+        estimateLabel: typeof finding.evidence?.estimate_label === "string" ? finding.evidence.estimate_label : null,
+        evidence: evidenceLines(finding.evidence),
       })),
     campaigns: options.campaigns
       .filter((campaign) => num(campaign.spend) > 0 || num(campaign.impressions) > 0)

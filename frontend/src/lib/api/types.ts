@@ -1,4 +1,4 @@
-import type { AuditResult } from "@functions/_shared/audit/types.ts";
+import type { AuditResult, ScoreStatus } from "@functions/_shared/audit/types.ts";
 import type { TenantRole } from "../auth-context";
 
 export type Provider = "meta" | "google";
@@ -174,7 +174,8 @@ export type AuditRun = {
   overall_score: number | null;
   platform_scores: Partial<Record<Provider, number>>;
   category_scores: Record<string, number>;
-  kpis: Partial<AuditResult["kpis"]>;
+  /** Engine 2.0 runs carry score_status; 1.0 runs do not (see scoreStatusOf). */
+  kpis: Partial<AuditResult["kpis"]> & { score_status?: ScoreStatus };
   summary: string | null;
   ad_account_ids: string[];
   reviewed_at: string | null;
@@ -212,6 +213,8 @@ export type RunAuditInput = {
   periodEnd: string;
   adAccountIds?: string[];
   title?: string;
+  /** Optional business targets per ad account id (engine 2.0). */
+  targets?: Record<string, { targetCpa?: number; targetRoas?: number; goal?: "sales" | "leads" | "app" | "conversions" | "traffic" | "awareness" }>;
 };
 
 export type Report = {

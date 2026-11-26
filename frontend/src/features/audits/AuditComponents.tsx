@@ -18,48 +18,228 @@ import { queryKeys, useApi } from "../../lib/api/ApiProvider";
 import { errorMessage } from "../../lib/api/errors";
 import type { AuditFinding, AuditRun, FindingPatch, FindingStatus, Severity, Tenant } from "../../lib/api/types";
 
+/** Engine 2.0 stores the score status; for 1.0 runs it is derived from the score. */
+export function scoreStatusOf(run: AuditRun): "scored" | "provisional" | "unscored" {
+  return run.kpis?.score_status ?? (run.overall_score === null ? "unscored" : "scored");
+}
+
+const CONFIDENCE_TONE: Record<string, string> = {
+  high: "bg-accent-50 text-accent-800",
+  medium: "bg-amber-50 text-amber-800",
+  low: "bg-rose-50 text-rose-800",
+  none: "bg-slate-100 text-slate-700",
+};
+
 export function AuditOverview({ run }: { run: AuditRun }) {
   const totals = run.kpis.totals ?? null;
   const currency = run.kpis.currency ?? null;
   const categories = Object.entries(run.category_scores ?? {});
+  const status = scoreStatusOf(run);
+  const quality = run.kpis.dataQuality;
+  const scoring = run.kpis.scoring;
+  const notAssessed = scoring
+    ? Object.entries(scoring.accounts[0]?.categories ?? {}).filter(([category]) => !(category in (run.category_scores ?? {}))).map(([category]) => category)
+    : [];
+  const accounts = run.kpis.accounts ?? [];
+  const campaigns = run.kpis.campaigns ?? [];
   return (
-    <div className="grid gap-5 lg:grid-cols-[300px_1fr]">
-      <Card className="flex flex-col items-center p-6">
-        <p className="self-start text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Account health</p>
-        <div className="mt-4"><ScoreRing score={run.overall_score} /></div>
-        <div className="mt-5 grid w-full grid-cols-2 gap-3">
-          {(["meta", "google"] as const).filter((platform) => run.platform_scores?.[platform] !== undefined).map((platform) => (
-            <div key={platform} className="rounded-lg border border-slate-200 p-3 text-center">
-              <ProviderBadge provider={platform} />
-              <p className="mt-1 text-xl font-semibold text-ink-950">{Math.round(run.platform_scores[platform] ?? 0)}</p>
+    <div className="space-y-5">
+      <div className="grid gap-5 lg:grid-cols-[300px_1fr]">
+        <div className="space-y-5">
+          <Card className="flex flex-col items-center p-6">
+            <p className="self-start text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Account health</p>
+            <div className="mt-4"><ScoreRing score={run.overall_score} status={status} /></div>
+            {scoring && status !== "scored" && <p className="mt-3 text-center text-xs leading-5 text-slate-500">{scoring.reason}</p>}
+            <div className="mt-5 grid w-full grid-cols-2 gap-3">
+              {(["meta", "google"] as const).filter((platform) => run.platform_scores?.[platform] !== undefined).map((platform) => (
+                <div key={platform} className="rounded-lg border border-slate-200 p-3 text-center">
+                  <ProviderBadge provider={platform} />
+                  <p className="mt-1 text-xl font-semibold text-ink-950">{Math.round(run.platform_scores[platform] ?? 0)}</p>
+                </div>
+              ))}
             </div>
-          ))}
+          </Card>
+          {quality && (
+            <Card className="p-5">
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Data confidence</p>
+              <div className="mt-2 flex items-baseline gap-2">
+                <span className="text-2xl font-semibold text-ink-950">{Math.round(quality.confidence)}</span>
+                <span className="text-xs text-slate-400">/ 100</span>
+                <span className={`ml-auto rounded-full px-2 py-0.5 text-xs font-medium capitalize ${CONFIDENCE_TONE[quality.level] ?? CONFIDENCE_TONE.none}`}>{quality.level}</span>
+              </div>
+              <dl className="mt-3 space-y-1 text-xs text-slate-600">
+                <div className="flex justify-between"><dt>Days with known data</dt><dd className="font-medium text-ink-950">{formatPercent(quality.coverageRatio, 0)}</dd></div>
+                <div className="flex justify-between"><dt>Reporting period</dt><dd className="font-medium text-ink-950">{formatDate(run.period_start)} – {formatDate(run.period_end)}</dd></div>
+                <div className="flex justify-between gap-2"><dt>Last successful sync</dt><dd className="text-right font-medium text-ink-950">{run.kpis.lastSuccessfulSync ? formatDate(run.kpis.lastSuccessfulSync) : "Not recorded"}</dd></div>
+              </dl>
+              <p className="mt-3 text-xs leading-5 text-slate-500">{quality.explanation}</p>
+            </Card>
+          )}
         </div>
-      </Card>
-      <div className="space-y-5">
-        {run.summary && (
-          <Card className="p-5 sm:p-6">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Executive summary</p>
-            <p className="mt-2 whitespace-pre-line text-sm leading-6 text-slate-700">{run.summary}</p>
-          </Card>
-        )}
-        {totals && (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-            <Kpi label="Spend" value={formatMoney(totals.spend, currency, 0)} />
-            <Kpi label="Conversions" value={formatNumber(totals.conversions, 0)} />
-            <Kpi label="Cost / conversion" value={formatMoney(totals.cpa, currency)} />
-            <Kpi label={totals.conversionValue > 0 ? "ROAS" : "CTR"} value={totals.conversionValue > 0 ? formatMultiple(totals.roas) : formatPercent(totals.ctr)} />
-          </div>
-        )}
-        {categories.length > 0 && (
-          <Card className="grid gap-4 p-5 sm:grid-cols-2 sm:p-6">
-            {categories.map(([category, score]) => (
-              <ScoreBar key={category} label={CATEGORY_LABELS[category] ?? category} score={Number(score)} />
-            ))}
-          </Card>
-        )}
+        <div className="space-y-5">
+          {run.summary && (
+            <Card className="p-5 sm:p-6">
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Executive summary</p>
+              <p className="mt-2 whitespace-pre-line text-sm leading-6 text-slate-700">{run.summary}</p>
+            </Card>
+          )}
+          {totals && (
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              <Kpi label="Spend" value={formatMoney(totals.spend, currency, 0)} />
+              <Kpi label="Impressions" value={formatNumber(totals.impressions)} />
+              <Kpi label="Clicks" value={formatNumber(totals.clicks)} />
+              <Kpi label="CTR" value={formatPercent(totals.ctr)} />
+              <Kpi label="Avg. CPC" value={formatMoney(totals.cpc, currency)} />
+              <Kpi label="Conversions" value={formatNumber(totals.conversions, 0)} />
+              <Kpi label="Cost / conversion" value={formatMoney(totals.cpa, currency)} />
+              <Kpi label="ROAS" value={totals.conversionValue > 0 ? formatMultiple(totals.roas) : "No value reported"} />
+            </div>
+          )}
+          {categories.length > 0 && (
+            <Card className="p-5 sm:p-6">
+              <div className="grid gap-4 sm:grid-cols-2">
+                {categories.map(([category, score]) => (
+                  <ScoreBar key={category} label={CATEGORY_LABELS[category] ?? category} score={Number(score)} />
+                ))}
+              </div>
+              {notAssessed.length > 0 && (
+                <p className="mt-4 text-xs text-slate-500">
+                  Not assessed (not enough data): {notAssessed.map((category) => CATEGORY_LABELS[category] ?? category).join(", ")}.
+                </p>
+              )}
+            </Card>
+          )}
+        </div>
       </div>
+      {accounts.length > 0 && accounts[0].coverage && (
+        <Card className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-left text-sm">
+            <caption className="px-5 pt-4 text-left text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Accounts reviewed</caption>
+            <thead className="text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th scope="col" className="px-5 py-2 font-medium">Account</th>
+                <th scope="col" className="px-3 py-2 font-medium">Known days</th>
+                <th scope="col" className="px-3 py-2 font-medium">Confidence</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Spend</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Conv.</th>
+                <th scope="col" className="px-5 py-2 text-right font-medium">Score</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {accounts.map((account) => (
+                <tr key={account.adAccountId}>
+                  <td className="px-5 py-2"><span className="font-medium text-ink-950">{account.name}</span> <ProviderBadge provider={account.provider} /></td>
+                  <td className="px-3 py-2 text-slate-600">
+                    {account.coverage ? `${account.coverage.periodDays - account.coverage.missingDays}/${account.coverage.periodDays}` : "–"}
+                    {account.coverage && account.coverage.missingDays > 0 && <span className="text-rose-700"> ({account.coverage.missingDays} missing)</span>}
+                  </td>
+                  <td className="px-3 py-2 capitalize text-slate-600">{account.confidenceLevel ?? "–"}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(account.spend, account.currency, 0)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(account.conversions, 0)}</td>
+                  <td className="px-5 py-2 text-right tabular-nums" title={account.scoreReason}>
+                    {account.score === null || account.score === undefined ? "Not scored" : `${Math.round(account.score)}${account.scoreStatus === "provisional" ? " (provisional)" : ""}`}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+      {campaigns.length > 0 && (
+        <Card className="overflow-x-auto">
+          <table className="w-full min-w-[820px] text-left text-sm">
+            <caption className="px-5 pt-4 text-left text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Campaign performance</caption>
+            <thead className="text-xs uppercase tracking-wide text-slate-500">
+              <tr>
+                <th scope="col" className="px-5 py-2 font-medium">Campaign</th>
+                <th scope="col" className="px-3 py-2 font-medium">Status at sync</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Spend</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Impr.</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">CTR</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Conv.</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">CPA</th>
+                <th scope="col" className="px-5 py-2 text-right font-medium">Daily budget</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {campaigns.slice(0, 15).map((campaign) => (
+                <tr key={campaign.campaignId}>
+                  <td className="max-w-[260px] truncate px-5 py-2 font-medium text-ink-950" title={campaign.name}>{campaign.name}</td>
+                  <td className="px-3 py-2 text-slate-600">{campaign.status ?? "–"}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(campaign.spend, campaign.currency, 0)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(campaign.impressions)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatPercent(campaign.ctr)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(campaign.conversions, 0)}</td>
+                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(campaign.cpa, campaign.currency)}</td>
+                  <td className="px-5 py-2 text-right tabular-nums">{formatMoney(campaign.dailyBudget, campaign.currency, 0)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </Card>
+      )}
+      {(run.kpis.limitations?.length ?? 0) > 0 && (
+        <Card className="p-5 sm:p-6">
+          <details>
+            <summary className="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Limitations and unavailable data</summary>
+            <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-600">
+              {[...(run.kpis.limitations ?? []), ...(run.kpis.metricNotes ?? [])].map((item) => <li key={item}>{item}</li>)}
+            </ul>
+            {scoring?.method && <p className="mt-3 text-xs leading-5 text-slate-500"><span className="font-medium">Scoring method:</span> {scoring.method}</p>}
+          </details>
+        </Card>
+      )}
     </div>
+  );
+}
+
+const BASIS_LABEL: Record<string, string> = {
+  verified: "Verified finding",
+  indicative: "Indicative observation",
+  benchmark: "Benchmark comparison",
+  target: "Target comparison",
+  unavailable: "Unavailable data",
+};
+
+function formatEvidenceValue(value: unknown) {
+  if (value === null || value === undefined) return "–";
+  if (typeof value === "number") return Number.isInteger(value) ? formatNumber(value) : formatNumber(value, 2);
+  return String(value);
+}
+
+function EvidenceDetails({ evidence }: { evidence: Record<string, unknown> }) {
+  const observed = evidence.observed as Record<string, unknown> | undefined;
+  if (!observed || typeof observed !== "object") {
+    // Engine 1.0 findings: flat key/value evidence.
+    return (
+      <>
+        {Object.entries(evidence).slice(0, 4).map(([key, value]) => (
+          <span key={key}>{key.replace(/_/g, " ")}: <span className="text-slate-700">{formatEvidenceValue(value)}</span></span>
+        ))}
+      </>
+    );
+  }
+  const thresholds = (evidence.thresholds ?? {}) as Record<string, unknown>;
+  const period = evidence.period as { start?: string; end?: string } | undefined;
+  const unavailable = Array.isArray(evidence.unavailable) ? (evidence.unavailable as string[]) : [];
+  return (
+    <details className="w-full">
+      <summary className="cursor-pointer font-medium text-slate-600">Evidence</summary>
+      <dl className="mt-2 grid gap-x-6 gap-y-1 sm:grid-cols-2">
+        {Object.entries(observed).filter(([, value]) => value !== null).map(([key, value]) => (
+          <div key={`o-${key}`} className="flex justify-between gap-3"><dt>{key.replace(/_/g, " ")}</dt><dd className="text-right text-slate-700">{formatEvidenceValue(value)}</dd></div>
+        ))}
+        {Object.entries(thresholds).map(([key, value]) => (
+          <div key={`t-${key}`} className="flex justify-between gap-3"><dt>threshold: {key.replace(/_/g, " ")}</dt><dd className="text-right text-slate-700">{formatEvidenceValue(value)}</dd></div>
+        ))}
+      </dl>
+      <p className="mt-2">
+        {period?.start && <>Period {period.start} to {period.end}. </>}
+        {typeof evidence.source === "string" && <>Source: {evidence.source}. </>}
+        {typeof evidence.reference === "string" && <>Reference: {evidence.reference}. </>}
+      </p>
+      {unavailable.length > 0 && <p className="mt-1">Not available: {unavailable.join("; ")}.</p>}
+    </details>
   );
 }
 
@@ -102,6 +282,9 @@ export function FindingCard({
       <div className="p-5 sm:p-6">
         <div className="flex flex-wrap items-center gap-2">
           <SeverityBadge severity={finding.severity} />
+          {typeof finding.evidence?.basis === "string" && (
+            <span className="rounded-full border border-slate-200 px-2 py-0.5 text-xs text-slate-600">{BASIS_LABEL[finding.evidence.basis] ?? finding.evidence.basis}</span>
+          )}
           <span className="text-xs text-slate-500">{CATEGORY_LABELS[finding.category] ?? finding.category}</span>
           {finding.platform && <ProviderBadge provider={finding.platform} />}
           {finding.status !== "open" && <StatusBadge status={finding.status} />}
@@ -116,11 +299,12 @@ export function FindingCard({
         </div>
         <div className="mt-3 flex flex-wrap gap-x-5 gap-y-1 text-xs text-slate-500">
           {finding.estimated_impact !== null && finding.impact_currency && (
-            <span className="font-medium text-orange-700">Spend at risk: {formatMoney(finding.estimated_impact, finding.impact_currency, 0)}</span>
+            <span className="font-medium text-orange-700">
+              {typeof finding.evidence?.estimate_label === "string" ? finding.evidence.estimate_label : "Spend at risk (estimate)"}:{" "}
+              {formatMoney(finding.estimated_impact, finding.impact_currency, 0)}
+            </span>
           )}
-          {Object.entries(finding.evidence ?? {}).slice(0, 4).map(([key, value]) => (
-            <span key={key}>{key.replace(/_/g, " ")}: <span className="text-slate-700">{String(value)}</span></span>
-          ))}
+          <EvidenceDetails evidence={(finding.evidence ?? {}) as Record<string, unknown>} />
         </div>
         {!editable && finding.reviewer_note && (
           <p className="mt-3 border-l-2 border-accent-500 pl-3 text-sm text-slate-700">
@@ -237,7 +421,9 @@ export function AuditRunTable({
               </td>
               {tenants && <td className="px-3 py-3 text-slate-600">{names.get(run.tenant_id) ?? "–"}</td>}
               <td className="px-3 py-3 text-slate-600">{formatDate(run.period_start)} – {formatDate(run.period_end)}</td>
-              <td className="px-3 py-3 text-right font-semibold tabular-nums text-ink-950">{run.overall_score === null ? "–" : Math.round(run.overall_score)}</td>
+              <td className="px-3 py-3 text-right font-semibold tabular-nums text-ink-950">
+                {run.overall_score === null ? "Not scored" : `${Math.round(run.overall_score)}${scoreStatusOf(run) === "provisional" ? "*" : ""}`}
+              </td>
               <td className="px-3 py-3"><StatusBadge status={run.status} /></td>
               <td className="px-5 py-3 text-right">
                 <Link to={linkTo(run)} className="inline-flex items-center gap-1 text-sm font-medium text-accent-700 hover:text-accent-800">
@@ -248,6 +434,9 @@ export function AuditRunTable({
           ))}
         </tbody>
       </table>
+      {runs.some((run) => scoreStatusOf(run) === "provisional") && (
+        <p className="px-5 py-2 text-xs text-slate-500">* Provisional score: the data behind it is incomplete or not fully verified.</p>
+      )}
     </div>
   );
 }

@@ -96,7 +96,7 @@ export function ClientDashboard() {
             <EmptyState icon={<ClipboardCheck />} title="No audit published yet" description="Your PRISIM team reviews every audit before it appears here." />
           ) : (
             <div className="grid gap-6 p-5 sm:grid-cols-[auto_1fr] sm:p-6">
-              <ScoreRing score={latest.overall_score} size={120} />
+              <ScoreRing score={latest.overall_score} size={120} status={latest.kpis?.score_status} />
               <div className="min-w-0">
                 <p className="font-semibold text-ink-950">{latest.title}</p>
                 <p className="text-xs text-slate-500">{formatDate(latest.period_start)} – {formatDate(latest.period_end)}</p>

@@ -1,5 +1,5 @@
 // @vitest-environment node
-import { ctrBenchmark, deriveKpis, runAudit, scoreFindings, sortFindings } from "@functions/_shared/audit/engine.ts";
+import { ctrBenchmark, deriveKpis, ENGINE_VERSION, runAudit, scoreFindings, sortFindings } from "@functions/_shared/audit/engine.ts";
 import { buildAuditInput, num } from "@functions/_shared/audit/input.ts";
 import { toSaveAuditPayload } from "@functions/_shared/audit/payload.ts";
 import type { AuditCampaign, AuditDailyRow, AuditInput } from "@functions/_shared/audit/types.ts";
@@ -67,27 +67,33 @@ describe("audit engine", () => {
     expect(result.platformScores.google).toBeUndefined();
   });
 
-  it("flags missing conversion tracking as critical with spend at risk", () => {
+  // Engine 2.0: zero conversions alone is an indicative (not verified) tracking
+  // problem; it becomes critical only with tracking evidence (see the v2 tests).
+  it("flags missing conversions with spend affected, without claiming tracking is broken", () => {
     const result = runAudit(input({
       campaigns: [campaign({ id: "no-conv", adAccountId: META, conversions: 0 })],
       daily: daily(META, 30, () => ({ conversions: 0 })),
     }));
     const finding = result.findings.find((item) => item.ruleId === "tracking.no_conversions");
-    expect(finding?.severity).toBe("critical");
+    expect(finding?.severity).toBe("high");
+    expect(finding?.basis).toBe("indicative");
     expect(finding?.estimatedImpact).toBe(30000);
+    expect(finding?.estimateLabel).toBe("Spend without recorded conversions");
     expect(finding?.impactCurrency).toBe("INR");
     expect(result.findings[0].ruleId).toBe("tracking.no_conversions");
-    expect(result.categoryScores.tracking).toBeLessThan(70);
+    // high (20) x indicative (0.5) = 10 points
+    expect(result.categoryScores.tracking).toBe(90);
   });
 
   it("detects wasted spend, CPA outliers, low ROAS, fatigue and low CTR", () => {
     const result = runAudit(input({
       campaigns: [
-        campaign({ id: "winner", adAccountId: META, spend: 40_000, conversions: 200, conversionValue: 200_000 }),
+        // Engine 2.0 checks ROAS only on sales-focused campaigns (lead campaigns need no value).
+        campaign({ id: "winner", adAccountId: META, objective: "OUTCOME_SALES", spend: 40_000, conversions: 200, conversionValue: 200_000 }),
         campaign({ id: "waste", adAccountId: META, spend: 10_000, conversions: 0, clicks: 400 }),
-        campaign({ id: "expensive", adAccountId: META, spend: 12_000, conversions: 8, conversionValue: 6_000 }),
-        campaign({ id: "fatigued", adAccountId: META, impressions: 90_000, reach: 15_000, spend: 5_000, conversions: 20, conversionValue: 30_000 }),
-        campaign({ id: "dull", adAccountId: META, impressions: 80_000, clicks: 200, spend: 4_000, conversions: 10, conversionValue: 20_000 }),
+        campaign({ id: "expensive", adAccountId: META, objective: "OUTCOME_SALES", spend: 12_000, conversions: 8, conversionValue: 6_000 }),
+        campaign({ id: "fatigued", adAccountId: META, objective: "OUTCOME_SALES", impressions: 90_000, reach: 15_000, spend: 5_000, conversions: 20, conversionValue: 30_000 }),
+        campaign({ id: "dull", adAccountId: META, objective: "OUTCOME_SALES", impressions: 80_000, clicks: 200, spend: 4_000, conversions: 10, conversionValue: 20_000 }),
       ],
     }));
     const ids = ruleIds(result);
@@ -100,8 +106,11 @@ describe("audit engine", () => {
     expect(waste?.campaignId).toBe("waste");
   });
 
-  it("applies Google-specific rules and channel CTR benchmarks", () => {
-    expect(ctrBenchmark("google", "SEARCH")).toBeGreaterThan(ctrBenchmark("google", "DISPLAY"));
+  it("applies Google-specific rules and only sourced CTR benchmarks", () => {
+    // Engine 2.0 ships no unsourced industry benchmarks.
+    const sourced = [{ metric: "ctr" as const, provider: "google" as const, kind: "search", value: 0.05, source: "Example source 2026", applicability: "Search, India" }];
+    expect(ctrBenchmark([], "google", "search")).toBeNull();
+    expect(ctrBenchmark(sourced, "google", "search")?.value).toBe(0.05);
     const result = runAudit(input({
       accounts: [{ id: GOOGLE, provider: "google", name: "Google account", currency: "INR" }],
       campaigns: [
@@ -114,6 +123,7 @@ describe("audit engine", () => {
     expect(ids).toContain("structure.manual_bidding");
     expect(ids).toContain("budget.underspend");
     expect(ids).not.toContain("engagement.high_frequency");
+    expect(ids).not.toContain("engagement.low_ctr");
   });
 
   it("detects a rising CPA trend from daily rows", () => {
@@ -130,7 +140,8 @@ describe("audit engine", () => {
     }));
     const ids = ruleIds(result);
     expect(ids).toContain("data_quality.missing_days");
-    expect(ids).toContain("structure.idle_campaigns");
+    // Renamed in 2.0: "idle campaigns" is now a per-campaign no-delivery finding.
+    expect(ids).toContain("structure.no_delivery");
   });
 
   it("never sums money across currencies", () => {
@@ -154,12 +165,20 @@ describe("audit engine", () => {
     expect(a).toEqual(b);
     const worst = scoreFindings(
       Array.from({ length: 30 }, () => ({
-        finding: { ...a.findings[0], severity: "critical" as const, category: "tracking" as const },
+        finding: { ...a.findings[0], severity: "critical" as const, category: "tracking" as const, basis: "verified" as const, campaignId: null },
         spendShare: null,
       })),
     );
-    expect(worst.categories.tracking).toBe(0);
-    expect(worst.overall).toBeGreaterThanOrEqual(0);
+    // Identical findings are counted once (no double counting): 100 - 35.
+    expect(worst.categories.tracking).toBe(65);
+    const distinct = scoreFindings(
+      Array.from({ length: 30 }, (_, index) => ({
+        finding: { ...a.findings[0], ruleId: `tracking.rule_${index}`, severity: "critical" as const, category: "tracking" as const, basis: "verified" as const, campaignId: null },
+        spendShare: null,
+      })),
+    );
+    expect(distinct.categories.tracking).toBe(0);
+    expect(distinct.overall).toBeGreaterThanOrEqual(0);
   });
 
   it("rejects invalid input", () => {
@@ -203,7 +222,10 @@ describe("audit input and payload", () => {
     const result = runAudit(input({ campaigns: [campaign({ id: "no-conv", adAccountId: META, conversions: 0 })], daily: daily(META, 30, () => ({ conversions: 0 })) }));
     const payload = toSaveAuditPayload(result, { title: "x".repeat(300), periodStart: "2026-10-01", periodEnd: "2026-10-30", adAccountIds: [META] });
     expect(payload.run.title.length).toBeLessThanOrEqual(200);
-    expect(payload.findings[0]).toMatchObject({ rule_id: "tracking.no_conversions", ad_account_id: META, severity: "critical" });
+    expect(payload.findings[0]).toMatchObject({ rule_id: "tracking.no_conversions", ad_account_id: META, severity: "high" });
+    expect(payload.findings[0].evidence).toMatchObject({ basis: "indicative", estimate_label: "Spend without recorded conversions" });
+    expect(payload.run.engine_version).toBe(ENGINE_VERSION);
+    expect(payload.run.kpis.score_status).toBe(result.scoreStatus);
     for (const finding of payload.findings) expect(finding.rule_id).toMatch(/^[a-z0-9_.]{2,80}$/);
   });
 });

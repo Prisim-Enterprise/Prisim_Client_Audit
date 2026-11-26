@@ -169,6 +169,28 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
       accounts: accounts.map((account) => ({ ...account })),
       campaigns: campaignPerformance(tenantId, range),
       daily: dailyPerformance(tenantId, range),
+      // Demo syncs always load the full synthetic history (through yesterday).
+      syncJobs: state.jobs
+        .filter((job) => job.tenant_id === tenantId && job.status === "completed")
+        .map((job) => {
+          const until = isoDate(new Date(Date.parse(job.completed_at ?? job.created_at) - 86_400_000));
+          return {
+            id: job.id,
+            connection_id: job.connection_id,
+            job_type: job.job_type,
+            status: job.status,
+            completed_at: job.completed_at,
+            error_message: job.error_message,
+            stats: {
+              window: { since: addDays(until, -119), until },
+              failed_accounts: 0,
+              account_results: accounts
+                .filter((account) => account.connection_id === job.connection_id)
+                .map((account) => ({ ad_account_id: account.id, status: "succeeded", since: addDays(until, -119), until })),
+            },
+          };
+        }),
+      generatedAt: new Date().toISOString(),
     });
     if (input.campaigns.length === 0) throw new ApiError("No campaign data exists for the selected accounts and period.", "no_campaign_data");
     const result = runAudit(input);

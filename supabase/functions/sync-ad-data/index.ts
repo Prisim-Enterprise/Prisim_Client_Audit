@@ -1,5 +1,6 @@
 import { bearerToken, withHttp } from "../_shared/http.ts";
 import { createProvider } from "../_shared/providers/config.ts";
+import type { AccountDiagnostics } from "../_shared/providers/types.ts";
 import { readServerConfig, serviceClient, userClient } from "../_shared/supabase.ts";
 import { type ClaimedJob, processSyncJob } from "../_shared/sync.ts";
 import { createSyncHandler, type SyncHandlerDependencies } from "./handler.ts";
@@ -37,6 +38,14 @@ function dependencies(): SyncHandlerDependencies {
       });
       if (error) throw new Error("ingest_failed");
       return data as { campaigns: number; metrics: number };
+    },
+    async storeDiagnostics(jobId: string, adAccountId: string, diagnostics: AccountDiagnostics) {
+      const { error } = await service.rpc("store_ad_account_diagnostics", {
+        p_job_id: jobId,
+        p_ad_account_id: adAccountId,
+        p_diagnostics: diagnostics,
+      });
+      if (error) throw new Error("diagnostics_store_failed");
     },
     async complete(jobId: string, success: boolean, message: string | null, stats: Record<string, unknown>) {
       const { error } = await service.rpc("complete_sync_job", {

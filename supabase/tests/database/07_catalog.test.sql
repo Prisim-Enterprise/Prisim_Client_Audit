@@ -95,6 +95,7 @@ SELECT results_eq(
         ('ingest_ad_account_data(uuid,uuid,jsonb,jsonb)'),
         ('set_connection_status(uuid,text)'),
         ('start_sync_job(uuid,uuid,text)'),
+        ('store_ad_account_diagnostics(uuid,uuid,jsonb)'),
         ('store_oauth_tokens(uuid,text,text,timestamp with time zone,uuid)'),
         ('upsert_discovered_ad_accounts(uuid,uuid,jsonb,text,text,text[])') $$,
     'service_role-only public functions are exactly the approved RPCs');

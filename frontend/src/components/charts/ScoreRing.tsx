@@ -9,8 +9,16 @@ export function scoreTone(score: number) {
   return { stroke: "#be123c", text: "text-rose-700", Icon: AlertTriangle };
 }
 
-/** Audit health score (0-100) with label + icon so the state is never color-only. */
-export function ScoreRing({ score, size = 132, showLabel = true }: { score: number | null; size?: number; showLabel?: boolean }) {
+/**
+ * Audit health score (0-100) with label + icon so the state is never color-only.
+ * `status` "provisional" adds a visible qualifier; a null score reads "Not scored".
+ */
+export function ScoreRing({
+  score,
+  size = 132,
+  showLabel = true,
+  status,
+}: { score: number | null; size?: number; showLabel?: boolean; status?: "scored" | "provisional" | "unscored" }) {
   const radius = size / 2 - 9;
   const circumference = 2 * Math.PI * radius;
   const value = score === null ? 0 : Math.min(Math.max(score, 0), 100);
@@ -18,7 +26,12 @@ export function ScoreRing({ score, size = 132, showLabel = true }: { score: numb
   return (
     <div className="flex flex-col items-center">
       <div className="relative" style={{ width: size, height: size }}>
-        <svg width={size} height={size} role="img" aria-label={score === null ? "Not scored" : `Score ${Math.round(value)} out of 100, ${scoreLabel(value)}`}>
+        <svg
+          width={size}
+          height={size}
+          role="img"
+          aria-label={score === null ? "Not scored" : `${status === "provisional" ? "Provisional score" : "Score"} ${Math.round(value)} out of 100, ${scoreLabel(value)}`}
+        >
           <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="#e2e8f0" strokeWidth={10} />
           {tone && (
             <circle
@@ -45,6 +58,12 @@ export function ScoreRing({ score, size = 132, showLabel = true }: { score: numb
         <span className={cn("mt-2 inline-flex items-center gap-1 text-sm font-medium", tone.text)}>
           <tone.Icon aria-hidden="true" className="h-4 w-4" /> {scoreLabel(value)}
         </span>
+      )}
+      {showLabel && tone && status === "provisional" && (
+        <span className="mt-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">Provisional</span>
+      )}
+      {showLabel && score === null && (
+        <span className="mt-2 text-sm font-medium text-slate-500">Not scored</span>
       )}
     </div>
   );

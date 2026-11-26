@@ -1,4 +1,8 @@
 // Serializes an engine result for public.save_audit_run(p_tenant_id, p_run, p_findings).
+//
+// audit_findings has no columns for the finding basis or the estimate label,
+// so both travel inside the evidence JSON (evidence.basis, evidence.estimate_label).
+// overall_score is NULL when the audit is unscored.
 
 import type { AuditResult } from "./types.ts";
 
@@ -8,10 +12,10 @@ export type SaveAuditPayload = {
     period_start: string;
     period_end: string;
     engine_version: string;
-    overall_score: number;
+    overall_score: number | null;
     platform_scores: Record<string, number>;
     category_scores: Record<string, number>;
-    kpis: AuditResult["kpis"];
+    kpis: AuditResult["kpis"] & { score_status: AuditResult["scoreStatus"] };
     summary: string;
     ad_account_ids: string[];
   };
@@ -47,8 +51,8 @@ export function toSaveAuditPayload(
       engine_version: result.engineVersion,
       overall_score: result.overallScore,
       platform_scores: result.platformScores as Record<string, number>,
-      category_scores: result.categoryScores,
-      kpis: result.kpis,
+      category_scores: result.categoryScores as Record<string, number>,
+      kpis: { ...result.kpis, score_status: result.scoreStatus },
       summary: clip(result.summary, 5000),
       ad_account_ids: options.adAccountIds,
     },
@@ -62,7 +66,7 @@ export function toSaveAuditPayload(
       title: clip(finding.title, 240),
       description: clip(finding.description, 4000),
       recommendation: clip(finding.recommendation, 4000),
-      evidence: finding.evidence,
+      evidence: { ...finding.evidence, basis: finding.basis, estimate_label: finding.estimateLabel },
       estimated_impact: finding.estimatedImpact,
       impact_currency: finding.impactCurrency,
     })),

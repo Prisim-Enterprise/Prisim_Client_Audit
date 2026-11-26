@@ -16,6 +16,11 @@ export type ReportFinding = {
   status: string;
   estimatedImpact: number | null;
   impactCurrency: string | null;
+  /** Engine 2.0: verified / indicative / benchmark / target / unavailable. */
+  basis?: string | null;
+  estimateLabel?: string | null;
+  /** Short evidence lines (observed values, thresholds, gaps). */
+  evidence?: string[];
 };
 
 export type ReportAccountKpis = {
@@ -55,6 +60,12 @@ export type ReportData = {
   findings: ReportFinding[];
   campaigns: ReportCampaign[];
   engineVersion: string;
+  scoreStatus?: "scored" | "provisional" | "unscored";
+  scoreReason?: string | null;
+  dataConfidence?: { confidence: number; level: string; coverageRatio: number; explanation: string } | null;
+  lastSuccessfulSync?: string | null;
+  limitations?: string[];
+  scoringMethod?: string | null;
   /** Demo fixtures only. Adds a watermark on every page. */
   synthetic?: boolean;
 };
@@ -84,6 +95,14 @@ const SEVERITY_LABEL: Record<ReportFinding["severity"], string> = {
   medium: "MEDIUM",
   low: "LOW",
   info: "INFO",
+};
+
+const BASIS_LABEL: Record<string, string> = {
+  verified: "Verified finding",
+  indicative: "Indicative observation",
+  benchmark: "Benchmark comparison",
+  target: "Target comparison",
+  unavailable: "Unavailable data",
 };
 
 const CATEGORY_LABEL: Record<string, string> = {
@@ -238,7 +257,18 @@ function drawCover(writer: Writer) {
   writer.y = centerY + 50;
   const textX = centerX + 100;
   writer.text("OVERALL ACCOUNT HEALTH", { x: textX, size: 8, font: writer.bold, color: COLORS.accent });
-  writer.text(score === null ? "Not scored" : scoreLabel(score), { x: textX, size: 20, font: writer.bold });
+  writer.text(score === null ? "Not scored" : `${data.scoreStatus === "provisional" ? "Provisional: " : ""}${scoreLabel(score)}`, { x: textX, size: 20, font: writer.bold });
+  if (data.scoreStatus && data.scoreStatus !== "scored" && data.scoreReason) {
+    writer.text(data.scoreReason, { x: textX, size: 8.5, color: COLORS.slate, lineHeight: 11.5 });
+  }
+  if (data.dataConfidence) {
+    writer.space(2);
+    writer.text(
+      `Data confidence: ${data.dataConfidence.level} (${formatNumber(data.dataConfidence.confidence, 0)}/100), ${formatPercent(data.dataConfidence.coverageRatio, 0)} of days known` +
+        (data.lastSuccessfulSync ? `. Last successful sync ${data.lastSuccessfulSync.slice(0, 16).replace("T", " ")} UTC.` : "."),
+      { x: textX, size: 9, color: COLORS.slate, lineHeight: 12 },
+    );
+  }
   const platforms = Object.entries(data.platformScores);
   if (platforms.length > 0) {
     writer.space(4);
@@ -304,9 +334,19 @@ function drawSummary(writer: Writer) {
     writer.text("Accounts use different currencies, so totals are reported per account below.", { size: 9, color: COLORS.slate });
   }
 
+  if (data.dataConfidence) {
+    writer.space(14);
+    writer.text("DATA CONFIDENCE", { size: 8, font: writer.bold, color: COLORS.accent });
+    writer.space(4);
+    writer.text(data.dataConfidence.explanation, { size: 9, color: COLORS.slate, lineHeight: 13 });
+  }
+
   writer.space(14);
   writer.text("SCORE BY AREA", { size: 8, font: writer.bold, color: COLORS.accent });
   writer.space(6);
+  if (Object.keys(data.categoryScores).length === 0) {
+    writer.text("No area had enough evidence to be scored.", { size: 9, color: COLORS.slate });
+  }
   for (const [category, value] of Object.entries(data.categoryScores)) {
     writer.ensure(22);
     const y = writer.y - 10;
@@ -413,7 +453,8 @@ function drawFindings(writer: Writer) {
     const meta = [CATEGORY_LABEL[finding.category] ?? finding.category, finding.platform === "meta" ? "Meta Ads" : finding.platform === "google" ? "Google Ads" : null]
       .filter(Boolean)
       .join("  |  ");
-    writer.page.drawText(toPdfSafeText(meta), { x, y: top - 9.5, size: 8, font: writer.regular, color: COLORS.slate });
+    const metaText = [meta, finding.basis ? BASIS_LABEL[finding.basis] ?? finding.basis : null].filter(Boolean).join("  |  ");
+    writer.page.drawText(toPdfSafeText(metaText), { x, y: top - 9.5, size: 8, font: writer.regular, color: COLORS.slate });
     if (finding.status === "resolved" || finding.status === "accepted") {
       const label = finding.status === "resolved" ? "RESOLVED" : "ACCEPTED";
       const width = writer.bold.widthOfTextAtSize(label, 7) + 10;
@@ -428,7 +469,11 @@ function drawFindings(writer: Writer) {
     writer.text(finding.recommendation, { size: 9.5, lineHeight: 14 });
     if (finding.estimatedImpact && finding.impactCurrency) {
       writer.space(2);
-      writer.text(`Spend at risk: ${formatMoney(finding.estimatedImpact, finding.impactCurrency, 0)}`, { size: 9, font: writer.bold, color: COLORS.high });
+      writer.text(`${finding.estimateLabel ?? "Spend at risk (estimate)"}: ${formatMoney(finding.estimatedImpact, finding.impactCurrency, 0)}`, { size: 9, font: writer.bold, color: COLORS.high });
+    }
+    if (finding.evidence && finding.evidence.length > 0) {
+      writer.space(2);
+      for (const line of finding.evidence) writer.text(line, { size: 8, color: COLORS.slate, lineHeight: 11 });
     }
     if (finding.reviewerNote) {
       writer.space(2);
@@ -466,13 +511,19 @@ function drawCampaigns(writer: Writer) {
   writer.text("METHODOLOGY", { size: 8, font: writer.bold, color: COLORS.accent });
   writer.space(4);
   writer.text(
-    "Figures come from the Meta Marketing API and Google Ads API, synchronized daily at campaign level. " +
+    "Figures come from the Meta Marketing API and Google Ads API, synchronized at campaign and day level. " +
       "Conversions and conversion value are reported as attributed by each platform and are not de-duplicated across platforms. " +
-      "Scores start at 100 per area and are reduced by each finding according to its severity and the share of spend it affects; " +
-      "the overall score weights tracking and cost efficiency most heavily. Benchmarks are conservative industry medians and should be " +
-      "read alongside the business's own targets. Findings were reviewed by PRISIM before publication.",
+      (data.scoringMethod ??
+        "Scores start at 100 per area and are reduced by each finding according to its severity and the share of spend it affects.") +
+      " Estimates are not confirmed losses or savings. Findings were reviewed by PRISIM before publication.",
     { size: 8.5, color: COLORS.slate, lineHeight: 12.5 },
   );
+  if (data.limitations && data.limitations.length > 0) {
+    writer.space(10);
+    writer.text("LIMITATIONS AND UNAVAILABLE DATA", { size: 8, font: writer.bold, color: COLORS.accent });
+    writer.space(4);
+    for (const item of data.limitations) writer.text(`- ${item}`, { size: 8.5, color: COLORS.slate, lineHeight: 12 });
+  }
 }
 
 function decorate(writer: Writer) {

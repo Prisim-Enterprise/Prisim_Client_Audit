@@ -32,7 +32,7 @@ async function handle(request: Request, origin: string): Promise<Response> {
   const { data: tenant } = await client.from("tenants").select("business_name").eq("id", run.tenant_id).maybeSingle();
   const { data: findings, error: findingsError } = await client
     .from("audit_findings")
-    .select("severity, category, platform, title, description, recommendation, reviewer_note, status, estimated_impact, impact_currency, sort_order")
+    .select("severity, category, platform, title, description, recommendation, reviewer_note, status, estimated_impact, impact_currency, sort_order, evidence")
     .eq("audit_run_id", run.id)
     .order("sort_order");
   if (findingsError) throw new HttpError(500, "data_unavailable");
