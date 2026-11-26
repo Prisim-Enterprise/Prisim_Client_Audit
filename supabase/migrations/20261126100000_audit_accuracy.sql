@@ -1,7 +1,7 @@
 -- =====================================================
 -- 20261126100000 - Audit accuracy: campaign context and account diagnostics
 --
--- Supports audit engine prisim-audit-2.0.0:
+-- Supports audit engine prisim-audit-2.1.0:
 --   1. public.campaigns.details: non-secret campaign context reported by the
 --      platform at sync time (Google primary status and reasons, start/end,
 --      shared budget id/flag, budget period; Meta configured status, start/
@@ -26,14 +26,33 @@
 --      platform_metrics and how many rows carry them (same arguments,
 --      SECURITY INVOKER and grants; see the end of this file).
 --
--- No existing column, policy or grant is changed; one column grant is added
--- for the new daily_metrics column (same rule as the other metric columns).
--- Additive and reversible:
---   DROP FUNCTION public.store_ad_account_diagnostics(UUID, UUID, JSONB);
---   DROP TABLE public.ad_account_diagnostics;
---   ALTER TABLE public.campaigns DROP COLUMN details;
---   ALTER TABLE public.daily_metrics DROP COLUMN platform_metrics;
---   (and re-apply ingest_ad_account_data from 20261111100000)
+-- Privileges and policies:
+--   - No existing column, table or RLS policy is changed or removed.
+--   - New grants: SELECT (platform_metrics) ON daily_metrics TO authenticated
+--     (same column-grant rule as the other metric columns); SELECT on the new
+--     ad_account_diagnostics table to authenticated (filtered by its
+--     staff-only policy) and ALL to service_role; EXECUTE on
+--     store_ad_account_diagnostics to service_role only.
+--   - ingest_ad_account_data is replaced with CREATE OR REPLACE, so its
+--     existing grants are kept.
+--   - get_campaign_performance and get_daily_performance are dropped and
+--     recreated (their return type changes), which resets their privileges;
+--     the original privileges are re-applied explicitly: REVOKE from PUBLIC,
+--     anon, authenticated, then EXECUTE to authenticated. Both stay SECURITY
+--     INVOKER, so the caller's RLS still decides which rows are visible.
+--
+-- Rollback (in this order):
+--   1. Restore the previous analytics functions: DROP FUNCTION
+--      public.get_campaign_performance(UUID, DATE, DATE, UUID) and
+--      public.get_daily_performance(UUID, DATE, DATE, UUID), re-run their
+--      CREATE FUNCTION statements from 20261111100000_audit_platform.sql
+--      (section 8), then re-apply that migration's REVOKE / GRANT EXECUTE ...
+--      TO authenticated and COMMENT ON FUNCTION statements for both.
+--   2. Re-apply ingest_ad_account_data from 20261111100000 (CREATE OR REPLACE).
+--   3. DROP FUNCTION public.store_ad_account_diagnostics(UUID, UUID, JSONB);
+--   4. DROP TABLE public.ad_account_diagnostics;
+--   5. ALTER TABLE public.daily_metrics DROP COLUMN platform_metrics;
+--   6. ALTER TABLE public.campaigns DROP COLUMN details;
 -- =====================================================
 
 ALTER TABLE public.campaigns
