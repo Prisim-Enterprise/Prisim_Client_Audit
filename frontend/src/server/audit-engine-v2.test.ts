@@ -679,3 +679,90 @@ describe("multiple accounts and providers", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Scoring scenarios (final accuracy gate). These document how the score moves;
+// several assertions pin behaviour that the review reports as a weakness.
+// ---------------------------------------------------------------------------
+
+import { scoreFindings } from "@functions/_shared/audit/engine.ts";
+import type { AuditFinding } from "@functions/_shared/audit/types.ts";
+
+function synthetic(ruleId: string, category: AuditFinding["category"], severity: AuditFinding["severity"], campaignId: string | null = null): AuditFinding {
+  return {
+    ruleId, category, severity, basis: "verified", platform: "google", adAccountId: GOOGLE, campaignId,
+    title: ruleId, description: "", recommendation: "",
+    evidence: { observed: {}, thresholds: {}, period: { start: START, end: END, days: DAYS }, source: "test", unavailable: [] },
+    estimatedImpact: null, estimateLabel: null, impactCurrency: null,
+  };
+}
+
+describe("scoring scenarios", () => {
+  it("one serious issue outweighs several low-severity issues", () => {
+    const serious = scoreFindings([{ finding: synthetic("tracking.no_conversions", "tracking", "critical"), spendShare: null }]);
+    const several = scoreFindings([
+      { finding: synthetic("tracking.a", "tracking", "low"), spendShare: null },
+      { finding: synthetic("efficiency.b", "efficiency", "low"), spendShare: null },
+      { finding: synthetic("engagement.c", "engagement", "low"), spendShare: null },
+      { finding: synthetic("budget.d", "budget", "low"), spendShare: null },
+    ]);
+    expect(serious.overall).toBe(90.9); // 100 - 0.26 x 35
+    expect(several.overall).toBeCloseTo(96.8, 1);
+    expect(serious.overall!).toBeLessThan(several.overall!);
+    // Weakness reported by the review: one verified critical issue still leaves "Strong".
+    expect(scoreLabel(serious.overall!)).toBe("Strong");
+  });
+
+  it("a campaign holding most of the budget weighs more than a small one with the same finding", () => {
+    const big = scoreFindings([{ finding: synthetic("efficiency.spend_without_conversions", "efficiency", "high", "c1"), spendShare: 0.9 }]);
+    const small = scoreFindings([{ finding: synthetic("efficiency.spend_without_conversions", "efficiency", "high", "c1"), spendShare: 0.05 }]);
+    expect(big.categories.efficiency).toBe(80); // full 20 points
+    expect(small.categories.efficiency).toBe(92); // 20 x 0.40
+  });
+
+  it("similar findings on several campaigns add up per campaign, scaled by spend share", () => {
+    const three = scoreFindings(["c1", "c2", "c3"].map((id) => ({ finding: synthetic("efficiency.low_roas_campaign", "efficiency", "high", id), spendShare: 1 / 3 })));
+    expect(three.categories.efficiency).toBeCloseTo(100 - 3 * 20 * (0.35 + 1 / 3), 0);
+    // The same finding twice on one campaign is counted once.
+    const dup = scoreFindings([1, 2].map(() => ({ finding: synthetic("efficiency.low_roas_campaign", "efficiency", "high", "c1"), spendShare: 1 / 3 })));
+    expect(dup.categories.efficiency).toBeCloseTo(100 - 20 * (0.35 + 1 / 3), 0);
+  });
+
+  it("campaign objectives decide which checks apply", () => {
+    const zero = (objective: string) => audit({ accounts: [{ account: metaAccount, campaigns: [{ id: "m1", objective, day: () => ({ conversions: 0 }) }, { id: "m2", objective, day: () => ({ conversions: 0 }) }] }] }).result;
+    expect(ids(zero("OUTCOME_LEADS"))).toContain("tracking.no_conversions");
+    expect(ids(zero("OUTCOME_SALES"))).toContain("tracking.no_conversions");
+    for (const objective of ["OUTCOME_AWARENESS", "OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT", "OUTCOME_APP_PROMOTION"]) {
+      expect(ids(zero(objective))).not.toContain("tracking.no_conversions");
+    }
+  });
+
+  it("a single assessable category does not produce a score", () => {
+    const { result } = audit({ accounts: [{ account: googleAccount, campaigns: [{ id: "g1", day: (index) => (index < 10 ? { impressions: 50, clicks: 2, spend: 10, conversions: 0 } : null) }] }] });
+    const assessed = Object.entries(result.kpis.scoring!.accounts[0].categories).filter(([, item]) => item.status === "assessed").map(([category]) => category);
+    expect(assessed.length).toBeLessThanOrEqual(1);
+    expect(result.overallScore).toBeNull();
+  });
+
+  it("accounts in different currencies are scored, but their money is never combined", () => {
+    const { result } = audit({ accounts: [
+      { account: metaAccount, campaigns: [{ id: "m1", day: () => ({ conversionValue: 1600 }) }, { id: "m2", day: () => ({ conversionValue: 1600 }) }, { id: "m3", day: () => ({ conversionValue: 1600 }) }] },
+      { account: { ...googleAccount, currency: "USD" }, campaigns: [{ id: "g1" }, { id: "g2" }, { id: "g3" }] },
+    ] });
+    expect(result.kpis.totals).toBeNull();
+    expect(result.platformScores.meta).toBeDefined();
+    expect(result.platformScores.google).toBeDefined();
+    // Weakness reported by the review: the overall score averages Meta and Google.
+    expect(result.overallScore).toBeCloseTo((result.platformScores.meta! + result.platformScores.google!) / 2, 0);
+  });
+
+  it("account size: identical ratios at 10x the volume give the same score", () => {
+    const small = audit({}).result;
+    const scale = (factor: number) => ["m1", "m2", "m3"].map((id) => ({ id, day: () => ({ impressions: 2000 * factor, reach: 1500 * factor, clicks: 40 * factor, spend: 400 * factor, conversions: 2 * factor, conversionValue: 1600 * factor }) }));
+    const large = audit({ accounts: [{ account: metaAccount, campaigns: scale(10) }] }).result;
+    expect(large.overallScore).toBe(small.overallScore);
+    // Below the sample thresholds the same ratios are not scored at all.
+    const tiny = audit({ accounts: [{ account: metaAccount, campaigns: ["m1", "m2", "m3"].map((id) => ({ id, day: (index: number) => (index % 10 === 0 ? { impressions: 200, reach: 150, clicks: 4, spend: 40, conversions: 0, conversionValue: 0 } : null) })) }] }).result;
+    expect(tiny.overallScore).toBeNull();
+  });
+});
