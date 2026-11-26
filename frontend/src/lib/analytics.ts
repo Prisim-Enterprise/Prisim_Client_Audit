@@ -1,5 +1,3 @@
-import { deriveKpis } from "@functions/_shared/audit/engine.ts";
-import type { DerivedKpis } from "@functions/_shared/audit/types.ts";
 import { addDays, isoDate } from "@functions/_shared/format.ts";
 import type { CampaignPerformance, DailyPerformance, DateRange } from "./api/types";
 
@@ -17,19 +15,9 @@ export function presetRange(days: number, today = new Date()): DateRange {
   return { from: addDays(to, -(days - 1)), to };
 }
 
-export function totalsFromCampaigns(rows: CampaignPerformance[]): DerivedKpis {
-  return deriveKpis(rows.reduce(
-    (acc, row) => ({
-      impressions: acc.impressions + row.impressions,
-      reach: acc.reach + row.reach,
-      clicks: acc.clicks + row.clicks,
-      spend: acc.spend + row.spend,
-      conversions: acc.conversions + row.conversions,
-      conversionValue: acc.conversionValue + row.conversion_value,
-    }),
-    { impressions: 0, reach: 0, clicks: 0, spend: 0, conversions: 0, conversionValue: 0 },
-  ));
-}
+// Cross-platform totals of conversions or clicks are intentionally not offered:
+// use summarizePlatforms() (@functions/_shared/analytics/platform.ts), which
+// reports Google and Meta separately. dailyTotals is kept for spend only.
 
 export type DailyTotals = {
   date: string;

@@ -22,6 +22,9 @@
 --      longer lists) without overwriting an existing campaign row.
 --   5. store_ad_account_diagnostics: service_role RPC, bound to a running
 --      sync job exactly like ingest_ad_account_data.
+--   6. get_campaign_performance / get_daily_performance also return
+--      platform_metrics and how many rows carry them (same arguments,
+--      SECURITY INVOKER and grants; see the end of this file).
 --
 -- No existing column, policy or grant is changed; one column grant is added
 -- for the new daily_metrics column (same rule as the other metric columns).
@@ -248,3 +251,160 @@ COMMENT ON TABLE public.ad_account_diagnostics IS
     'Latest diagnostics snapshot per ad account, written by sync-ad-data. Platform admins read only.';
 COMMENT ON FUNCTION public.store_ad_account_diagnostics(UUID, UUID, JSONB) IS
     'service_role: store the diagnostics snapshot of an ad account for a running sync job.';
+
+
+-- -----------------------------------------------------
+-- Analytics RPCs with platform metrics (client analytics and reports)
+-- -----------------------------------------------------
+-- The return types gain columns, so both functions are dropped and created
+-- again with the same arguments, the same SECURITY INVOKER (the caller's RLS
+-- decides which tenants and accounts are visible) and the same grants.
+--
+-- New columns:
+--   metric_rows           campaign/day rows in the period
+--   platform_metric_rows  rows of those that carry platform_metrics; when it
+--                         is lower than metric_rows the platform metrics are
+--                         incomplete and are shown as unavailable
+--   platform_metrics      sums of the numeric platform_metrics keys (NULL when
+--                         no row has them)
+-- get_daily_performance counts Meta results only from campaigns whose
+-- objective has that result (purchases and purchase value from sales
+-- objectives, leads from lead objectives, installs from app promotion),
+-- matching the audit engine's Meta classification
+-- (supabase/functions/_shared/audit/meta.ts, META_OBJECTIVE_FAMILY).
+DROP FUNCTION public.get_campaign_performance(UUID, DATE, DATE, UUID);
+DROP FUNCTION public.get_daily_performance(UUID, DATE, DATE, UUID);
+
+CREATE FUNCTION public.get_campaign_performance(
+    p_tenant_id UUID, p_from DATE, p_to DATE, p_ad_account_id UUID DEFAULT NULL)
+RETURNS TABLE (
+    campaign_id UUID,
+    ad_account_id UUID,
+    provider TEXT,
+    account_name TEXT,
+    external_campaign_id TEXT,
+    campaign_name TEXT,
+    objective TEXT,
+    campaign_status TEXT,
+    channel_type TEXT,
+    bid_strategy TEXT,
+    daily_budget NUMERIC,
+    currency TEXT,
+    impressions BIGINT,
+    reach BIGINT,
+    clicks BIGINT,
+    spend NUMERIC,
+    conversions NUMERIC,
+    conversion_value NUMERIC,
+    active_days INTEGER,
+    metric_rows INTEGER,
+    platform_metric_rows INTEGER,
+    platform_metrics JSONB
+)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+    SELECT c.id, c.ad_account_id, a.provider, a.account_name, c.external_campaign_id, c.campaign_name,
+           c.objective, c.campaign_status, c.channel_type, c.bid_strategy, c.daily_budget, a.currency,
+           COALESCE(sum(m.impressions), 0)::BIGINT,
+           COALESCE(sum(m.reach), 0)::BIGINT,
+           COALESCE(sum(m.clicks), 0)::BIGINT,
+           COALESCE(sum(m.spend), 0)::NUMERIC,
+           COALESCE(sum(m.conversions), 0)::NUMERIC,
+           COALESCE(sum(m.conversion_value), 0)::NUMERIC,
+           (count(m.id) FILTER (WHERE m.impressions > 0 OR m.spend > 0))::INTEGER,
+           count(m.id)::INTEGER,
+           (count(m.id) FILTER (WHERE m.platform_metrics IS NOT NULL))::INTEGER,
+           CASE WHEN count(m.platform_metrics) > 0 THEN jsonb_build_object(
+               'link_clicks',        COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'link_clicks') = 'number' THEN (m.platform_metrics ->> 'link_clicks')::NUMERIC END), 0),
+               'purchases',          COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'purchases') = 'number' THEN (m.platform_metrics ->> 'purchases')::NUMERIC END), 0),
+               'leads',              COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'leads') = 'number' THEN (m.platform_metrics ->> 'leads')::NUMERIC END), 0),
+               'registrations',      COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'registrations') = 'number' THEN (m.platform_metrics ->> 'registrations')::NUMERIC END), 0),
+               'app_installs',       COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'app_installs') = 'number' THEN (m.platform_metrics ->> 'app_installs')::NUMERIC END), 0),
+               'landing_page_views', COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'landing_page_views') = 'number' THEN (m.platform_metrics ->> 'landing_page_views')::NUMERIC END), 0),
+               'purchase_value',     COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'purchase_value') = 'number' THEN (m.platform_metrics ->> 'purchase_value')::NUMERIC END), 0))
+           END
+    FROM public.campaigns c
+    JOIN public.ad_accounts a ON a.id = c.ad_account_id
+    LEFT JOIN public.daily_metrics m
+           ON m.campaign_id = c.id
+          AND m.metric_date BETWEEN p_from AND p_to
+    WHERE c.tenant_id = p_tenant_id
+      AND (p_ad_account_id IS NULL OR c.ad_account_id = p_ad_account_id)
+      AND p_to >= p_from
+      AND p_to - p_from <= 731
+    GROUP BY c.id, a.id
+    ORDER BY COALESCE(sum(m.spend), 0) DESC, c.campaign_name;
+$$;
+
+CREATE FUNCTION public.get_daily_performance(
+    p_tenant_id UUID, p_from DATE, p_to DATE, p_ad_account_id UUID DEFAULT NULL)
+RETURNS TABLE (
+    metric_date DATE,
+    ad_account_id UUID,
+    provider TEXT,
+    currency TEXT,
+    impressions BIGINT,
+    reach BIGINT,
+    clicks BIGINT,
+    spend NUMERIC,
+    conversions NUMERIC,
+    conversion_value NUMERIC,
+    metric_rows INTEGER,
+    platform_metric_rows INTEGER,
+    platform_metrics JSONB
+)
+LANGUAGE sql
+STABLE
+SECURITY INVOKER
+SET search_path = ''
+AS $$
+    SELECT m.metric_date, m.ad_account_id, a.provider, a.currency,
+           sum(m.impressions)::BIGINT, sum(m.reach)::BIGINT, sum(m.clicks)::BIGINT,
+           sum(m.spend)::NUMERIC, sum(m.conversions)::NUMERIC, sum(m.conversion_value)::NUMERIC,
+           count(m.id)::INTEGER,
+           (count(m.id) FILTER (WHERE m.platform_metrics IS NOT NULL))::INTEGER,
+           CASE WHEN count(m.platform_metrics) > 0 THEN jsonb_build_object(
+               'link_clicks', COALESCE(sum(CASE WHEN jsonb_typeof(m.platform_metrics -> 'link_clicks') = 'number'
+                                               THEN (m.platform_metrics ->> 'link_clicks')::NUMERIC END), 0),
+               'purchases', COALESCE(sum(CASE WHEN upper(c.objective) IN ('OUTCOME_SALES', 'CONVERSIONS', 'PRODUCT_CATALOG_SALES')
+                                               AND jsonb_typeof(m.platform_metrics -> 'purchases') = 'number'
+                                             THEN (m.platform_metrics ->> 'purchases')::NUMERIC END), 0),
+               'purchase_value', COALESCE(sum(CASE WHEN upper(c.objective) IN ('OUTCOME_SALES', 'CONVERSIONS', 'PRODUCT_CATALOG_SALES')
+                                                    AND jsonb_typeof(m.platform_metrics -> 'purchase_value') = 'number'
+                                                  THEN (m.platform_metrics ->> 'purchase_value')::NUMERIC END), 0),
+               'leads', COALESCE(sum(CASE WHEN upper(c.objective) IN ('OUTCOME_LEADS', 'LEAD_GENERATION')
+                                           AND jsonb_typeof(m.platform_metrics -> 'leads') = 'number'
+                                         THEN (m.platform_metrics ->> 'leads')::NUMERIC END), 0),
+               'app_installs', COALESCE(sum(CASE WHEN upper(c.objective) IN ('OUTCOME_APP_PROMOTION', 'APP_INSTALLS')
+                                                  AND jsonb_typeof(m.platform_metrics -> 'app_installs') = 'number'
+                                                THEN (m.platform_metrics ->> 'app_installs')::NUMERIC END), 0))
+           END
+    FROM public.daily_metrics m
+    JOIN public.ad_accounts a ON a.id = m.ad_account_id
+    JOIN public.campaigns c ON c.id = m.campaign_id
+    WHERE m.tenant_id = p_tenant_id
+      AND m.campaign_id IS NOT NULL
+      AND m.metric_date BETWEEN p_from AND p_to
+      AND (p_ad_account_id IS NULL OR m.ad_account_id = p_ad_account_id)
+      AND p_to >= p_from
+      AND p_to - p_from <= 731
+    GROUP BY m.metric_date, m.ad_account_id, a.provider, a.currency
+    ORDER BY m.metric_date, m.ad_account_id;
+$$;
+
+REVOKE ALL ON FUNCTION
+    public.get_campaign_performance(UUID, DATE, DATE, UUID),
+    public.get_daily_performance(UUID, DATE, DATE, UUID)
+FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION
+    public.get_campaign_performance(UUID, DATE, DATE, UUID),
+    public.get_daily_performance(UUID, DATE, DATE, UUID)
+TO authenticated;
+
+COMMENT ON FUNCTION public.get_campaign_performance(UUID, DATE, DATE, UUID) IS
+    'Per-campaign totals for a period, with platform_metrics and their row coverage. SECURITY INVOKER: RLS applies.';
+COMMENT ON FUNCTION public.get_daily_performance(UUID, DATE, DATE, UUID) IS
+    'Per-account daily totals from campaign-level rows; Meta results counted only from campaigns of the matching objective. SECURITY INVOKER: RLS applies.';

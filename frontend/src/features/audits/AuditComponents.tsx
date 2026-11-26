@@ -108,6 +108,14 @@ export function ScoreStatusBanner({ run }: { run: AuditRun }) {
   );
 }
 
+/** A Meta campaign's own result (engine platform KPIs); awareness and engagement have none. */
+function metaResultText(goal: string, kpis: Record<string, number | null> | undefined) {
+  const key = ({ sales: "purchases", leads: "leads", app: "app_installs", traffic: "link_clicks" } as Record<string, string>)[goal];
+  if (!key) return "–";
+  const value = kpis?.[key];
+  return value === null || value === undefined ? "Unavailable" : `${formatNumber(value, 0)} ${key.replace("_", " ")}`;
+}
+
 const CONFIDENCE_TONE: Record<string, string> = {
   high: "bg-accent-50 text-accent-800",
   medium: "bg-amber-50 text-amber-800",
@@ -293,7 +301,7 @@ export function AuditOverview({ run }: { run: AuditRun }) {
                 <th scope="col" className="px-3 py-2 text-right font-medium">Spend</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">Impr.</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">CTR</th>
-                <th scope="col" className="px-3 py-2 text-right font-medium">Conv.</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Result</th>
                 <th scope="col" className="px-5 py-2 text-right font-medium">Daily budget</th>
               </tr>
             </thead>
@@ -309,7 +317,7 @@ export function AuditOverview({ run }: { run: AuditRun }) {
                     <td className="px-3 py-2 text-right tabular-nums">{money(campaign.spend, campaign.currency, 0)}</td>
                     <td className="px-3 py-2 text-right tabular-nums">{formatNumber(campaign.impressions)}</td>
                     <td className="px-3 py-2 text-right tabular-nums" title={meta ? "Link CTR" : "CTR"}>{meta ? (typeof linkCtr === "number" ? formatPercent(linkCtr) : "Unavailable") : formatPercent(campaign.ctr)}</td>
-                    <td className="px-3 py-2 text-right tabular-nums">{meta ? "See objective" : formatNumber(campaign.conversions, 0)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{meta ? metaResultText(campaign.goal, campaign.platformKpis) : formatNumber(campaign.conversions, 0)}</td>
                     <td className="px-5 py-2 text-right tabular-nums">{money(campaign.dailyBudget, campaign.currency, 0)}</td>
                   </tr>
                 );

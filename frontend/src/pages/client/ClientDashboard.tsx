@@ -1,15 +1,17 @@
-import { formatMoney, formatNumber } from "@functions/_shared/format.ts";
+import { formatMoney } from "@functions/_shared/format.ts";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowUpRight, ClipboardCheck, FileText, Link2, Target, Wallet } from "lucide-react";
+import { ArrowUpRight, ClipboardCheck, FileText, Link2 } from "lucide-react";
 import { useMemo } from "react";
 import { Link } from "react-router-dom";
 import { TrendChart } from "../../components/charts/TrendChart";
 import { ProviderBadge, SeverityBadge, StatusBadge } from "../../components/ui/Badge";
 import { Card } from "../../components/ui/Card";
 import { LoadingState } from "../../components/ui/LoadingState";
-import { EmptyState, PageHeader, SectionCard, StatTile } from "../../components/ui/States";
+import { EmptyState, PageHeader, SectionCard } from "../../components/ui/States";
 import { useAuth } from "../../context/AuthProvider";
-import { currenciesOf, dailyTotals, formatDate, presetRange, relativeTime, totalsFromCampaigns } from "../../lib/analytics";
+import { currenciesOf, dailyTotals, formatDate, presetRange, relativeTime } from "../../lib/analytics";
+import { summarizePlatforms } from "@functions/_shared/analytics/platform.ts";
+import { PlatformSummaries } from "../../features/analytics/PlatformSummaries";
 import { queryKeys, useApi, useRealtime } from "../../lib/api/ApiProvider";
 import { useWorkspace } from "./workspace";
 import { PlatformScoreRings, ScoreStatusBanner } from "../../features/audits/AuditComponents";
@@ -50,7 +52,7 @@ export function ClientDashboard() {
   // campaigns of accounts whose sync was later disabled can still be in range.
   const reportedCurrencies = currenciesOf([...synced, ...(campaigns.data ?? [])]);
   const mixedCurrencies = reportedCurrencies.length > 1;
-  const totals = totalsFromCampaigns(campaigns.data ?? []);
+  const summaries = summarizePlatforms(campaigns.data ?? []);
   const currency = reportedCurrencies[0] ?? null;
   const trend = dailyTotals(daily.data ?? [], range).map((day) => ({ date: day.date, value: day.spend }));
   const lastSync = synced.map((account) => account.last_synced_at).filter(Boolean).sort().at(-1) ?? null;
@@ -77,11 +79,11 @@ export function ClientDashboard() {
           Your accounts report in different currencies ({reportedCurrencies.join(", ")}). See <Link className="font-medium text-accent-700" to={`${workspace.base}/campaigns`}>Campaigns</Link> for per-account performance.
         </Card>
       ) : (
-        <section className="grid gap-4 lg:grid-cols-[1fr_1fr_1.6fr]">
-          <StatTile label="Spend (30 days)" value={formatMoney(totals.spend, currency, 0)} icon={<Wallet />} detail={`${formatNumber(totals.clicks)} clicks`} />
-          <StatTile label="Conversions (30 days)" value={formatNumber(totals.conversions, 0)} icon={<Target />} detail={`Cost per conversion ${formatMoney(totals.cpa, currency)}`} />
+        <section className="grid gap-4 lg:grid-cols-[1.6fr_1fr]">
+          {/* Last 30 days, per platform: Google and Meta results are never added together. */}
+          <PlatformSummaries summaries={summaries} compact />
           <Card className="px-3 pb-2 pt-4">
-            <p className="px-2 text-sm text-slate-500">Daily spend</p>
+            <p className="px-2 text-sm text-slate-500">Daily spend, all platforms ({currency})</p>
             {daily.isLoading ? <LoadingState /> : <TrendChart points={trend} label="Spend" height={150} format={(value) => formatMoney(value, currency, 0)} />}
           </Card>
         </section>

@@ -2,6 +2,7 @@
 // it runs unchanged in Supabase Edge Functions (Deno) and in the browser.
 
 import { degrees, PDFDocument, type PDFFont, type PDFPage, rgb, StandardFonts } from "pdf-lib";
+import type { PlatformSummary } from "../analytics/platform.ts";
 import { scoreLabel } from "../audit/engine.ts";
 import { formatMoney, formatMultiple, formatNumber, formatPercent, ratio, toPdfSafeText } from "../format.ts";
 
@@ -32,6 +33,11 @@ export type ReportAccountKpis = {
   clicks: number;
   conversions: number;
   conversionValue: number;
+  /** Platform-specific key result ("40 conversions", "12 leads, 3 purchases", "Unavailable"). */
+  keyResult?: string;
+  costPerResult?: number | null;
+  roas?: number | null;
+  roasLabel?: string | null;
 };
 
 export type ReportCampaign = {
@@ -43,6 +49,14 @@ export type ReportCampaign = {
   clicks: number;
   conversions: number;
   conversionValue: number;
+  /** Platform-specific: Google CTR; Meta link CTR. */
+  ctr?: number | null;
+  ctrLabel?: string;
+  resultText?: string;
+  costPerResult?: number | null;
+  roas?: number | null;
+  roasLabel?: string | null;
+  available?: boolean;
 };
 
 export type ReportData = {
@@ -59,6 +73,8 @@ export type ReportData = {
   accounts: ReportAccountKpis[];
   findings: ReportFinding[];
   campaigns: ReportCampaign[];
+  /** Per platform and currency (same module as the portal). Google and Meta are never combined. */
+  platformSummaries?: PlatformSummary[];
   engineVersion: string;
   scoreStatus?: "scored" | "provisional" | "unscored";
   scoreReason?: string | null;
@@ -354,32 +370,39 @@ function drawSummary(writer: Writer) {
   writer.text(data.summary ?? "No summary was provided for this audit.", { size: 10.5, lineHeight: 16 });
   writer.space(16);
 
-  const currencies = new Set(data.accounts.map((account) => account.currency ?? ""));
-  if (data.accounts.length > 0 && currencies.size === 1) {
-    const currency = data.accounts[0].currency;
-    const total = data.accounts.reduce(
-      (acc, account) => ({
-        spend: acc.spend + account.spend,
-        impressions: acc.impressions + account.impressions,
-        clicks: acc.clicks + account.clicks,
-        conversions: acc.conversions + account.conversions,
-        value: acc.value + account.conversionValue,
-      }),
-      { spend: 0, impressions: 0, clicks: 0, conversions: 0, value: 0 },
-    );
-    const tiles: Array<[string, string]> = [
-      ["Spend", formatMoney(total.spend, currency, 0)],
-      ["Conversions", formatNumber(total.conversions, 0)],
-      ["Cost / conversion", formatMoney(ratio(total.spend, total.conversions), currency)],
-      ["ROAS", total.value > 0 ? formatMultiple(ratio(total.value, total.spend)) : "Not tracked"],
-      ["Impressions", formatNumber(total.impressions)],
-      ["Clicks", formatNumber(total.clicks)],
-      ["CTR", formatPercent(ratio(total.clicks, total.impressions))],
-      ["Cost / click", formatMoney(ratio(total.spend, total.clicks), currency)],
-    ];
+  // Per platform (and currency): Google and Meta results are never added together.
+  for (const summary of data.platformSummaries ?? []) {
+    const money = (value: number | null, digits = 2) => formatMoney(value, summary.currency, digits);
+    writer.text(`${summary.provider === "meta" ? "META ADS" : "GOOGLE ADS"}${summary.currency ? ` (${summary.currency})` : ""}`, { size: 8, font: writer.bold, color: COLORS.accent });
+    writer.space(4);
+    const tiles: Array<[string, string]> = [["Spend", money(summary.spend, 0)], ["Impressions", formatNumber(summary.impressions)], ["CPM", money(summary.cpm)]];
+    if (summary.google) {
+      const google = summary.google;
+      tiles.push(
+        ["Clicks", formatNumber(google.clicks)],
+        ["CTR", formatPercent(google.ctr)],
+        ["Conversions", formatNumber(google.conversions, 0)],
+        ["Cost / conversion", money(google.costPerConversion)],
+        ["ROAS", google.conversionValue > 0 ? formatMultiple(google.roas) : "Not tracked"],
+      );
+    }
+    if (summary.meta) {
+      const meta = summary.meta;
+      tiles.push(
+        ["Link clicks", meta.linkClicks === null ? "Unavailable" : formatNumber(meta.linkClicks)],
+        ["Link CTR", meta.linkClicks === null ? "Unavailable" : formatPercent(meta.linkCtr)],
+      );
+      for (const result of meta.results) {
+        tiles.push([result.label, result.count === null ? "Unavailable" : formatNumber(result.count, 0)]);
+        tiles.push([`Cost / ${result.singular}`, result.count === null ? "Unavailable" : money(result.cost)]);
+      }
+      if (meta.results.some((result) => result.family === "sales")) tiles.push(["Purchase ROAS", meta.purchaseRoas === null ? "Unavailable" : formatMultiple(meta.purchaseRoas)]);
+    }
     drawTiles(writer, tiles);
-  } else if (data.accounts.length > 0) {
-    writer.text("Accounts use different currencies, so totals are reported per account below.", { size: 9, color: COLORS.slate });
+    writer.space(6);
+  }
+  if ((data.platformSummaries ?? []).length > 1) {
+    writer.text("Each platform is reported separately; conversions, clicks and spend are not added across platforms or currencies.", { size: 8.5, color: COLORS.slate });
   }
 
   if (data.dataConfidence) {
@@ -416,15 +439,17 @@ function drawSummary(writer: Writer) {
   writer.space(6);
   drawTable(
     writer,
-    ["Account", "Platform", "Spend", "Conv.", "CPA", "ROAS"],
-    [0.34, 0.14, 0.16, 0.1, 0.14, 0.12],
+    ["Account", "Platform", "Spend", "Key result", "Cost / result", "ROAS"],
+    [0.26, 0.1, 0.14, 0.26, 0.12, 0.12],
     data.accounts.map((account) => [
       account.name,
       account.provider === "meta" ? "Meta" : "Google",
       formatMoney(account.spend, account.currency, 0),
-      formatNumber(account.conversions, 0),
-      formatMoney(ratio(account.spend, account.conversions), account.currency),
-      account.conversionValue > 0 ? formatMultiple(ratio(account.conversionValue, account.spend)) : "-",
+      account.keyResult ?? `${formatNumber(account.conversions, 0)} conversions`,
+      account.keyResult !== undefined ? formatMoney(account.costPerResult ?? null, account.currency) : formatMoney(ratio(account.spend, account.conversions), account.currency),
+      account.keyResult !== undefined
+        ? account.roas === null || account.roas === undefined ? "-" : `${formatMultiple(account.roas)}${account.roasLabel === "Purchase ROAS" ? " (purchase)" : ""}`
+        : account.conversionValue > 0 ? formatMultiple(ratio(account.conversionValue, account.spend)) : "-",
     ]),
   );
 }
@@ -547,17 +572,26 @@ function drawCampaigns(writer: Writer) {
   const rows = [...data.campaigns]
     .sort((a, b) => b.spend - a.spend)
     .slice(0, 25)
-    .map((campaign) => [
-      campaign.name,
-      campaign.provider === "meta" ? "Meta" : "Google",
-      formatMoney(campaign.spend, campaign.currency, 0),
-      formatNumber(campaign.impressions),
-      formatPercent(ratio(campaign.clicks, campaign.impressions)),
-      formatNumber(campaign.conversions, 0),
-      formatMoney(ratio(campaign.spend, campaign.conversions), campaign.currency),
-      campaign.conversionValue > 0 ? formatMultiple(ratio(campaign.conversionValue, campaign.spend)) : "-",
-    ]);
-  drawTable(writer, ["Campaign", "Platform", "Spend", "Impr.", "CTR", "Conv.", "CPA", "ROAS"], [0.28, 0.09, 0.13, 0.11, 0.08, 0.08, 0.13, 0.1], rows);
+    .map((campaign) => {
+      // Platform-specific values (Meta: link CTR, result of its objective, purchase ROAS for sales only).
+      const unavailable = campaign.available === false;
+      const shown = (value: number | null | undefined, format: (n: number) => string) => (value === null || value === undefined ? (unavailable ? "Unavailable" : "-") : format(value));
+      return [
+        campaign.name,
+        campaign.provider === "meta" ? "Meta" : "Google",
+        formatMoney(campaign.spend, campaign.currency, 0),
+        formatNumber(campaign.impressions),
+        campaign.ctrLabel ? shown(campaign.ctr, (n) => formatPercent(n)) : formatPercent(ratio(campaign.clicks, campaign.impressions)),
+        campaign.resultText ?? `${formatNumber(campaign.conversions, 0)} conv.`,
+        campaign.resultText !== undefined ? shown(campaign.costPerResult, (n) => formatMoney(n, campaign.currency)) : formatMoney(ratio(campaign.spend, campaign.conversions), campaign.currency),
+        campaign.resultText !== undefined
+          ? campaign.roasLabel ? shown(campaign.roas, (n) => formatMultiple(n)) : "-"
+          : campaign.conversionValue > 0 ? formatMultiple(ratio(campaign.conversionValue, campaign.spend)) : "-",
+      ];
+    });
+  drawTable(writer, ["Campaign", "Platform", "Spend", "Impr.", "CTR*", "Result", "Cost / result", "ROAS"], [0.25, 0.08, 0.12, 0.1, 0.08, 0.16, 0.12, 0.09], rows);
+  writer.space(4);
+  writer.text("* CTR is clicks / impressions for Google and link clicks / impressions for Meta. Meta results follow each campaign's objective; ROAS for Meta is purchase ROAS on sales campaigns only.", { size: 7.5, color: COLORS.slate, lineHeight: 10 });
 
   writer.space(24);
   writer.text("METHODOLOGY", { size: 8, font: writer.bold, color: COLORS.accent });

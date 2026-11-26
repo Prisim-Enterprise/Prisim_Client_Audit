@@ -1,8 +1,44 @@
 // Builds ReportData from database rows (audit_runs, audit_findings and
 // get_campaign_performance). Shared by generate-report and demo mode.
 
+import { campaignView, type PlatformSummary, summarizePlatforms } from "../analytics/platform.ts";
 import { type CampaignPerformanceRow, num } from "../audit/input.ts";
 import type { ReportData, ReportFinding } from "./pdf.ts";
+
+/** Key result of one platform summary: Google conversions; Meta results per objective (never added together). */
+/** Google key result from stored account KPIs (reports without campaign rows). */
+function googleFallback(spend: number, conversions: number, value: number) {
+  return {
+    text: `${Math.round(conversions).toLocaleString("en-US")} conversions`,
+    costPerResult: conversions > 0 ? spend / conversions : null,
+    roas: value > 0 && spend > 0 ? value / spend : null,
+    roasLabel: "ROAS",
+  };
+}
+
+export function summaryResult(summary: PlatformSummary | undefined): { text: string; costPerResult: number | null; roas: number | null; roasLabel: string | null } {
+  if (!summary) return { text: "-", costPerResult: null, roas: null, roasLabel: null };
+  if (summary.google) {
+    return {
+      text: `${Math.round(summary.google.conversions).toLocaleString("en-US")} conversions`,
+      costPerResult: summary.google.costPerConversion,
+      roas: summary.google.roas,
+      roasLabel: "ROAS",
+    };
+  }
+  const meta = summary.meta!;
+  const results = meta.results;
+  const text = results.length === 0
+    ? meta.linkClicks === null ? "Unavailable" : `${Math.round(meta.linkClicks).toLocaleString("en-US")} link clicks`
+    : results.map((item) => (item.count === null ? `${item.label}: Unavailable` : `${Math.round(item.count).toLocaleString("en-US")} ${item.label.toLowerCase()}`)).join(", ");
+  return {
+    text,
+    // A single cost per result only makes sense for a single objective.
+    costPerResult: results.length === 1 ? results[0].cost : null,
+    roas: meta.purchaseRoas,
+    roasLabel: results.some((item) => item.family === "sales") ? "Purchase ROAS" : null,
+  };
+}
 
 export type AuditRunRow = {
   id: string;
@@ -93,16 +129,30 @@ export function toReportData(options: {
   const { run } = options;
   const quality = (run.kpis.dataQuality ?? null) as Record<string, unknown> | null;
   const scoring = (run.kpis.scoring ?? null) as Record<string, unknown> | null;
-  const accounts = (run.kpis.accounts ?? []).map((account) => ({
-    name: String(account.name ?? "Ad account"),
-    provider: String(account.provider ?? ""),
-    currency: typeof account.currency === "string" ? account.currency : null,
-    spend: num(account.spend as number),
-    impressions: num(account.impressions as number),
-    clicks: num(account.clicks as number),
-    conversions: num(account.conversions as number),
-    conversionValue: num(account.conversionValue as number),
-  }));
+  const delivered = options.campaigns.filter((campaign) => num(campaign.spend) > 0 || num(campaign.impressions) > 0);
+  const accounts = (run.kpis.accounts ?? []).map((account) => {
+    const own = options.campaigns.filter((campaign) => campaign.ad_account_id === account.adAccountId);
+    // Same platform rules as the portal: per account, from the campaign rows.
+    const result = own.length > 0
+      ? summaryResult(summarizePlatforms(own)[0])
+      : account.provider === "meta"
+      ? { text: "Unavailable", costPerResult: null, roas: null, roasLabel: null }
+      : googleFallback(num(account.spend as number), num(account.conversions as number), num(account.conversionValue as number));
+    return {
+      name: String(account.name ?? "Ad account"),
+      provider: String(account.provider ?? ""),
+      currency: typeof account.currency === "string" ? account.currency : null,
+      spend: num(account.spend as number),
+      impressions: num(account.impressions as number),
+      clicks: num(account.clicks as number),
+      conversions: num(account.conversions as number),
+      conversionValue: num(account.conversionValue as number),
+      keyResult: result.text,
+      costPerResult: result.costPerResult,
+      roas: result.roas,
+      roasLabel: result.roasLabel,
+    };
+  });
   return {
     tenantName: options.tenantName,
     title: run.title,
@@ -149,9 +199,10 @@ export function toReportData(options: {
         estimateLabel: typeof finding.evidence?.estimate_label === "string" ? finding.evidence.estimate_label : null,
         evidence: evidenceLines(finding.evidence),
       })),
-    campaigns: options.campaigns
-      .filter((campaign) => num(campaign.spend) > 0 || num(campaign.impressions) > 0)
-      .map((campaign) => ({
+    platformSummaries: summarizePlatforms(delivered),
+    campaigns: delivered.map((campaign) => {
+      const view = campaignView(campaign);
+      return {
         name: campaign.campaign_name ?? campaign.external_campaign_id,
         provider: campaign.provider,
         currency: campaign.currency,
@@ -160,6 +211,14 @@ export function toReportData(options: {
         clicks: num(campaign.clicks),
         conversions: num(campaign.conversions),
         conversionValue: num(campaign.conversion_value),
-      })),
+        ctr: view.ctr,
+        ctrLabel: view.ctrLabel,
+        resultText: view.result ? (view.result.count === null ? "Unavailable" : `${Math.round(view.result.count).toLocaleString("en-US")} ${view.result.label.toLowerCase()}`) : "-",
+        costPerResult: view.result?.cost ?? null,
+        roas: view.roas,
+        roasLabel: view.roasLabel,
+        available: view.available,
+      };
+    }),
   };
 }

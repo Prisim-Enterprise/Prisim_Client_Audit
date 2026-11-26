@@ -42,6 +42,10 @@ export type CampaignPerformanceRow = {
   conversions: number | string;
   conversion_value: number | string;
   active_days: number | string;
+  /** Engine 2.1 RPC: campaign/day rows, rows with platform_metrics, and their sums. */
+  metric_rows?: number | string | null;
+  platform_metric_rows?: number | string | null;
+  platform_metrics?: Record<string, unknown> | null;
 };
 
 export type DailyPerformanceRow = {

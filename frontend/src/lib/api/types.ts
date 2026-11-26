@@ -148,6 +148,11 @@ export type CampaignPerformance = {
   conversions: number;
   conversion_value: number;
   active_days: number;
+  /** Campaign/day rows in the period, and how many carry platform_metrics (engine 2.1 RPC). */
+  metric_rows?: number;
+  platform_metric_rows?: number;
+  /** Meta: link_clicks, purchases, leads, registrations, app_installs, landing_page_views, purchase_value. */
+  platform_metrics?: Record<string, number> | null;
 };
 
 export type DailyPerformance = {
@@ -161,6 +166,10 @@ export type DailyPerformance = {
   spend: number;
   conversions: number;
   conversion_value: number;
+  metric_rows?: number;
+  platform_metric_rows?: number;
+  /** Meta results counted only from campaigns of the matching objective. */
+  platform_metrics?: Record<string, number> | null;
 };
 
 export type AuditRun = {

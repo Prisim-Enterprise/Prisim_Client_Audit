@@ -103,6 +103,26 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
     return tenant;
   }
 
+  /** Synthetic Meta platform metrics for one row (demo only): link clicks and the objective's result. */
+  function demoPlatformMetrics(row: DemoMetric): Record<string, number> | null {
+    const campaign = state.campaigns.find((item) => item.campaign_id === row.campaign_id);
+    if (campaign?.provider !== "meta") return null;
+    const objective = (campaign.objective ?? "").toUpperCase();
+    return {
+      link_clicks: Math.round(row.clicks * 0.7),
+      purchases: objective.includes("SALES") ? row.conversions : 0,
+      leads: objective.includes("LEADS") ? row.conversions : 0,
+      registrations: 0,
+      app_installs: objective.includes("APP") ? row.conversions : 0,
+      landing_page_views: Math.round(row.clicks * 0.5),
+      purchase_value: objective.includes("SALES") ? row.conversion_value : 0,
+    };
+  }
+
+  function sumMetrics(target: Record<string, number>, metrics: Record<string, number> | null) {
+    for (const [key, value] of Object.entries(metrics ?? {})) target[key] = (target[key] ?? 0) + value;
+  }
+
   function campaignPerformance(tenantId: string, range: DateRange, adAccountId?: string): CampaignPerformance[] {
     return state.campaigns
       .filter((campaign) => campaign.tenant_id === tenantId && (!adAccountId || campaign.ad_account_id === adAccountId))
@@ -110,8 +130,14 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
       .map((campaign) => {
         const rows = state.metrics.filter((row) => row.campaign_id === campaign.campaign_id && row.metric_date >= range.from && row.metric_date <= range.to);
         const sum = (key: keyof DemoMetric) => rows.reduce((total, row) => total + (row[key] as number), 0);
+        const platform: Record<string, number> = {};
+        rows.forEach((row) => sumMetrics(platform, demoPlatformMetrics(row)));
+        const meta = campaign.provider === "meta";
         return {
           ...campaign,
+          metric_rows: rows.length,
+          platform_metric_rows: meta ? rows.length : 0,
+          platform_metrics: meta && rows.length > 0 ? platform : null,
           impressions: sum("impressions"),
           reach: sum("reach"),
           clicks: sum("clicks"),
@@ -143,7 +169,19 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
         spend: 0,
         conversions: 0,
         conversion_value: 0,
+        metric_rows: 0,
+        platform_metric_rows: 0,
+        platform_metrics: null,
       };
+      const metrics = demoPlatformMetrics(row);
+      current.metric_rows = (current.metric_rows ?? 0) + 1;
+      if (metrics) {
+        current.platform_metric_rows = (current.platform_metric_rows ?? 0) + 1;
+        // Same rule as get_daily_performance: results only from campaigns of the matching objective.
+        const daily = current.platform_metrics ?? {};
+        sumMetrics(daily, { link_clicks: metrics.link_clicks, purchases: metrics.purchases, purchase_value: metrics.purchase_value, leads: metrics.leads, app_installs: metrics.app_installs });
+        current.platform_metrics = daily;
+      }
       current.impressions += row.impressions;
       current.reach += row.reach;
       current.clicks += row.clicks;
@@ -173,25 +211,7 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
       // are derived from the synthetic clicks and conversions (demo only).
       campaignDaily: state.metrics
         .filter((row) => row.tenant_id === tenantId && row.metric_date >= periodStart && row.metric_date <= periodEnd)
-        .map((row) => {
-          const campaign = state.campaigns.find((item) => item.campaign_id === row.campaign_id);
-          const objective = (campaign?.objective ?? "").toUpperCase();
-          const meta = campaign?.provider === "meta";
-          return {
-            ...row,
-            platform_metrics: meta
-              ? {
-                link_clicks: Math.round(row.clicks * 0.7),
-                purchases: objective.includes("SALES") ? row.conversions : 0,
-                leads: objective.includes("LEADS") ? row.conversions : 0,
-                registrations: 0,
-                app_installs: objective.includes("APP") ? row.conversions : 0,
-                landing_page_views: Math.round(row.clicks * 0.5),
-                purchase_value: objective.includes("SALES") ? row.conversion_value : 0,
-              }
-              : null,
-          };
-        }),
+        .map((row) => ({ ...row, platform_metrics: demoPlatformMetrics(row) })),
       // Demo syncs always load the full synthetic history (through yesterday).
       syncJobs: state.jobs
         .filter((job) => job.tenant_id === tenantId && job.status === "completed")

@@ -55,7 +55,17 @@ function normalizeCampaign(row: CampaignPerformance): CampaignPerformance {
     conversions: num(row.conversions),
     conversion_value: num(row.conversion_value),
     active_days: num(row.active_days),
+    ...platformFields(row),
   };
+}
+
+/** Coverage counts and numeric platform metrics (PostgREST sends NUMERIC as strings). */
+function platformFields(row: { metric_rows?: unknown; platform_metric_rows?: unknown; platform_metrics?: unknown }) {
+  if (row.metric_rows === undefined) return {};
+  const metrics = row.platform_metrics && typeof row.platform_metrics === "object"
+    ? Object.fromEntries(Object.entries(row.platform_metrics as Record<string, unknown>).map(([key, value]) => [key, num(value as number)]))
+    : null;
+  return { metric_rows: num(row.metric_rows as number), platform_metric_rows: num(row.platform_metric_rows as number), platform_metrics: metrics };
 }
 
 function normalizeDaily(row: DailyPerformance): DailyPerformance {
@@ -67,6 +77,7 @@ function normalizeDaily(row: DailyPerformance): DailyPerformance {
     spend: num(row.spend),
     conversions: num(row.conversions),
     conversion_value: num(row.conversion_value),
+    ...platformFields(row),
   };
 }
 

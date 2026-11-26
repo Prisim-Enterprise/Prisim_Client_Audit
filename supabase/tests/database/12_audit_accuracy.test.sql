@@ -22,6 +22,11 @@ INSERT INTO public.oauth_connections (id, tenant_id, provider, status) VALUES
 INSERT INTO public.ad_accounts (id, tenant_id, connection_id, provider, external_account_id, currency, sync_enabled) VALUES
     ('c0000000-0000-4000-8000-0000000000aa', 'c0000000-0000-4000-8000-000000000000', 'c0000000-0000-4000-8000-0000000000c0', 'google', '1111111111', 'INR', TRUE),
     ('d0000000-0000-4000-8000-0000000000aa', 'd0000000-0000-4000-8000-000000000000', 'd0000000-0000-4000-8000-0000000000c0', 'google', '2222222222', 'INR', TRUE);
+-- Tenant D has its own data, so the isolation checks below are not vacuous.
+INSERT INTO public.campaigns (id, tenant_id, ad_account_id, external_campaign_id, campaign_name) VALUES
+    ('d0000000-0000-4000-8000-0000000000ca', 'd0000000-0000-4000-8000-000000000000', 'd0000000-0000-4000-8000-0000000000aa', 'd1', 'D campaign');
+INSERT INTO public.daily_metrics (tenant_id, ad_account_id, campaign_id, metric_date, impressions, spend, platform_metrics) VALUES
+    ('d0000000-0000-4000-8000-000000000000', 'd0000000-0000-4000-8000-0000000000aa', 'd0000000-0000-4000-8000-0000000000ca', '2026-11-02', 50, 5, '{"link_clicks": 2}');
 INSERT INTO public.sync_jobs (id, tenant_id, connection_id, provider, job_type, status, started_at) VALUES
     ('c0000000-0000-4000-8000-0000000000f1', 'c0000000-0000-4000-8000-000000000000', 'c0000000-0000-4000-8000-0000000000c0', 'google', 'manual_sync', 'processing', NOW()),
     ('c0000000-0000-4000-8000-0000000000f2', 'c0000000-0000-4000-8000-000000000000', 'c0000000-0000-4000-8000-0000000000c0', 'google', 'manual_sync', 'completed', NOW());
@@ -69,6 +74,15 @@ SELECT ok(
     (SELECT platform_metrics IS NULL FROM public.daily_metrics m JOIN public.campaigns c ON c.id = m.campaign_id WHERE c.external_campaign_id = '99'),
     'absent platform_metrics stay NULL (not reported), not zero');
 
+-- Objective-specific results for the analytics RPCs (2026-11-02): a leads and a sales campaign.
+SELECT lives_ok(
+    $$ SELECT public.ingest_ad_account_data(
+        'c0000000-0000-4000-8000-0000000000f1', 'c0000000-0000-4000-8000-0000000000aa',
+        '[{"external_id":"80","name":"Leads","objective":"OUTCOME_LEADS","status":"ACTIVE"},{"external_id":"81","name":"Sales","objective":"OUTCOME_SALES","status":"ACTIVE"}]'::JSONB,
+        '[{"external_campaign_id":"80","date":"2026-11-02","impressions":100,"clicks":9,"spend":10,"platform_metrics":{"link_clicks":4,"leads":3,"purchases":1}},
+          {"external_campaign_id":"81","date":"2026-11-02","impressions":200,"clicks":12,"spend":20,"platform_metrics":{"link_clicks":6,"leads":2,"purchases":5,"purchase_value":250}}]'::JSONB) $$,
+    'leads and sales campaign rows ingested');
+
 SELECT lives_ok(
     $$ SELECT public.store_ad_account_diagnostics('c0000000-0000-4000-8000-0000000000f1', 'c0000000-0000-4000-8000-0000000000aa',
          '{"provider":"google","window":{"since":"2026-10-26","until":"2026-11-24"},"captured_at":"2026-11-25T00:00:00Z","sections":{"conversion_actions":{"status":"ok","rows":[]}}}'::JSONB) $$,
@@ -103,8 +117,33 @@ SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-0000000000c1","
 SELECT is((SELECT count(*)::INT FROM public.ad_account_diagnostics), 0, 'tenant owner cannot read diagnostics');
 SELECT is((SELECT details ->> 'primary_status' FROM public.campaigns WHERE external_campaign_id = '77'), 'NOT_ELIGIBLE', 'tenant members read their own campaign details');
 
+-- Analytics RPCs (SECURITY INVOKER): platform metrics, row coverage, objective-specific results, tenant isolation.
+SELECT ok((SELECT NOT prosecdef FROM pg_proc WHERE oid = 'public.get_campaign_performance(uuid,date,date,uuid)'::regprocedure), 'get_campaign_performance stays SECURITY INVOKER');
+SELECT ok((SELECT NOT prosecdef FROM pg_proc WHERE oid = 'public.get_daily_performance(uuid,date,date,uuid)'::regprocedure), 'get_daily_performance stays SECURITY INVOKER');
+SELECT is(
+    (SELECT platform_metrics ->> 'link_clicks' FROM public.get_campaign_performance('c0000000-0000-4000-8000-000000000000', '2026-11-01', '2026-11-02') WHERE external_campaign_id = '80'),
+    '4', 'campaign platform_metrics summed');
+SELECT results_eq(
+    $$ SELECT metric_rows, platform_metric_rows FROM public.get_campaign_performance('c0000000-0000-4000-8000-000000000000', '2026-11-01', '2026-11-02') WHERE external_campaign_id = '99' $$,
+    $$ VALUES (1, 0) $$, 'row coverage shows platform metrics are missing for a campaign');
+SELECT is(
+    (SELECT platform_metrics ->> 'leads' FROM public.get_daily_performance('c0000000-0000-4000-8000-000000000000', '2026-11-02', '2026-11-02')),
+    '3', 'daily leads come only from lead-objective campaigns (sales campaign leads excluded)');
+SELECT is(
+    (SELECT platform_metrics ->> 'purchases' FROM public.get_daily_performance('c0000000-0000-4000-8000-000000000000', '2026-11-02', '2026-11-02')),
+    '5', 'daily purchases come only from sales-objective campaigns');
+SELECT is(
+    (SELECT count(*)::INT FROM public.get_campaign_performance('d0000000-0000-4000-8000-000000000000', '2026-11-01', '2026-11-02')),
+    0, 'a tenant member reads no campaigns of another tenant');
+SELECT is(
+    (SELECT count(*)::INT FROM public.get_daily_performance('d0000000-0000-4000-8000-000000000000', '2026-11-01', '2026-11-02')),
+    0, 'a tenant member reads no daily rows of another tenant');
+
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-00000000ad02","role":"authenticated","aal":"aal2"}';
 SELECT is((SELECT count(*)::INT FROM public.ad_account_diagnostics), 1, 'aal2 platform admin reads diagnostics');
+SELECT is(
+    (SELECT platform_metrics ->> 'link_clicks' FROM public.get_campaign_performance('d0000000-0000-4000-8000-000000000000', '2026-11-01', '2026-11-02')),
+    '2', 'aal2 staff read platform metrics of any tenant through the same RPC');
 
 SET LOCAL request.jwt.claims TO '{"sub":"00000000-0000-4000-8000-00000000ad02","role":"authenticated","aal":"aal1"}';
 SELECT is((SELECT count(*)::INT FROM public.ad_account_diagnostics), 0, 'platform admin without MFA reads nothing');

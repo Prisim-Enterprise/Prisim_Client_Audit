@@ -77,7 +77,8 @@ const T = META_THRESHOLDS;
 // Classification
 // ---------------------------------------------------------------------------
 
-const FAMILY: Record<string, string> = {
+/** Objective -> family. Also used by client analytics and the analytics RPCs (keep in sync). */
+export const META_OBJECTIVE_FAMILY: Record<string, string> = {
   OUTCOME_SALES: "sales",
   CONVERSIONS: "sales",
   PRODUCT_CATALOG_SALES: "sales",
@@ -109,7 +110,7 @@ const LABEL: Record<string, string> = {
 };
 
 /** Result metric per objective family (keys of daily_metrics.platform_metrics). */
-const RESULT: Record<string, { metric: string; label: string } | null> = {
+export const META_RESULT: Record<string, { metric: string; label: string } | null> = {
   sales: { metric: "purchases", label: "purchases" },
   leads: { metric: "leads", label: "leads" },
   app: { metric: "app_installs", label: "app installs" },
@@ -118,14 +119,19 @@ const RESULT: Record<string, { metric: string; label: string } | null> = {
   awareness: null,
 };
 
+/** sales | leads | app | traffic | engagement | awareness | unknown */
+export function metaObjectiveFamily(objective: string | null | undefined): string {
+  return META_OBJECTIVE_FAMILY[(objective ?? "").toUpperCase()] ?? "unknown";
+}
+
 export function classifyMeta(campaign: AuditCampaign, target?: BusinessTarget | null): Classification {
-  let family = FAMILY[(campaign.objective ?? "").toUpperCase()] ?? "unknown";
+  let family = metaObjectiveFamily(campaign.objective);
   let uncertain = false;
   if (family === "unknown") {
     uncertain = true;
-    if (target?.goal && target.goal in RESULT) family = target.goal;
+    if (target?.goal && target.goal in META_RESULT) family = target.goal;
   }
-  const result = RESULT[family] ?? null;
+  const result = META_RESULT[family] ?? null;
   return { kind: family, kindLabel: LABEL[family] ?? "Unknown objective", goal: family, resultMetric: result?.metric ?? null, resultLabel: result?.label ?? null, uncertain };
 }
 
@@ -204,7 +210,7 @@ const noResults: Rule = {
       const clicks = group.reduce((sum, campaign) => sum + (linkClicks(campaign) ?? 0), 0);
       const count = group.reduce((sum, campaign) => sum + (results(ctx, campaign) ?? 0), 0);
       if (count > 0 || spend <= 0 || clicks < T.minLinkClicksForZeroResults) continue;
-      const label = RESULT[family]!.label;
+      const label = META_RESULT[family]!.label;
       const observed = { spend: round(spend), link_clicks: clicks, [label.replace(/ /g, "_")]: 0, campaigns: group.length };
       if (family === "app") {
         drafts.push({
@@ -610,7 +616,7 @@ function breakdownRule(id: "engagement.placement_cost" | "engagement.audience_co
   const singleFamily = (ctx: RuleContext) => {
     const families = new Set(ctx.campaigns.filter(delivered).map((campaign) => ctx.classify(campaign).goal));
     const [family] = [...families];
-    return families.size === 1 && RESULT[family] ? family : null;
+    return families.size === 1 && META_RESULT[family] ? family : null;
   };
   return {
     id,
@@ -626,7 +632,7 @@ function breakdownRule(id: "engagement.placement_cost" | "engagement.audience_co
       const section = diagnosticsSection(ctx, sectionName);
       const family = singleFamily(ctx);
       if (section?.status !== "ok" || !family) return [];
-      const metric = RESULT[family]!.metric;
+      const metric = META_RESULT[family]!.metric;
       const rows = section.rows.map((row) => ({ label: describe(row), spend: Number(row.spend ?? 0), result: resultFromRow(row, metric) }));
       if (rows.some((row) => row.result === null)) return [];
       const spend = rows.reduce((sum, row) => sum + row.spend, 0);
@@ -640,8 +646,8 @@ function breakdownRule(id: "engagement.placement_cost" | "engagement.audience_co
         severity: "low",
         basis: "indicative",
         scoringGroup: id,
-        title: `${row.label} takes ${formatPercent(row.spend / spend, 0)} of spend at ${row.result === 0 ? "no" : `${formatMultiple(row.spend / (row.result as number) / average, 1)} the average`} cost per ${RESULT[family]!.label.replace(/s$/, "")}`,
-        description: `${money(ctx, row.spend)} produced ${formatNumber(row.result, 0)} ${RESULT[family]!.label}; the account average is ${money(ctx, average)} per result. Meta's delivery may still value this ${what} for reach or assisted results.`,
+        title: `${row.label} takes ${formatPercent(row.spend / spend, 0)} of spend at ${row.result === 0 ? "no" : `${formatMultiple(row.spend / (row.result as number) / average, 1)} the average`} cost per ${META_RESULT[family]!.label.replace(/s$/, "")}`,
+        description: `${money(ctx, row.spend)} produced ${formatNumber(row.result, 0)} ${META_RESULT[family]!.label}; the account average is ${money(ctx, average)} per result. Meta's delivery may still value this ${what} for reach or assisted results.`,
         recommendation: what === "placement"
           ? "Review creative fit for this placement (format and aspect ratio) before excluding it; exclusions can raise costs elsewhere."
           : "Check whether this audience segment fits the offer; adjust creative or exclude it only if the gap persists.",
@@ -772,7 +778,7 @@ function trendGroups(ctx: RuleContext) {
   for (const family of ["sales", "leads", "app"]) {
     const campaigns = ctx.campaigns.filter((campaign) => ctx.classify(campaign).goal === family);
     if (campaigns.length === 0) continue;
-    const metric = RESULT[family]!.metric;
+    const metric = META_RESULT[family]!.metric;
     const halves = groupHalves(ctx, new Set(campaigns.map((campaign) => campaign.id)), (row) => ({
       cost: row.spend,
       result: row.platformMetrics && typeof row.platformMetrics[metric] === "number" ? row.platformMetrics[metric] : null,
@@ -799,7 +805,7 @@ const costTrend: Rule = {
       const before = halves.first.cost / (halves.first.result as number);
       const after = halves.second.cost / (halves.second.result as number);
       if (after < before * (1 + T.trendCostRise)) return [];
-      const label = RESULT[family]!.label;
+      const label = META_RESULT[family]!.label;
       return [{
         ruleId: "trend.cpa_rising",
         category: "trend",
