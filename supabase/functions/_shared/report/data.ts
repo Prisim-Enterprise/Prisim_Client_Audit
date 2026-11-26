@@ -67,6 +67,17 @@ function scoreStatus(run: AuditRunRow): "scored" | "provisional" | "unscored" {
   return run.overall_score === null ? "unscored" : "scored";
 }
 
+function platformScoring(scoring: Record<string, unknown> | null) {
+  const platforms = (scoring?.platforms ?? null) as Record<string, Record<string, unknown>> | null;
+  if (!platforms) return undefined;
+  return (["google", "meta"] as const).flatMap((provider) => {
+    const item = platforms[provider];
+    if (!item) return [];
+    const status = item.status === "provisional" || item.status === "unscored" ? item.status : "scored";
+    return [{ provider, score: typeof item.score === "number" ? item.score : null, status: status as "scored" | "provisional" | "unscored", reason: typeof item.reason === "string" ? item.reason : null }];
+  });
+}
+
 function numberRecord(value: Record<string, number | string> | null | undefined): Record<string, number> {
   return Object.fromEntries(Object.entries(value ?? {}).map(([key, item]) => [key, num(item)]));
 }
@@ -118,6 +129,8 @@ export function toReportData(options: {
     lastSuccessfulSync: typeof run.kpis.lastSuccessfulSync === "string" ? run.kpis.lastSuccessfulSync : null,
     limitations: Array.isArray(run.kpis.limitations) ? (run.kpis.limitations as unknown[]).filter((item): item is string => typeof item === "string") : [],
     scoringMethod: typeof scoring?.method === "string" ? scoring.method : null,
+    platformScoring: platformScoring(scoring),
+    platformCategoryScores: (run.kpis.platformCategoryScores ?? undefined) as Record<string, Record<string, number>> | undefined,
     synthetic: options.synthetic,
     findings: [...options.findings]
       .sort((a, b) => a.sort_order - b.sort_order)

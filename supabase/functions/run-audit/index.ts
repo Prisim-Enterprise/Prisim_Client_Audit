@@ -7,6 +7,7 @@ import { runAudit } from "../_shared/audit/engine.ts";
 import {
   type AccountRow,
   buildAuditInput,
+  type CampaignDailyMetricRow,
   type CampaignDetailsRow,
   type CampaignPerformanceRow,
   type DailyPerformanceRow,
@@ -17,7 +18,7 @@ import type { BusinessTarget } from "../_shared/audit/types.ts";
 import { toSaveAuditPayload } from "../_shared/audit/payload.ts";
 import { daysBetweenInclusive } from "../_shared/format.ts";
 import { bearerToken, HttpError, isIsoDate, isUuid, json, readBody, withHttp } from "../_shared/http.ts";
-import { fetchAllRows } from "../_shared/paging.ts";
+import { fetchAllRows, TruncatedResultError } from "../_shared/paging.ts";
 import { readServerConfig, requirePlatformAdmin, requireUser, userClient } from "../_shared/supabase.ts";
 
 async function handle(request: Request, origin: string): Promise<Response> {
@@ -50,19 +51,26 @@ async function handle(request: Request, origin: string): Promise<Response> {
     : all;
   if (accounts.length === 0) throw new HttpError(422, "no_ad_accounts");
 
-  const campaigns = await fetchAllRows<CampaignPerformanceRow>(() =>
-    client.rpc("get_campaign_performance", { p_tenant_id: tenantId, p_from: periodStart, p_to: periodEnd })
-  );
-  const daily = await fetchAllRows<DailyPerformanceRow>(() =>
-    client.rpc("get_daily_performance", { p_tenant_id: tenantId, p_from: periodStart, p_to: periodEnd })
-  );
+  let campaigns: CampaignPerformanceRow[];
+  let daily: DailyPerformanceRow[];
+  try {
+    campaigns = await fetchAllRows<CampaignPerformanceRow>(() =>
+      client.rpc("get_campaign_performance", { p_tenant_id: tenantId, p_from: periodStart, p_to: periodEnd })
+    );
+    daily = await fetchAllRows<DailyPerformanceRow>(() =>
+      client.rpc("get_daily_performance", { p_tenant_id: tenantId, p_from: periodStart, p_to: periodEnd })
+    );
+  } catch (error) {
+    if (error instanceof TruncatedResultError) throw new HttpError(422, "too_much_data");
+    throw new HttpError(500, "data_unavailable");
+  }
 
   const accountIds = accounts.map((account) => account.id);
   // Sync records decide which days were actually retrieved. A job can cover
   // period days only if it completed on or after the period start.
   const { data: jobs, error: jobsError } = await client
     .from("sync_jobs")
-    .select("id, connection_id, job_type, status, completed_at, error_message, stats")
+    .select("id, connection_id, job_type, status, started_at, completed_at, error_message, stats")
     .eq("tenant_id", tenantId)
     .in("status", ["completed", "failed"])
     .gte("completed_at", `${periodStart}T00:00:00Z`)
@@ -83,6 +91,30 @@ async function handle(request: Request, origin: string): Promise<Response> {
     .select("ad_account_id, provider, window_start, window_end, captured_at, payload")
     .in("ad_account_id", accountIds);
 
+  // Campaign/day rows: per-type trends and Meta link clicks / results per
+  // objective. Fails loudly instead of truncating (fetchAllRows). Without the
+  // platform_metrics column (migration not applied) the rows are read without
+  // it and Meta result checks are reported as unavailable.
+  const campaignDailyColumns = "campaign_id, ad_account_id, metric_date, impressions, reach, clicks, spend, conversions, conversion_value";
+  const readCampaignDaily = (columns: string) =>
+    fetchAllRows<CampaignDailyMetricRow>(() =>
+      client
+        .from("daily_metrics")
+        .select(columns)
+        .in("ad_account_id", accountIds)
+        .not("campaign_id", "is", null)
+        .gte("metric_date", periodStart)
+        .lte("metric_date", periodEnd)
+        .order("metric_date")
+        .order("campaign_id") as never, 1000, 200_000);
+  let campaignDaily: CampaignDailyMetricRow[];
+  try {
+    campaignDaily = await readCampaignDaily(`${campaignDailyColumns}, platform_metrics`);
+  } catch (error) {
+    if (error instanceof TruncatedResultError) throw new HttpError(422, "too_much_data");
+    campaignDaily = await readCampaignDaily(campaignDailyColumns);
+  }
+
   const input = buildAuditInput({
     tenantName: tenant.business_name,
     periodStart,
@@ -91,6 +123,7 @@ async function handle(request: Request, origin: string): Promise<Response> {
     campaigns,
     daily,
     campaignDetails: detailsError ? undefined : (details ?? []) as CampaignDetailsRow[],
+    campaignDaily,
     syncJobs: (jobs ?? []) as SyncJobRow[],
     diagnostics: diagnosticsError ? undefined : (diagnostics ?? []) as DiagnosticsRow[],
     targets: parseTargets(body.targets, accountIds),

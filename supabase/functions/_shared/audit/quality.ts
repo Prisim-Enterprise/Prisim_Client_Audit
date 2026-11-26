@@ -63,7 +63,7 @@ export type AccountQuality = {
   account: AuditAccount;
   coverage: AccountCoverage;
   /** Per-date state for the audit period. */
-  days: Map<string, "rows" | "zero" | "rows_unverified" | "missing">;
+  days: Map<string, "rows" | "zero" | "unverified" | "rows_unverified" | "missing">;
   issues: DataIssue[];
   confidence: number;
   level: ConfidenceLevel;
@@ -195,22 +195,32 @@ export function assessAccount(input: AuditInput, account: AuditAccount, generate
   const runs = input.syncRuns?.filter((run) => run.adAccountId === account.id) ?? null;
   const successes = (runs ?? []).filter((run) => run.status === "succeeded" && run.since && run.until);
   const retrieved = new Set<string>();
+  const zeroProven = new Set<string>();
   for (const run of successes) {
-    for (const date of dates) if (date >= run.since! && date <= run.until!) retrieved.add(date);
+    for (const date of dates) {
+      if (date < run.since! || date > run.until!) continue;
+      retrieved.add(date);
+      if (run.zeroDaysVerified) zeroProven.add(date);
+    }
   }
-  const basis: CoverageBasis = runs === null
+  // Coverage basis: no successful run means only the rows themselves are known.
+  const basis: CoverageBasis = runs === null || successes.length === 0
     ? "rows_only"
-    : successes.length > 0 && successes.every((run) => run.legacy)
+    : successes.every((run) => run.legacy)
     ? "legacy_sync_record"
     : "sync_record";
 
-  const days = new Map<string, "rows" | "zero" | "rows_unverified" | "missing">();
+  // A day without rows is zero delivery only when a run proved it (complete
+  // pagination, all rows stored, account totals reconciled). Otherwise it is
+  // unknown: never zero.
+  const days = new Map<string, "rows" | "zero" | "unverified" | "rows_unverified" | "missing">();
   for (const date of dates) {
     const hasRow = byDate.has(date);
-    if (retrieved.has(date)) days.set(date, hasRow ? "rows" : "zero");
+    if (retrieved.has(date)) days.set(date, hasRow ? "rows" : zeroProven.has(date) ? "zero" : "unverified");
     else days.set(date, hasRow ? "rows_unverified" : "missing");
   }
   const missing = dates.filter((date) => days.get(date) === "missing");
+  const unverified = dates.filter((date) => days.get(date) === "unverified");
   const zero = dates.filter((date) => days.get(date) === "zero");
   const sortedSuccess = [...successes].sort((a, b) => (b.completedAt ?? "").localeCompare(a.completedAt ?? ""));
   const lastSuccess = sortedSuccess[0] ?? null;
@@ -222,8 +232,9 @@ export function assessAccount(input: AuditInput, account: AuditAccount, generate
     retrievedDays: retrieved.size,
     daysWithRows: daily.length,
     zeroDeliveryDays: zero.length,
+    unverifiedDays: unverified.length,
     missingDays: missing.length,
-    coverageRatio: periodDays > 0 ? round((periodDays - missing.length) / periodDays, 4) : 0,
+    coverageRatio: periodDays > 0 ? round((periodDays - missing.length - unverified.length) / periodDays, 4) : 0,
     basis,
     missingRanges: toRanges(missing).slice(0, 12),
     lastSuccessfulSync,
@@ -252,12 +263,43 @@ export function assessAccount(input: AuditInput, account: AuditAccount, generate
       { missing_days: missing.length, period_days: periodDays },
     ));
   }
+  if (unverified.length > 0) {
+    const ratio = unverified.length / Math.max(periodDays, 1);
+    issues.push(issue(
+      "zero_delivery_unverified",
+      ratio > 0.5 ? "blocking" : ratio > 0.1 ? "major" : "minor",
+      account,
+      `${unverified.length} retrieved day(s) have no metric rows, but the sync could not prove that nothing was delivered on them ` +
+        "(no reconciled account totals for that sync). They are treated as unknown, not as zero.",
+      { unverified_days: unverified.length, period_days: periodDays },
+    ));
+  }
+  const unresolved = Math.max(0, ...successes.map((run) => run.unresolvedCampaigns ?? 0));
+  if (unresolved > 0) {
+    issues.push(issue(
+      "unresolved_campaigns",
+      "minor",
+      account,
+      `${unresolved} campaign(s) had metrics but are no longer listed by the platform; their metrics are kept under a placeholder name.`,
+      { campaigns: unresolved },
+    ));
+  }
+  const unreconciled = successes.filter((run) => run.reconciliation === "mismatch");
+  if (unreconciled.length > 0) {
+    issues.push(issue(
+      "rows_not_reconciled",
+      "major",
+      account,
+      "The platform's account totals for a synced window differ from the stored campaign rows, so some delivery may be missing from the campaign data.",
+      { windows: unreconciled.length },
+    ));
+  }
   if (basis === "legacy_sync_record") {
     issues.push(issue(
       "legacy_sync_record",
       "minor",
       account,
-      "Coverage is inferred from sync jobs recorded before per-account results existed (the job completed with no failed accounts). Re-sync to record a per-account result.",
+      "Coverage comes from a sync job recorded before per-account results existed (the job stored this account and no account failed). Days without rows cannot be proven to have had no delivery; re-sync to record a verified result.",
     ));
   }
 
@@ -353,7 +395,7 @@ export function summarizeQuality(input: AuditInput, accounts: AccountQuality[], 
       : c.basis === "legacy_sync_record"
       ? "job-level sync records (inferred)"
       : "metric rows only (no sync records)";
-    return `${item.account.name}: ${c.periodDays - c.missingDays}/${c.periodDays} days known (${c.daysWithRows} with delivery rows, ${c.zeroDeliveryDays} retrieved with no delivery, ${c.missingDays} missing) from ${basis}`;
+    return `${item.account.name}: ${c.periodDays - c.missingDays - c.unverifiedDays}/${c.periodDays} days known (${c.daysWithRows} with delivery rows, ${c.zeroDeliveryDays} proven to have no delivery, ${c.unverifiedDays} retrieved but unverified, ${c.missingDays} missing) from ${basis}`;
   });
   return {
     confidence,

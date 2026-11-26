@@ -99,9 +99,11 @@ describe("Meta provider", () => {
       })],
     ]);
     const rows = await createMetaProvider(config, fetcher).fetchMetrics("token", account, "2026-10-01", "2026-10-02");
+    // Engine 2.1 also stores per-family results (leads are not merged with purchases) in platform_metrics.
+    const families = { purchases: 0, leads: 0, registrations: 0, app_installs: 0, landing_page_views: 0, purchase_value: 0 };
     expect(rows).toEqual([
-      { external_campaign_id: "c1", date: "2026-10-01", impressions: 1000, reach: 800, clicks: 20, spend: 12.34, conversions: 2, conversion_value: 0 },
-      { external_campaign_id: "c2", date: "2026-10-02", impressions: 50, reach: 0, clicks: 2, spend: 1.5, conversions: 0, conversion_value: 0 },
+      { external_campaign_id: "c1", date: "2026-10-01", impressions: 1000, reach: 800, clicks: 20, spend: 12.34, conversions: 2, conversion_value: 0, platform_metrics: { ...families, leads: 2 } },
+      { external_campaign_id: "c2", date: "2026-10-02", impressions: 50, reach: 0, clicks: 2, spend: 1.5, conversions: 0, conversion_value: 0, platform_metrics: families },
     ]);
   });
 

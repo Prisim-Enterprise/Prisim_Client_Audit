@@ -13,6 +13,7 @@ import type {
   AuditDailyRow,
   AuditInput,
   CampaignContext,
+  CampaignDailyRow,
   SyncRunRecord,
 } from "@functions/_shared/audit/types.ts";
 import { addDays } from "@functions/_shared/format.ts";
@@ -40,12 +41,30 @@ function dates() {
   return Array.from({ length: DAYS }, (_, index) => addDays(START, index));
 }
 
-/** Builds consistent campaigns + account daily rows from per-day campaign metrics. */
+/** Meta platform metrics derived from a synthetic day (link clicks = clicks; result by objective = conversions). */
+function metaMetrics(objective: string | null, metrics: { clicks: number; conversions: number; conversionValue: number }, noLinks = false): Record<string, number> {
+  const family = (objective ?? "").toUpperCase();
+  const result: Record<string, number> = {
+    purchases: family.includes("SALES") ? metrics.conversions : 0,
+    leads: family.includes("LEADS") ? metrics.conversions : 0,
+    registrations: 0,
+    app_installs: family.includes("APP") ? metrics.conversions : 0,
+    landing_page_views: 0,
+    purchase_value: family.includes("SALES") ? metrics.conversionValue : 0,
+  };
+  if (!noLinks) result.link_clicks = metrics.clicks;
+  return result;
+}
+
+/** Builds consistent campaigns, campaign/day rows and account daily rows from per-day campaign metrics. */
 function build(account: AuditAccount, specs: CampaignSpec[]) {
   const campaigns: AuditCampaign[] = [];
+  const campaignDaily: CampaignDailyRow[] = [];
   const daily = new Map<string, AuditDailyRow>();
   for (const spec of specs) {
     const totals = { impressions: 0, reach: 0, clicks: 0, spend: 0, conversions: 0, conversionValue: 0, activeDays: 0 };
+    const objective = spec.objective !== undefined ? spec.objective : account.provider === "meta" ? "OUTCOME_SALES" : "SEARCH";
+    const platform: Record<string, number> = {};
     dates().forEach((date, index) => {
       const value = spec.day ? spec.day(index) : DEFAULT_DAY;
       if (!value) return;
@@ -55,9 +74,13 @@ function build(account: AuditAccount, specs: CampaignSpec[]) {
       const row = daily.get(date) ?? { date, adAccountId: account.id, impressions: 0, reach: 0, clicks: 0, spend: 0, conversions: 0, conversionValue: 0, currency: account.currency };
       for (const key of ["impressions", "reach", "clicks", "spend", "conversions", "conversionValue"] as const) row[key] += metrics[key];
       daily.set(date, row);
+      const platformMetrics = account.provider === "meta" ? metaMetrics(objective, metrics) : null;
+      for (const [key, item] of Object.entries(platformMetrics ?? {})) platform[key] = (platform[key] ?? 0) + item;
+      campaignDaily.push({ campaignId: spec.id, adAccountId: account.id, date, ...metrics, platformMetrics });
     });
     const { day: _day, ...rest } = spec;
     campaigns.push({
+      platformMetrics: account.provider === "meta" ? { ...metaMetrics(objective, { clicks: 0, conversions: 0, conversionValue: 0 }), ...platform } : undefined,
       adAccountId: account.id,
       provider: account.provider,
       name: spec.id,
@@ -73,7 +96,7 @@ function build(account: AuditAccount, specs: CampaignSpec[]) {
       ...rest,
     });
   }
-  return { campaigns, daily: [...daily.values()] };
+  return { campaigns, daily: [...daily.values()], campaignDaily };
 }
 
 function syncRun(adAccountId: string, overrides: Partial<SyncRunRecord> = {}): SyncRunRecord {
@@ -89,6 +112,9 @@ function syncRun(adAccountId: string, overrides: Partial<SyncRunRecord> = {}): S
     unavailableFields: [],
     error: null,
     legacy: false,
+    // A sync 2.1 run: complete pagination, all rows stored, totals reconciled.
+    zeroDaysVerified: true,
+    reconciliation: "matched",
     ...overrides,
   };
 }
@@ -119,6 +145,7 @@ function audit(options: {
     accounts: built.map((item) => item.account),
     campaigns: built.flatMap((item) => item.campaigns),
     daily: built.flatMap((item) => item.daily),
+    campaignDaily: built.flatMap((item) => item.campaignDaily),
     syncRuns: options.noSync ? undefined : options.syncRuns ?? built.map((item) => syncRun(item.account.id)),
     diagnostics: options.diagnostics,
     generatedAt: GENERATED,
@@ -165,11 +192,11 @@ describe("Cleanwell regression", () => {
     expect(campaign?.basis).toBe("indicative");
     expect(campaign?.evidence.unavailable).toContain("campaign start and end dates");
     expect(campaign?.evidence.observed).toMatchObject({ daily_budget: 700, status_at_sync: "ENABLED" });
-    expect(result.summary).toContain("No account health score was calculated");
+    expect(result.summary).toContain("Google Ads: no score was calculated");
     expect(result.summary).not.toMatch(/\d+\/100 \(strong/);
   });
 
-  it("A (production record shape): a legacy job-level sync record gives inferred coverage, still unscored", () => {
+  it("A (production record shape): a legacy job record proves the account was stored, but not that missing days had no delivery", () => {
     const input = buildAuditInput({
       tenantName: "Cleanwell Solutions",
       periodStart: START,
@@ -182,17 +209,35 @@ describe("Cleanwell regression", () => {
       }],
       daily: [],
       syncJobs: [{
-        id: "job", connection_id: "30e0849a", job_type: "manual_sync", status: "completed", completed_at: "2026-11-25T11:35:23.304024+00:00", error_message: null,
+        id: "job", connection_id: "30e0849a", job_type: "manual_sync", status: "completed",
+        started_at: "2026-11-25T11:35:21.954984+00:00", completed_at: "2026-11-25T11:35:23.304024+00:00", error_message: null,
         stats: { accounts: 1, campaigns: 1, errors: null, failed_accounts: 0, metrics: 0, window: { since: "2026-08-27", until: "2026-11-24" } },
       }],
       generatedAt: GENERATED,
     });
     const result = runAudit(input);
     expect(result.overallScore).toBeNull();
-    expect(result.kpis.accounts[0].coverage?.basis).toBe("legacy_sync_record");
-    expect(ids(result)).toContain("data_quality.legacy_sync_record");
-    expect(ids(result)).toContain("structure.no_account_delivery");
+    // last_synced_at (11:35:23.000) lies inside the job run, so the account was stored by it ...
+    expect(result.kpis.accounts[0].coverage).toMatchObject({ basis: "legacy_sync_record", retrievedDays: 30, zeroDeliveryDays: 0, unverifiedDays: 30 });
+    // ... but pagination and totals were not recorded, so the empty days are unknown, not zero.
+    expect(ids(result)).toEqual(expect.arrayContaining(["data_quality.legacy_sync_record", "data_quality.zero_delivery_unverified"]));
+    expect(ids(result)).not.toContain("structure.no_account_delivery");
     expect(result.kpis.campaigns?.[0]).toMatchObject({ kind: "app", goal: "app", dailyBudget: 700 });
+  });
+
+  it("D5: a legacy job that cannot be shown to have stored the account proves nothing", () => {
+    const input = buildAuditInput({
+      tenantName: "Cleanwell Solutions", periodStart: START, periodEnd: END,
+      // last synced an hour after the job finished: this job did not store it
+      accounts: [{ id: CLEANWELL, provider: "google", account_name: "Cleanwell Solutions", external_account_id: "9574280792", currency: "INR", connection_id: "30e0849a", last_synced_at: "2026-11-25T12:40:00Z" }],
+      campaigns: [],
+      daily: [],
+      syncJobs: [{ id: "job", connection_id: "30e0849a", job_type: "manual_sync", status: "completed", started_at: "2026-11-25T11:35:21Z", completed_at: "2026-11-25T11:35:23Z", error_message: null, stats: { failed_accounts: 0, window: { since: "2026-08-27", until: "2026-11-24" } } }],
+      generatedAt: GENERATED,
+    });
+    expect(input.syncRuns).toEqual([]);
+    const result = runAudit(input);
+    expect(result.kpis.accounts[0].coverage).toMatchObject({ retrievedDays: 0, missingDays: 30, basis: "rows_only" });
   });
 
   it("B: missing reporting data is never treated as zero performance", () => {
@@ -228,8 +273,12 @@ describe("Cleanwell regression", () => {
     const google = result.kpis.accounts.find((item) => item.adAccountId === CLEANWELL)!;
     expect(meta.scoreStatus).not.toBe("unscored");
     expect(google.scoreStatus).toBe("unscored");
+    // Platforms are scored separately: no combined number.
+    expect(result.overallScore).toBeNull();
     expect(result.scoreStatus).toBe("provisional");
-    expect(result.kpis.scoring?.reason).toContain("1 of 2 account(s) could not be scored");
+    expect(result.kpis.scoring?.platforms.google?.status).toBe("unscored");
+    expect(result.kpis.scoring?.platforms.meta?.status).toBe("scored");
+    expect(result.kpis.scoring?.reason).toContain("scored separately");
     expect(result.platformScores.google).toBeUndefined();
     expect(result.platformScores.meta).toBeDefined();
   });
@@ -407,7 +456,7 @@ describe("scoring", () => {
     const categories = result.kpis.scoring!.accounts[0].categories;
     expect(categories.tracking.status).toBe("not_assessed");
     expect(categories.efficiency.status).toBe("not_assessed");
-    expect(categories.tracking.reason).toMatch(/fewer than 100 clicks/);
+    expect(categories.tracking.reason).toMatch(/fewer than 100 link clicks/);
     expect(result.kpis.scoring?.reason).toMatch(/Too few checks/);
   });
 
@@ -423,10 +472,10 @@ describe("scoring", () => {
   });
 
   it("does not double count: the account ROAS finding is superseded by campaign ROAS findings", () => {
-    const { result } = audit({ accounts: [{ account: metaAccount, campaigns: [
-      { id: "m1", day: () => ({ conversionValue: 200 }) },
-      { id: "m2", day: () => ({ conversionValue: 200 }) },
-      { id: "m3", day: () => ({ conversionValue: 200 }) },
+    const { result } = audit({ accounts: [{ account: googleAccount, campaigns: [
+      { id: "g1", bidStrategy: "TARGET_ROAS", day: () => ({ conversionValue: 200 }) },
+      { id: "g2", bidStrategy: "TARGET_ROAS", day: () => ({ conversionValue: 200 }) },
+      { id: "g3", bidStrategy: "TARGET_ROAS", day: () => ({ conversionValue: 200 }) },
     ] }] });
     expect(ids(result)).toEqual(expect.arrayContaining(["efficiency.low_roas_campaign", "efficiency.account_roas"]));
     const penalties = result.kpis.scoring!.accounts[0].categories.efficiency.penalties.map((item) => item.ruleId);
@@ -438,7 +487,7 @@ describe("scoring", () => {
     const { result } = audit({ overrides: { targets: [{ adAccountId: META, targetCpa: 50 }] } });
     const finding = find(result, "efficiency.high_cpa_campaign");
     expect(finding?.basis).toBe("target");
-    expect(finding?.evidence.reference).toContain("business target CPA");
+    expect(finding?.evidence.reference).toMatch(/business target (CPA|cost per result)/);
     expect(finding?.estimateLabel).toContain("estimate");
   });
 
@@ -479,7 +528,11 @@ describe("zero conversions and conversion value", () => {
 
   it("is not raised for awareness campaigns, Meta app campaigns or small samples", () => {
     expect(ids(audit({ accounts: [{ account: googleAccount, campaigns: noConversions({ bidStrategy: "TARGET_CPM", channelType: "VIDEO", objective: "VIDEO" }) }] }).result)).not.toContain("tracking.no_conversions");
-    expect(ids(audit({ accounts: [{ account: metaAccount, campaigns: noConversions({ objective: "OUTCOME_APP_PROMOTION" }) }] }).result)).not.toContain("tracking.no_conversions");
+    // Meta app promotion is judged on app installs (engine 2.1) and never called a pixel problem.
+    const app = find(audit({ accounts: [{ account: metaAccount, campaigns: noConversions({ objective: "OUTCOME_APP_PROMOTION" }) }] }).result, "tracking.no_conversions");
+    expect(app).toMatchObject({ basis: "indicative", title: expect.stringMatching(/No app installs/) });
+    expect(app?.evidence.unavailable).toContain("app event (SDK/MMP) diagnostics");
+    expect(ids(audit({ accounts: [{ account: metaAccount, campaigns: noConversions({ objective: "OUTCOME_AWARENESS" }) }] }).result)).not.toContain("tracking.no_conversions");
     expect(ids(audit({ accounts: [{ account: googleAccount, campaigns: [{ id: "g1", day: (index) => (index === 0 ? { clicks: 50, conversions: 0 } : null) }] }] }).result)).not.toContain("tracking.no_conversions");
   });
 
@@ -623,16 +676,16 @@ describe("Meta", () => {
 
   it("CTR comparisons use same-type peers by default and label sourced benchmarks", () => {
     const peers = audit({ accounts: [{ account: metaAccount, campaigns: [{ id: "m1", day: () => ({ clicks: 4 }) }, { id: "m2" }, { id: "m3" }] }] }).result;
-    expect(find(peers, "engagement.low_ctr")).toMatchObject({ campaignId: "m1", basis: "indicative" });
-    const sourced = audit({ overrides: { benchmarks: [{ metric: "ctr", provider: "meta", kind: "meta", value: 0.05, source: "Example 2026 study", applicability: "Meta feed, India" }] } }).result;
-    expect(find(sourced, "engagement.low_ctr")).toMatchObject({ basis: "benchmark" });
+    expect(find(peers, "engagement.low_link_ctr")).toMatchObject({ campaignId: "m1", basis: "indicative" });
+    const sourced = audit({ overrides: { benchmarks: [{ metric: "ctr", provider: "meta", kind: "sales", value: 0.05, source: "Example 2026 study", applicability: "Meta feed, India" }] } }).result;
+    expect(find(sourced, "engagement.low_link_ctr")).toMatchObject({ basis: "benchmark" });
   });
 });
 
 describe("trends", () => {
   it("compares equal halves of known days only", () => {
     const rising = audit({ accounts: [{ account: metaAccount, campaigns: ["m1", "m2", "m3"].map((id) => ({ id, day: (index: number) => ({ conversions: index < 15 ? 4 : 2, conversionValue: 1600 }) })) }] }).result;
-    expect(find(rising, "trend.cpa_rising")?.evidence.observed).toMatchObject({ cpa_first_half: 100, cpa_second_half: 200 });
+    expect(find(rising, "trend.cpa_rising")?.evidence.observed).toMatchObject({ cost_per_purchases_first_half: 100, cost_per_purchases_second_half: 200 });
     // A half with missing days is not compared.
     const gap = audit({
       syncRuns: [syncRun(META, { since: "2026-11-05", until: END })],
@@ -657,7 +710,8 @@ describe("multiple accounts and providers", () => {
       ],
     });
     const scores = result.kpis.accounts.map((item) => item.score as number);
-    expect(result.overallScore).toBeCloseTo((scores[0] + scores[1]) / 2, 0);
+    // Engine 2.1: never an average of Google and Meta.
+    expect(result.overallScore).toBeNull();
     expect(result.platformScores.meta).toBe(scores[0]);
     expect(result.platformScores.google).toBe(scores[1]);
     expect(result.kpis.dataQuality?.accounts).toHaveLength(2);
@@ -706,10 +760,10 @@ describe("scoring scenarios", () => {
       { finding: synthetic("engagement.c", "engagement", "low"), spendShare: null },
       { finding: synthetic("budget.d", "budget", "low"), spendShare: null },
     ]);
-    expect(serious.overall).toBe(90.9); // 100 - 0.26 x 35
+    expect(serious.overall).toBe(91.3); // 100 - 0.25 x 35 (Google tracking weight)
     expect(several.overall).toBeCloseTo(96.8, 1);
     expect(serious.overall!).toBeLessThan(several.overall!);
-    // Weakness reported by the review: one verified critical issue still leaves "Strong".
+    // The weighted average alone would still read "Strong"; the account score is capped (see the caps test).
     expect(scoreLabel(serious.overall!)).toBe("Strong");
   });
 
@@ -732,9 +786,10 @@ describe("scoring scenarios", () => {
     const zero = (objective: string) => audit({ accounts: [{ account: metaAccount, campaigns: [{ id: "m1", objective, day: () => ({ conversions: 0 }) }, { id: "m2", objective, day: () => ({ conversions: 0 }) }] }] }).result;
     expect(ids(zero("OUTCOME_LEADS"))).toContain("tracking.no_conversions");
     expect(ids(zero("OUTCOME_SALES"))).toContain("tracking.no_conversions");
-    for (const objective of ["OUTCOME_AWARENESS", "OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT", "OUTCOME_APP_PROMOTION"]) {
+    for (const objective of ["OUTCOME_AWARENESS", "OUTCOME_TRAFFIC", "OUTCOME_ENGAGEMENT"]) {
       expect(ids(zero(objective))).not.toContain("tracking.no_conversions");
     }
+    expect(find(zero("OUTCOME_APP_PROMOTION"), "tracking.no_conversions")?.title).toMatch(/No app installs/);
   });
 
   it("a single assessable category does not produce a score", () => {
@@ -752,8 +807,10 @@ describe("scoring scenarios", () => {
     expect(result.kpis.totals).toBeNull();
     expect(result.platformScores.meta).toBeDefined();
     expect(result.platformScores.google).toBeDefined();
-    // Weakness reported by the review: the overall score averages Meta and Google.
-    expect(result.overallScore).toBeCloseTo((result.platformScores.meta! + result.platformScores.google!) / 2, 0);
+    // Fixed in 2.1: no overall average across platforms.
+    expect(result.overallScore).toBeNull();
+    expect(result.kpis.platformTotals?.meta?.spend).toBeGreaterThan(0);
+    expect(result.kpis.platformTotals?.google?.spend).toBeGreaterThan(0);
   });
 
   it("account size: identical ratios at 10x the volume give the same score", () => {

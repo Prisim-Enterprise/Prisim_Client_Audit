@@ -86,6 +86,26 @@ export type AuditCampaign = {
   externalId?: string | null;
   currency?: string | null;
   details?: CampaignContext;
+  /**
+   * Platform-specific totals for the period (Meta: link_clicks, purchases,
+   * leads, registrations, app_installs, landing_page_views, purchase_value).
+   * null/undefined = not captured for every day with rows (unavailable).
+   */
+  platformMetrics?: Record<string, number> | null;
+};
+
+/** One campaign/day metric row (needed for per-campaign-type trends). */
+export type CampaignDailyRow = {
+  campaignId: string;
+  adAccountId: string;
+  date: string;
+  impressions: number;
+  reach: number;
+  clicks: number;
+  spend: number;
+  conversions: number;
+  conversionValue: number;
+  platformMetrics?: Record<string, number> | null;
 };
 
 export type AuditDailyRow = {
@@ -117,6 +137,17 @@ export type SyncRunRecord = {
   unavailableFields: string[];
   error: string | null;
   legacy: boolean;
+  /**
+   * True only when days without rows are proven to have had no delivery:
+   * every result page was read, every fetched row was stored, and the
+   * account totals for the window equal the summed rows. Legacy records and
+   * runs without that proof leave such days unknown.
+   */
+  zeroDaysVerified: boolean;
+  /** "mismatch" = account totals disagree with the stored rows (rows are incomplete). */
+  reconciliation: "matched" | "mismatch" | "unverified";
+  /** Campaigns with metrics that the platform no longer lists (stored as placeholders). */
+  unresolvedCampaigns?: number;
 };
 
 export type DiagnosticSectionInput =
@@ -137,7 +168,7 @@ export type AccountDiagnosticsInput = {
  * and bid strategy. "conversions" = optimizes for conversions of an unknown
  * type (e.g. Target CPA); "unknown" = cannot be derived.
  */
-export type CampaignGoal = "sales" | "leads" | "app" | "conversions" | "traffic" | "awareness";
+export type CampaignGoal = "sales" | "leads" | "app" | "conversions" | "traffic" | "awareness" | "engagement";
 
 /** Business targets supplied by PRISIM staff for an ad account (all optional). */
 export type BusinessTarget = {
@@ -176,6 +207,8 @@ export type AuditInput = {
   accounts: AuditAccount[];
   campaigns: AuditCampaign[];
   daily: AuditDailyRow[];
+  /** Campaign/day rows for the period (optional; enables per-type trends). */
+  campaignDaily?: CampaignDailyRow[];
   /** Sync outcomes. Undefined = unknown (coverage is then based on rows only). */
   syncRuns?: SyncRunRecord[];
   diagnostics?: AccountDiagnosticsInput[];
@@ -213,11 +246,13 @@ export type AccountCoverage = {
   retrievedDays: number;
   /** Days with at least one metric row. */
   daysWithRows: number;
-  /** Retrieved days without rows: the platform reported no delivery. */
+  /** Retrieved days without rows, proven to have had no delivery (see SyncRunRecord.zeroDaysVerified). */
   zeroDeliveryDays: number;
+  /** Retrieved days without rows where no delivery could not be proven: unknown. */
+  unverifiedDays: number;
   /** Days that were neither retrieved nor have rows: unknown, not zero. */
   missingDays: number;
-  /** (period days - missing days) / period days. */
+  /** (period days - missing days - unverified days) / period days. */
   coverageRatio: number;
   basis: CoverageBasis;
   missingRanges: string[];
@@ -238,6 +273,8 @@ export type AccountKpis = DerivedKpis & {
   /** Campaigns with impressions or spend in the period. */
   activeCampaignCount: number;
   coverage?: AccountCoverage;
+  /** Platform-specific KPIs (e.g. Meta link CTR, cost per lead). null = unavailable. */
+  platformKpis?: Record<string, number | null>;
   dataConfidence?: number;
   confidenceLevel?: ConfidenceLevel;
   score?: number | null;
@@ -255,6 +292,7 @@ export type CampaignKpis = DerivedKpis & {
   kind: string;
   goal: CampaignGoal | "unknown";
   dailyBudget: number | null;
+  platformKpis?: Record<string, number | null>;
 };
 
 export type FindingEvidence = {
@@ -307,19 +345,38 @@ export type CategoryAssessment = {
 
 export type AccountScoring = {
   adAccountId: string;
+  provider: Provider;
   status: ScoreStatus;
   score: number | null;
+  /** Weighted score before severity caps. */
+  uncappedScore: number | null;
+  /** A verified critical/high finding caps the score (see the platform's scoring config). */
+  cap: { limit: number; ruleId: string; severity: Severity } | null;
   reason: string;
   assessedWeight: number;
   categories: Record<ScoredCategory, CategoryAssessment>;
 };
 
-export type ScoringReport = {
+export type PlatformScore = {
   status: ScoreStatus;
+  score: number | null;
+  reason: string;
+  accounts: number;
+  scoredAccounts: number;
+  /** False when the scored accounts were assessed on different areas. */
+  comparable: boolean;
+  weights: Record<ScoredCategory, number>;
+  caps: Partial<Record<Severity, number>>;
+};
+
+export type ScoringReport = {
+  /** Status across platforms (worst of the platform statuses). */
+  status: ScoreStatus;
+  /** Only set when exactly one platform was audited; never a Google/Meta average. */
   overall: number | null;
   reason: string;
   method: string;
-  weights: Record<ScoredCategory, number>;
+  platforms: Partial<Record<Provider, PlatformScore>>;
   severityPenalties: Record<Severity, number>;
   accounts: AccountScoring[];
 };
@@ -353,8 +410,12 @@ export type AuditResult = {
     periodDays: number;
     dataDays: number;
     campaigns?: CampaignKpis[];
+    /** Totals per platform (single currency only). Google and Meta totals are never added together. */
+    platformTotals?: Partial<Record<Provider, DerivedKpis | null>>;
     dataQuality?: DataQualityReport;
     scoring?: ScoringReport;
+    /** Category scores per platform (categories of different platforms are not comparable). */
+    platformCategoryScores?: Partial<Record<Provider, Partial<Record<ScoredCategory, number>>>>;
     lastSuccessfulSync?: string | null;
     limitations?: string[];
     metricNotes?: string[];

@@ -3,7 +3,6 @@ import { useQuery } from "@tanstack/react-query";
 import { ArrowUpRight, ClipboardCheck, FileText, Link2, Target, Wallet } from "lucide-react";
 import { useMemo } from "react";
 import { Link } from "react-router-dom";
-import { ScoreRing } from "../../components/charts/ScoreRing";
 import { TrendChart } from "../../components/charts/TrendChart";
 import { ProviderBadge, SeverityBadge, StatusBadge } from "../../components/ui/Badge";
 import { Card } from "../../components/ui/Card";
@@ -13,6 +12,7 @@ import { useAuth } from "../../context/AuthProvider";
 import { currenciesOf, dailyTotals, formatDate, presetRange, relativeTime, totalsFromCampaigns } from "../../lib/analytics";
 import { queryKeys, useApi, useRealtime } from "../../lib/api/ApiProvider";
 import { useWorkspace } from "./workspace";
+import { PlatformScoreRings, ScoreStatusBanner } from "../../features/audits/AuditComponents";
 
 export function ClientDashboard() {
   const api = useApi();
@@ -96,15 +96,11 @@ export function ClientDashboard() {
             <EmptyState icon={<ClipboardCheck />} title="No audit published yet" description="Your PRISIM team reviews every audit before it appears here." />
           ) : (
             <div className="grid gap-6 p-5 sm:grid-cols-[auto_1fr] sm:p-6">
-              <ScoreRing score={latest.overall_score} size={120} status={latest.kpis?.score_status} />
+              <PlatformScoreRings run={latest} size={110} />
               <div className="min-w-0">
                 <p className="font-semibold text-ink-950">{latest.title}</p>
                 <p className="text-xs text-slate-500">{formatDate(latest.period_start)} – {formatDate(latest.period_end)}</p>
-                <div className="mt-2 flex gap-3">
-                  {(["meta", "google"] as const).filter((platform) => latest.platform_scores?.[platform] !== undefined).map((platform) => (
-                    <span key={platform} className="text-xs text-slate-600"><ProviderBadge provider={platform} />: <b>{Math.round(latest.platform_scores[platform] ?? 0)}</b></span>
-                  ))}
-                </div>
+                <div className="mt-3"><ScoreStatusBanner run={latest} /></div>
                 <ul className="mt-4 space-y-2">
                   {(findings.data ?? []).filter((finding) => finding.severity !== "info").slice(0, 4).map((finding) => (
                     <li key={finding.id} className="flex items-start gap-2 text-sm">

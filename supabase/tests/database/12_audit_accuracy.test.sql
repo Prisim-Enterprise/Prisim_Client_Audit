@@ -30,6 +30,9 @@ INSERT INTO public.sync_jobs (id, tenant_id, connection_id, provider, job_type, 
 SELECT has_column('public', 'campaigns', 'details', 'campaigns.details exists');
 SELECT col_not_null('public', 'campaigns', 'details', 'campaigns.details is NOT NULL');
 SELECT has_table('public', 'ad_account_diagnostics', 'ad_account_diagnostics exists');
+SELECT has_column('public', 'daily_metrics', 'platform_metrics', 'daily_metrics.platform_metrics exists');
+SELECT ok(has_column_privilege('authenticated', 'public.daily_metrics', 'platform_metrics', 'SELECT'), 'platform_metrics readable through RLS like other metric columns');
+SELECT ok(NOT has_column_privilege('authenticated', 'public.daily_metrics', 'source_payload', 'SELECT'), 'source_payload stays hidden');
 SELECT ok((SELECT relrowsecurity FROM pg_class WHERE oid = 'public.ad_account_diagnostics'::regclass), 'diagnostics table has RLS enabled');
 SELECT ok(NOT has_table_privilege('authenticated', 'public.ad_account_diagnostics', 'INSERT, UPDATE, DELETE'), 'authenticated cannot write diagnostics');
 SELECT ok(NOT has_function_privilege('authenticated', 'public.store_ad_account_diagnostics(uuid,uuid,jsonb)', 'EXECUTE'), 'authenticated cannot store diagnostics');
@@ -48,6 +51,23 @@ SELECT is(
     '2', 'ingest stores campaigns with and without details');
 SELECT is((SELECT details ->> 'primary_status' FROM public.campaigns WHERE external_campaign_id = '77'), 'NOT_ELIGIBLE', 'details stored');
 SELECT is((SELECT details FROM public.campaigns WHERE external_campaign_id = '78'), '{}'::JSONB, 'missing details stored as an empty object');
+
+-- platform_metrics and placeholder campaigns (metrics of campaigns the platform no longer lists)
+SELECT is(
+    public.ingest_ad_account_data(
+        'c0000000-0000-4000-8000-0000000000f1', 'c0000000-0000-4000-8000-0000000000aa',
+        '[{"external_id":"77","placeholder":true},{"external_id":"99","placeholder":true}]'::JSONB,
+        '[{"external_campaign_id":"77","date":"2026-11-01","impressions":10,"clicks":1,"spend":5,"platform_metrics":{"link_clicks":1,"leads":0}},
+          {"external_campaign_id":"99","date":"2026-11-01","impressions":20,"clicks":2,"spend":6}]'::JSONB) ->> 'metrics',
+    '2', 'metrics of unlisted campaigns are stored, not dropped');
+SELECT is((SELECT campaign_name FROM public.campaigns WHERE external_campaign_id = '77'), 'App', 'a placeholder does not overwrite a known campaign');
+SELECT is((SELECT campaign_status FROM public.campaigns WHERE external_campaign_id = '99'), 'UNKNOWN', 'a new placeholder campaign is created as UNKNOWN');
+SELECT is(
+    (SELECT platform_metrics ->> 'link_clicks' FROM public.daily_metrics m JOIN public.campaigns c ON c.id = m.campaign_id WHERE c.external_campaign_id = '77'),
+    '1', 'platform_metrics stored');
+SELECT ok(
+    (SELECT platform_metrics IS NULL FROM public.daily_metrics m JOIN public.campaigns c ON c.id = m.campaign_id WHERE c.external_campaign_id = '99'),
+    'absent platform_metrics stay NULL (not reported), not zero');
 
 SELECT lives_ok(
     $$ SELECT public.store_ad_account_diagnostics('c0000000-0000-4000-8000-0000000000f1', 'c0000000-0000-4000-8000-0000000000aa',

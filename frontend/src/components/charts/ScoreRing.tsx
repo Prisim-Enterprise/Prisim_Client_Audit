@@ -9,6 +9,18 @@ export function scoreTone(score: number) {
   return { stroke: "#be123c", text: "text-rose-700", Icon: AlertTriangle };
 }
 
+const STATUS_STYLE: Record<"scored" | "provisional" | "unscored", { label: string; className: string }> = {
+  scored: { label: "Final", className: "border-accent-200 bg-accent-50 text-accent-800" },
+  provisional: { label: "Provisional", className: "border-amber-300 bg-amber-100 text-amber-900" },
+  unscored: { label: "Not scored", className: "border-slate-200 bg-slate-100 text-slate-700" },
+};
+
+/** Final / Provisional / Not scored, always as text (never color only). */
+export function ScoreStatusBadge({ status, className }: { status: "scored" | "provisional" | "unscored"; className?: string }) {
+  const style = STATUS_STYLE[status];
+  return <span className={cn("inline-flex rounded-full border px-2 py-0.5 text-xs font-semibold uppercase tracking-wide", style.className, className)}>{style.label}</span>;
+}
+
 /**
  * Audit health score (0-100) with label + icon so the state is never color-only.
  * `status` "provisional" adds a visible qualifier; a null score reads "Not scored".
@@ -48,10 +60,14 @@ export function ScoreRing({
           )}
         </svg>
         <div className="absolute inset-0 flex flex-col items-center justify-center">
-          <span className="text-3xl font-semibold tracking-tight text-ink-950" style={{ fontSize: size / 4.2 }}>
-            {score === null ? "–" : Math.round(value)}
-          </span>
-          <span className="text-[11px] text-slate-400">/ 100</span>
+          {score === null ? (
+            <span className="px-2 text-center text-sm font-semibold leading-tight text-slate-500">Not scored</span>
+          ) : (
+            <>
+              <span className="text-3xl font-semibold tracking-tight text-ink-950" style={{ fontSize: size / 4.2 }}>{Math.round(value)}</span>
+              <span className="text-[11px] text-slate-400">/ 100</span>
+            </>
+          )}
         </div>
       </div>
       {showLabel && tone && (
@@ -59,12 +75,7 @@ export function ScoreRing({
           <tone.Icon aria-hidden="true" className="h-4 w-4" /> {scoreLabel(value)}
         </span>
       )}
-      {showLabel && tone && status === "provisional" && (
-        <span className="mt-1 rounded-full bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">Provisional</span>
-      )}
-      {showLabel && score === null && (
-        <span className="mt-2 text-sm font-medium text-slate-500">Not scored</span>
-      )}
+      {showLabel && <ScoreStatusBadge status={score === null ? "unscored" : status ?? "scored"} className="mt-1.5" />}
     </div>
   );
 }

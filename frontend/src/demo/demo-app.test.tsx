@@ -1,9 +1,13 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, configure, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DemoRoot } from "./DemoRoot";
 import { createDemoApi } from "./demo-api";
 import { DEMO_TENANT_IDS } from "./fixtures";
+
+// Lazy routes can take longer than the 1 s default to appear when the whole
+// suite runs in parallel; allow 5 s (the test-level timeouts stay unchanged).
+configure({ asyncUtilTimeout: 5000 });
 
 afterEach(cleanup);
 
@@ -34,7 +38,8 @@ describe("demo application", () => {
     await userEvent.click(screen.getAllByRole("link", { name: "Audits" })[0]);
     await userEvent.click(await screen.findByRole("link", { name: "Onboarding audit" }));
     expect(await screen.findByText(/Not visible to the client/)).toBeInTheDocument();
-    expect((await screen.findAllByText(/No conversions recorded/)).length).toBeGreaterThan(0);
+    // Meta lead campaigns are judged on leads (engine 2.1 wording is per objective).
+    expect((await screen.findAllByText(/No leads recorded/)).length).toBeGreaterThan(0);
   }, 20_000);
 
   it("shows the client owner their published audit and analytics", async () => {

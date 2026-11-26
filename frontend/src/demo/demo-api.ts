@@ -169,6 +169,29 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
       accounts: accounts.map((account) => ({ ...account })),
       campaigns: campaignPerformance(tenantId, range),
       daily: dailyPerformance(tenantId, range),
+      // Synthetic campaign/day rows. Meta link clicks and results per objective
+      // are derived from the synthetic clicks and conversions (demo only).
+      campaignDaily: state.metrics
+        .filter((row) => row.tenant_id === tenantId && row.metric_date >= periodStart && row.metric_date <= periodEnd)
+        .map((row) => {
+          const campaign = state.campaigns.find((item) => item.campaign_id === row.campaign_id);
+          const objective = (campaign?.objective ?? "").toUpperCase();
+          const meta = campaign?.provider === "meta";
+          return {
+            ...row,
+            platform_metrics: meta
+              ? {
+                link_clicks: Math.round(row.clicks * 0.7),
+                purchases: objective.includes("SALES") ? row.conversions : 0,
+                leads: objective.includes("LEADS") ? row.conversions : 0,
+                registrations: 0,
+                app_installs: objective.includes("APP") ? row.conversions : 0,
+                landing_page_views: Math.round(row.clicks * 0.5),
+                purchase_value: objective.includes("SALES") ? row.conversion_value : 0,
+              }
+              : null,
+          };
+        }),
       // Demo syncs always load the full synthetic history (through yesterday).
       syncJobs: state.jobs
         .filter((job) => job.tenant_id === tenantId && job.status === "completed")
@@ -186,7 +209,16 @@ export function createDemoApi(options: { actorId: () => string; actorEmail: () =
               failed_accounts: 0,
               account_results: accounts
                 .filter((account) => account.connection_id === job.connection_id)
-                .map((account) => ({ ad_account_id: account.id, status: "succeeded", since: addDays(until, -119), until })),
+                .map((account) => ({
+                  ad_account_id: account.id,
+                  status: "succeeded",
+                  since: addDays(until, -119),
+                  until,
+                  pagination: "complete",
+                  reconciliation: "matched",
+                  fetched_rows: 0,
+                  persisted_rows: 0,
+                })),
             },
           };
         }),

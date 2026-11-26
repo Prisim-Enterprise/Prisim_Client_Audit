@@ -5,7 +5,9 @@ export type ProviderErrorCode =
   | "permission_denied"
   | "rate_limited"
   | "not_configured"
-  | "provider_error";
+  | "provider_error"
+  /** A query returned only part of its result (e.g. a page token remained). */
+  | "incomplete";
 
 /** Errors carry a code and a safe message; provider payloads are never echoed to browsers. */
 export class ProviderError extends Error {
@@ -72,6 +74,8 @@ export type CampaignRecord = {
   bid_strategy: string | null;
   channel_type: string | null;
   details?: CampaignDetails;
+  /** Metrics exist but the platform no longer lists the campaign; stored without overwriting a known row. */
+  placeholder?: boolean;
 };
 
 export type MetricRecord = {
@@ -84,11 +88,23 @@ export type MetricRecord = {
   conversions: number;
   conversion_value: number;
   /**
+   * Platform-specific metrics stored in daily_metrics.platform_metrics (JSONB).
+   * Meta: link_clicks, purchases, leads, registrations, app_installs,
+   * landing_page_views, purchase_value. A missing key means "not reported".
+   */
+  platform_metrics?: Record<string, number>;
+  /**
    * Fields the platform returned in a non-numeric form. The stored value is 0,
    * so the sync records the count as a data-quality problem (not stored per row).
    */
   invalid_fields?: string[];
 };
+
+/** Account-level totals for a window, used to prove that days without rows had no delivery. */
+export type AccountTotals = { impressions: number; spend: number };
+
+/** Upper bound for metric rows per account and sync; more is an incomplete sync, never truncated silently. */
+export const MAX_METRIC_ROWS = 200_000;
 
 /**
  * Account-level diagnostics captured during a sync (latest snapshot per ad
@@ -120,7 +136,12 @@ export interface AdProvider {
   identity(accessToken: string): Promise<ProviderIdentity>;
   listAccounts(accessToken: string): Promise<DiscoveredAccount[]>;
   fetchCampaigns(accessToken: string, account: SyncAccount): Promise<CampaignRecord[]>;
+  /** Must throw ProviderError("incomplete") rather than return a partial result. */
   fetchMetrics(accessToken: string, account: SyncAccount, since: string, until: string): Promise<MetricRecord[]>;
+  /** Campaigns by platform id, including removed/deleted ones (for metrics of campaigns no longer listed). */
+  fetchCampaignsById?(accessToken: string, account: SyncAccount, ids: string[]): Promise<CampaignRecord[]>;
+  /** Unsegmented account totals for the window (impressions, spend). */
+  fetchAccountTotals?(accessToken: string, account: SyncAccount, since: string, until: string): Promise<AccountTotals>;
   /** Optional diagnostics; a failure here never fails the metric sync. */
   fetchDiagnostics?(accessToken: string, account: SyncAccount, since: string, until: string): Promise<AccountDiagnostics>;
   revoke(accessToken: string, refreshToken: string | null): Promise<void>;

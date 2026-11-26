@@ -2,7 +2,7 @@
 // with fakes. The Edge Function supplies the database and provider calls.
 
 import { addDays, isoDate } from "./format.ts";
-import { type AccountDiagnostics, type AdProvider, type MetricRecord, ProviderError, type SyncAccount } from "./providers/types.ts";
+import { type AccountDiagnostics, type AdProvider, type CampaignRecord, type MetricRecord, ProviderError, type SyncAccount } from "./providers/types.ts";
 
 /**
  * Per-account outcome recorded in sync_jobs.stats.account_results. The audit
@@ -16,7 +16,27 @@ export type AccountSyncResult = {
   since: string;
   until: string;
   campaigns: number;
+  /** Metric rows stored (same as persisted_rows; kept for older readers). */
   metrics: number;
+  /** "complete" only when every result page was read (no page token left). */
+  pagination: "complete" | "incomplete" | "not_run";
+  /** Distinct campaign/day rows returned by the platform. */
+  fetched_rows: number;
+  /** Rows the database reported as stored. Must equal fetched_rows. */
+  persisted_rows: number;
+  /** Campaign ids with metrics that the platform no longer lists; stored as placeholders. */
+  unresolved_campaigns: number;
+  /**
+   * Proof that days without rows had no delivery: the account-level totals
+   * for the window equal the sum of the campaign/day rows.
+   *   matched     - totals agree (and are non-zero, or the platform documents
+   *                 zero-row omission and reported zero totals)
+   *   mismatch    - totals disagree: rows are incomplete
+   *   unverified  - totals could not be read or prove nothing
+   */
+  reconciliation: "matched" | "mismatch" | "unverified";
+  account_totals: { impressions: number; spend: number } | null;
+  row_totals: { impressions: number; spend: number };
   /** Platform values that were present but not numeric (stored as 0). */
   invalid_values: number;
   /** Metric fields the platform could not return for this window (e.g. Meta reach). */
@@ -29,6 +49,31 @@ export type AccountSyncResult = {
 export function diagnosticsWindow(window: { since: string; until: string }): { since: string; until: string } {
   const since = addDays(window.until, -29);
   return { since: since > window.since ? since : window.since, until: window.until };
+}
+
+/** Relative tolerance between account totals and summed rows (Meta spend is estimated). */
+export const RECONCILE_TOLERANCE = 0.01;
+
+function agrees(a: number, b: number, unit: number) {
+  return Math.abs(a - b) <= Math.max(Math.abs(a), Math.abs(b)) * RECONCILE_TOLERANCE + unit;
+}
+
+/** Google documents that all-zero rows are omitted when segmenting; Meta does not document it. */
+const DOCUMENTED_ZERO_OMISSION: Record<"meta" | "google", boolean> = { google: true, meta: false };
+
+export function reconcile(
+  provider: "meta" | "google",
+  totals: { impressions: number; spend: number } | null,
+  rows: { impressions: number; spend: number },
+): AccountSyncResult["reconciliation"] {
+  if (!totals) return "unverified";
+  if (!agrees(totals.impressions, rows.impressions, 1) || !agrees(totals.spend, rows.spend, 0.01)) return "mismatch";
+  if (totals.impressions === 0 && totals.spend === 0 && !DOCUMENTED_ZERO_OMISSION[provider]) return "unverified";
+  return "matched";
+}
+
+function placeholder(externalId: string): CampaignRecord {
+  return { external_id: externalId, name: null, objective: null, status: "UNKNOWN", daily_budget: null, bid_strategy: null, channel_type: null, placeholder: true };
 }
 
 function metricQuality(metrics: MetricRecord[]) {
@@ -127,6 +172,13 @@ export async function processSyncJob(job: ClaimedJob, deps: SyncDependencies): P
         until: window.until,
         campaigns: 0,
         metrics: 0,
+        pagination: "not_run",
+        fetched_rows: 0,
+        persisted_rows: 0,
+        unresolved_campaigns: 0,
+        reconciliation: "unverified",
+        account_totals: null,
+        row_totals: { impressions: 0, spend: 0 },
         invalid_values: 0,
         unavailable_fields: [],
         diagnostics: "skipped",
@@ -134,11 +186,36 @@ export async function processSyncJob(job: ClaimedJob, deps: SyncDependencies): P
       };
       results.push(result);
       try {
-        const campaigns = await provider.fetchCampaigns(accessToken, account);
-        const metrics = await provider.fetchMetrics(accessToken, account, window.since, window.until);
+        const listed = await provider.fetchCampaigns(accessToken, account);
+        let metrics: MetricRecord[];
+        try {
+          metrics = await provider.fetchMetrics(accessToken, account, window.since, window.until);
+        } catch (error) {
+          if (error instanceof ProviderError && error.code === "incomplete") result.pagination = "incomplete";
+          throw error;
+        }
+        result.pagination = "complete";
         const quality = metricQuality(metrics);
         // invalid_fields is diagnostic only; the ingest RPC ignores unknown keys.
         const clean = metrics.map(({ invalid_fields: _ignored, ...metric }) => metric);
+
+        // Metrics for campaigns the platform no longer lists (removed/deleted)
+        // are kept: the campaigns are read by id, or stored as placeholders.
+        const known = new Set(listed.map((campaign) => campaign.external_id));
+        const missing = [...new Set(clean.map((metric) => metric.external_campaign_id))].filter((id) => !known.has(id));
+        const resolved = missing.length > 0 && provider.fetchCampaignsById ? await provider.fetchCampaignsById(accessToken, account, missing) : [];
+        const resolvedIds = new Set(resolved.map((campaign) => campaign.external_id));
+        const unresolved = missing.filter((id) => !resolvedIds.has(id));
+        const campaigns = [...listed, ...resolved, ...unresolved.map(placeholder)];
+
+        const distinct = new Set(clean.map((metric) => `${metric.external_campaign_id}|${metric.date}`)).size;
+        result.fetched_rows = distinct;
+        result.unresolved_campaigns = unresolved.length;
+        result.row_totals = {
+          impressions: clean.reduce((sum, metric) => sum + metric.impressions, 0),
+          spend: clean.reduce((sum, metric) => sum + metric.spend, 0),
+        };
+
         // The first batch carries all campaigns so metrics can resolve their ids.
         const batches = chunks(clean, 5000);
         const first = await deps.ingest(job.job_id, account.id, campaigns, batches[0] ?? []);
@@ -146,19 +223,32 @@ export async function processSyncJob(job: ClaimedJob, deps: SyncDependencies): P
         for (const batch of batches.slice(1)) {
           metricCount += (await deps.ingest(job.job_id, account.id, [], batch)).metrics;
         }
+        result.persisted_rows = metricCount;
+        result.metrics = metricCount;
+        result.campaigns = first.campaigns;
+        result.invalid_values = quality.invalid;
+        result.unavailable_fields = quality.unavailable;
+        if (metricCount !== distinct) {
+          throw new ProviderError("incomplete", `Only ${metricCount} of ${distinct} metric rows were stored.`);
+        }
+
+        if (provider.fetchAccountTotals) {
+          try {
+            result.account_totals = await provider.fetchAccountTotals(accessToken, account, window.since, window.until);
+          } catch (error) {
+            if (error instanceof ProviderError && error.code === "auth_expired") throw error;
+            result.account_totals = null;
+          }
+        }
+        result.reconciliation = reconcile(job.provider, result.account_totals, result.row_totals);
+        result.status = "succeeded";
         stats.accounts = (stats.accounts as number) + 1;
         stats.campaigns = (stats.campaigns as number) + first.campaigns;
         stats.metrics = (stats.metrics as number) + metricCount;
-        Object.assign(result, {
-          status: "succeeded",
-          campaigns: first.campaigns,
-          metrics: metricCount,
-          invalid_values: quality.invalid,
-          unavailable_fields: quality.unavailable,
-        });
       } catch (error) {
         if (error instanceof ProviderError && error.code === "auth_expired") throw error;
         stats.failed_accounts = (stats.failed_accounts as number) + 1;
+        result.status = "failed";
         result.error = error instanceof ProviderError ? error.message.slice(0, 200) : "unexpected error";
         errors.push(`${account.external_account_id}: ${result.error}`);
         continue;

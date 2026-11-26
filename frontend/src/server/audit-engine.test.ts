@@ -9,7 +9,27 @@ import { describe, expect, it } from "vitest";
 const META = "a0000000-0000-4000-8000-000000000001";
 const GOOGLE = "a0000000-0000-4000-8000-000000000002";
 
+// Engine 2.1 judges Meta campaigns on link clicks and the result of their
+// objective (platform metrics), so Meta fixtures carry them.
 function campaign(overrides: Partial<AuditCampaign> & { id: string; adAccountId: string }): AuditCampaign {
+  const base = metaCampaign(overrides);
+  if (base.provider !== "meta" || overrides.platformMetrics !== undefined) return base;
+  const objective = (base.objective ?? "").toUpperCase();
+  return {
+    ...base,
+    platformMetrics: {
+      link_clicks: base.clicks,
+      purchases: objective.includes("SALES") ? base.conversions : 0,
+      leads: objective.includes("LEADS") ? base.conversions : 0,
+      registrations: 0,
+      app_installs: objective.includes("APP") ? base.conversions : 0,
+      landing_page_views: 0,
+      purchase_value: objective.includes("SALES") ? base.conversionValue : 0,
+    },
+  };
+}
+
+function metaCampaign(overrides: Partial<AuditCampaign> & { id: string; adAccountId: string }): AuditCampaign {
   return {
     provider: overrides.adAccountId === GOOGLE ? "google" : "meta",
     name: overrides.id,
@@ -78,7 +98,8 @@ describe("audit engine", () => {
     expect(finding?.severity).toBe("high");
     expect(finding?.basis).toBe("indicative");
     expect(finding?.estimatedImpact).toBe(30000);
-    expect(finding?.estimateLabel).toBe("Spend without recorded conversions");
+    // Meta wording is per objective (a leads campaign is judged on leads).
+    expect(finding?.estimateLabel).toBe("Spend without recorded leads");
     expect(finding?.impactCurrency).toBe("INR");
     expect(result.findings[0].ruleId).toBe("tracking.no_conversions");
     // high (20) x indicative (0.5) = 10 points
@@ -90,7 +111,8 @@ describe("audit engine", () => {
       campaigns: [
         // Engine 2.0 checks ROAS only on sales-focused campaigns (lead campaigns need no value).
         campaign({ id: "winner", adAccountId: META, objective: "OUTCOME_SALES", spend: 40_000, conversions: 200, conversionValue: 200_000 }),
-        campaign({ id: "waste", adAccountId: META, spend: 10_000, conversions: 0, clicks: 400 }),
+        // Same objective as its converting peers (Meta compares within an objective).
+        campaign({ id: "waste", adAccountId: META, objective: "OUTCOME_SALES", spend: 10_000, conversions: 0, clicks: 400 }),
         campaign({ id: "expensive", adAccountId: META, objective: "OUTCOME_SALES", spend: 12_000, conversions: 8, conversionValue: 6_000 }),
         campaign({ id: "fatigued", adAccountId: META, objective: "OUTCOME_SALES", impressions: 90_000, reach: 15_000, spend: 5_000, conversions: 20, conversionValue: 30_000 }),
         campaign({ id: "dull", adAccountId: META, objective: "OUTCOME_SALES", impressions: 80_000, clicks: 200, spend: 4_000, conversions: 10, conversionValue: 20_000 }),
@@ -101,7 +123,8 @@ describe("audit engine", () => {
     expect(ids).toContain("efficiency.high_cpa_campaign");
     expect(ids).toContain("efficiency.low_roas_campaign");
     expect(ids).toContain("engagement.high_frequency");
-    expect(ids).toContain("engagement.low_ctr");
+    // Meta uses link CTR (engine 2.1), not all-click CTR.
+    expect(ids).toContain("engagement.low_link_ctr");
     const waste = result.findings.find((finding) => finding.ruleId === "efficiency.spend_without_conversions");
     expect(waste?.campaignId).toBe("waste");
   });
@@ -127,8 +150,11 @@ describe("audit engine", () => {
   });
 
   it("detects a rising CPA trend from daily rows", () => {
+    const rows = daily(META, 30, (index) => ({ conversions: index < 15 ? 6 : 3 }));
     const result = runAudit(input({
-      daily: daily(META, 30, (index) => ({ conversions: index < 15 ? 6 : 3 })),
+      daily: rows,
+      // Meta trends are per objective, from campaign/day rows with the objective's result (leads).
+      campaignDaily: rows.map((row) => ({ ...row, campaignId: "healthy", platformMetrics: { leads: row.conversions, link_clicks: row.clicks } })),
     }));
     expect(ruleIds(result)).toContain("trend.cpa_rising");
   });
@@ -223,7 +249,7 @@ describe("audit input and payload", () => {
     const payload = toSaveAuditPayload(result, { title: "x".repeat(300), periodStart: "2026-10-01", periodEnd: "2026-10-30", adAccountIds: [META] });
     expect(payload.run.title.length).toBeLessThanOrEqual(200);
     expect(payload.findings[0]).toMatchObject({ rule_id: "tracking.no_conversions", ad_account_id: META, severity: "high" });
-    expect(payload.findings[0].evidence).toMatchObject({ basis: "indicative", estimate_label: "Spend without recorded conversions" });
+    expect(payload.findings[0].evidence).toMatchObject({ basis: "indicative", estimate_label: "Spend without recorded leads" });
     expect(payload.run.engine_version).toBe(ENGINE_VERSION);
     expect(payload.run.kpis.score_status).toBe(result.scoreStatus);
     for (const finding of payload.findings) expect(finding.rule_id).toMatch(/^[a-z0-9_.]{2,80}$/);

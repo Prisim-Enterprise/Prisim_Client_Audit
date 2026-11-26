@@ -12,15 +12,24 @@
 --      set learning status and optimization goal, ad status, pixels).
 --      Staff-only (platform admins read; writes only through the service
 --      RPC below). Clients never read it directly.
---   3. ingest_ad_account_data stores campaigns.details (same signature,
---      grants unchanged).
---   4. store_ad_account_diagnostics: service_role RPC, bound to a running
+--   3. public.daily_metrics.platform_metrics: platform-specific metrics per
+--      campaign/day (Meta link clicks and results per family: purchases,
+--      leads, registrations, app installs, landing page views, purchase
+--      value). NULL = not captured (rows synced before this migration).
+--   4. ingest_ad_account_data stores campaigns.details and
+--      daily_metrics.platform_metrics (same signature, grants unchanged), and
+--      stores placeholder campaigns (metrics of campaigns the platform no
+--      longer lists) without overwriting an existing campaign row.
+--   5. store_ad_account_diagnostics: service_role RPC, bound to a running
 --      sync job exactly like ingest_ad_account_data.
 --
--- No existing column, policy or grant is changed. Additive and reversible:
+-- No existing column, policy or grant is changed; one column grant is added
+-- for the new daily_metrics column (same rule as the other metric columns).
+-- Additive and reversible:
 --   DROP FUNCTION public.store_ad_account_diagnostics(UUID, UUID, JSONB);
 --   DROP TABLE public.ad_account_diagnostics;
 --   ALTER TABLE public.campaigns DROP COLUMN details;
+--   ALTER TABLE public.daily_metrics DROP COLUMN platform_metrics;
 --   (and re-apply ingest_ad_account_data from 20261111100000)
 -- =====================================================
 
@@ -28,6 +37,14 @@ ALTER TABLE public.campaigns
     ADD COLUMN details JSONB NOT NULL DEFAULT '{}'::JSONB,
     ADD CONSTRAINT campaigns_details_object CHECK (jsonb_typeof(details) = 'object'),
     ADD CONSTRAINT campaigns_details_size CHECK (pg_column_size(details) <= 8192);
+
+ALTER TABLE public.daily_metrics
+    ADD COLUMN platform_metrics JSONB,
+    ADD CONSTRAINT daily_metrics_platform_metrics_object CHECK (platform_metrics IS NULL OR jsonb_typeof(platform_metrics) = 'object'),
+    ADD CONSTRAINT daily_metrics_platform_metrics_size CHECK (platform_metrics IS NULL OR pg_column_size(platform_metrics) <= 2048);
+
+-- daily_metrics uses column grants (source_payload stays hidden).
+GRANT SELECT (platform_metrics) ON public.daily_metrics TO authenticated;
 
 CREATE TABLE public.ad_account_diagnostics (
     ad_account_id UUID PRIMARY KEY,
@@ -59,7 +76,8 @@ GRANT SELECT ON public.ad_account_diagnostics TO authenticated;
 GRANT ALL ON public.ad_account_diagnostics TO service_role;
 
 
--- Same behaviour as 20261111100000, plus campaigns.details.
+-- Same behaviour as 20261111100000, plus campaigns.details,
+-- daily_metrics.platform_metrics and placeholder campaigns.
 CREATE OR REPLACE FUNCTION public.ingest_ad_account_data(
     p_job_id UUID, p_ad_account_id UUID, p_campaigns JSONB, p_metrics JSONB)
 RETURNS JSONB
@@ -72,6 +90,7 @@ DECLARE
     v_job public.sync_jobs%ROWTYPE;
     v_account public.ad_accounts%ROWTYPE;
     v_campaigns INTEGER;
+    v_placeholders INTEGER;
     v_metrics INTEGER;
 BEGIN
     SELECT * INTO v_job FROM public.sync_jobs j WHERE j.id = p_job_id;
@@ -103,8 +122,8 @@ BEGIN
            NOW()
     FROM jsonb_to_recordset(p_campaigns) AS x(
         external_id TEXT, name TEXT, objective TEXT, status TEXT, daily_budget NUMERIC,
-        bid_strategy TEXT, channel_type TEXT, details JSONB)
-    WHERE x.external_id IS NOT NULL AND btrim(x.external_id) <> ''
+        bid_strategy TEXT, channel_type TEXT, details JSONB, placeholder BOOLEAN)
+    WHERE x.external_id IS NOT NULL AND btrim(x.external_id) <> '' AND NOT COALESCE(x.placeholder, FALSE)
     ON CONFLICT (ad_account_id, external_campaign_id) DO UPDATE
     SET campaign_name = EXCLUDED.campaign_name,
         objective = EXCLUDED.objective,
@@ -116,9 +135,21 @@ BEGIN
         last_synced_at = EXCLUDED.last_synced_at;
     GET DIAGNOSTICS v_campaigns = ROW_COUNT;
 
+    -- Placeholders: campaigns with metrics that the platform no longer lists.
+    -- An existing row (with its last known name and settings) is kept as is.
+    INSERT INTO public.campaigns AS c (
+        tenant_id, ad_account_id, external_campaign_id, campaign_status, details, last_synced_at)
+    SELECT DISTINCT ON (x.external_id)
+           v_account.tenant_id, v_account.id, x.external_id, 'UNKNOWN', '{"placeholder": true}'::JSONB, NOW()
+    FROM jsonb_to_recordset(p_campaigns) AS x(external_id TEXT, placeholder BOOLEAN)
+    WHERE x.external_id IS NOT NULL AND btrim(x.external_id) <> '' AND COALESCE(x.placeholder, FALSE)
+    ON CONFLICT (ad_account_id, external_campaign_id) DO NOTHING;
+    GET DIAGNOSTICS v_placeholders = ROW_COUNT;
+    v_campaigns := v_campaigns + v_placeholders;
+
     INSERT INTO public.daily_metrics AS m (
         tenant_id, ad_account_id, campaign_id, metric_date, impressions, reach, clicks, spend,
-        conversions, conversion_value, currency)
+        conversions, conversion_value, currency, platform_metrics)
     SELECT DISTINCT ON (cm.id, x.date)
            v_account.tenant_id, v_account.id, cm.id, x.date,
            GREATEST(COALESCE(x.impressions, 0), 0),
@@ -127,10 +158,12 @@ BEGIN
            GREATEST(COALESCE(x.spend, 0), 0),
            GREATEST(COALESCE(x.conversions, 0), 0),
            GREATEST(COALESCE(x.conversion_value, 0), 0),
-           v_account.currency
+           v_account.currency,
+           CASE WHEN jsonb_typeof(x.platform_metrics) = 'object' AND pg_column_size(x.platform_metrics) <= 2048
+                THEN x.platform_metrics END
     FROM jsonb_to_recordset(p_metrics) AS x(
         external_campaign_id TEXT, date DATE, impressions BIGINT, reach BIGINT, clicks BIGINT,
-        spend NUMERIC, conversions NUMERIC, conversion_value NUMERIC)
+        spend NUMERIC, conversions NUMERIC, conversion_value NUMERIC, platform_metrics JSONB)
     JOIN public.campaigns cm
       ON cm.ad_account_id = v_account.id AND cm.external_campaign_id = x.external_campaign_id
     WHERE x.date IS NOT NULL
@@ -142,7 +175,8 @@ BEGIN
         spend = EXCLUDED.spend,
         conversions = EXCLUDED.conversions,
         conversion_value = EXCLUDED.conversion_value,
-        currency = EXCLUDED.currency;
+        currency = EXCLUDED.currency,
+        platform_metrics = EXCLUDED.platform_metrics;
     GET DIAGNOSTICS v_metrics = ROW_COUNT;
 
     UPDATE public.ad_accounts SET last_synced_at = NOW() WHERE id = v_account.id;

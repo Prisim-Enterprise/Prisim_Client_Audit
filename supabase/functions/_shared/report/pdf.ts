@@ -66,6 +66,10 @@ export type ReportData = {
   lastSuccessfulSync?: string | null;
   limitations?: string[];
   scoringMethod?: string | null;
+  /** Engine 2.1: one entry per audited platform. Google and Meta are never combined. */
+  platformScoring?: Array<{ provider: string; score: number | null; status: "scored" | "provisional" | "unscored"; reason: string | null }>;
+  /** Category scores per platform (engine 2.1). */
+  platformCategoryScores?: Record<string, Record<string, number>>;
   /** Demo fixtures only. Adds a watermark on every page. */
   synthetic?: boolean;
 };
@@ -241,48 +245,84 @@ function drawCover(writer: Writer) {
   writer.text(data.tenantName, { size: 16, font: writer.regular, color: COLORS.accentLight });
   writer.text(`${data.title}  |  ${data.periodStart} to ${data.periodEnd}`, { size: 10, color: COLORS.light });
 
-  // Score ring
-  const score = data.overallScore;
-  const centerX = MARGIN + 70;
+  const platforms = data.platformScoring && data.platformScoring.length > 0
+    ? data.platformScoring
+    : Object.entries(data.platformScores).map(([provider, score]) => ({ provider, score, status: (data.scoreStatus ?? "scored") as "scored" | "provisional" | "unscored", reason: null }));
+  const statusText = (status: string, score: number | null) => (score === null || status === "unscored" ? "NOT SCORED" : status === "provisional" ? "PROVISIONAL" : "FINAL");
+  const statusColor = (status: string, score: number | null) => (score === null || status === "unscored" ? COLORS.slate : status === "provisional" ? COLORS.high : COLORS.accent);
   const centerY = PAGE.height - 420;
-  page.drawCircle({ x: centerX, y: centerY, size: 62, borderColor: COLORS.light, borderWidth: 10 });
-  if (score !== null) {
-    page.drawCircle({ x: centerX, y: centerY, size: 62, borderColor: scoreColor(score), borderWidth: 10, borderOpacity: 0.95 });
+  const ring = (centerX: number, score: number | null, radius: number) => {
+    page.drawCircle({ x: centerX, y: centerY, size: radius, borderColor: COLORS.light, borderWidth: 9 });
+    if (score === null) {
+      const text = "Not scored";
+      page.drawText(text, { x: centerX - writer.bold.widthOfTextAtSize(text, 11) / 2, y: centerY - 4, size: 11, font: writer.bold, color: COLORS.slate });
+      return;
+    }
+    page.drawCircle({ x: centerX, y: centerY, size: radius, borderColor: scoreColor(score), borderWidth: 9, borderOpacity: 0.95 });
     const label = formatNumber(score, 0);
-    const width = writer.bold.widthOfTextAtSize(label, 34);
-    page.drawText(label, { x: centerX - width / 2, y: centerY - 8, size: 34, font: writer.bold, color: COLORS.ink });
-    const of = "/ 100";
-    page.drawText(of, { x: centerX - writer.regular.widthOfTextAtSize(of, 9) / 2, y: centerY - 24, size: 9, font: writer.regular, color: COLORS.slate });
-  }
-  writer.y = centerY + 50;
-  const textX = centerX + 100;
-  writer.text("OVERALL ACCOUNT HEALTH", { x: textX, size: 8, font: writer.bold, color: COLORS.accent });
-  writer.text(score === null ? "Not scored" : `${data.scoreStatus === "provisional" ? "Provisional: " : ""}${scoreLabel(score)}`, { x: textX, size: 20, font: writer.bold });
-  if (data.scoreStatus && data.scoreStatus !== "scored" && data.scoreReason) {
-    writer.text(data.scoreReason, { x: textX, size: 8.5, color: COLORS.slate, lineHeight: 11.5 });
+    page.drawText(label, { x: centerX - writer.bold.widthOfTextAtSize(label, 28) / 2, y: centerY - 6, size: 28, font: writer.bold, color: COLORS.ink });
+    page.drawText("/ 100", { x: centerX - writer.regular.widthOfTextAtSize("/ 100", 8) / 2, y: centerY - 20, size: 8, font: writer.regular, color: COLORS.slate });
+  };
+
+  if (platforms.length <= 1) {
+    // One platform (or a pre-2.1 audit): one score.
+    const only = platforms[0];
+    const score = only ? only.score : data.overallScore;
+    const status = only ? only.status : data.scoreStatus ?? (score === null ? "unscored" : "scored");
+    const centerX = MARGIN + 70;
+    ring(centerX, score, 58);
+    writer.y = centerY + 52;
+    const textX = centerX + 100;
+    writer.text(`${only ? (only.provider === "meta" ? "META ADS" : "GOOGLE ADS") : "OVERALL"} ACCOUNT HEALTH`, { x: textX, size: 8, font: writer.bold, color: COLORS.accent });
+    writer.ensure(20);
+    pill(writer, statusText(status, score), textX, writer.y - 10, statusColor(status, score));
+    writer.space(18);
+    writer.text(score === null ? "Not scored" : scoreLabel(score), { x: textX, size: 20, font: writer.bold });
+    const reason = only?.reason ?? data.scoreReason;
+    if (status !== "scored" && reason) writer.text(reason, { x: textX, size: 8.5, color: COLORS.slate, lineHeight: 11.5 });
+  } else {
+    // Google and Meta side by side, never averaged.
+    platforms.forEach((item, index) => {
+      const centerX = MARGIN + 70 + index * 250;
+      ring(centerX, item.score, 52);
+      const label = item.provider === "meta" ? "META ADS" : "GOOGLE ADS";
+      page.drawText(label, { x: centerX - writer.bold.widthOfTextAtSize(label, 9) / 2, y: centerY + 72, size: 9, font: writer.bold, color: COLORS.accent });
+      const status = statusText(item.status, item.score);
+      const width = writer.bold.widthOfTextAtSize(status, 7) + 10;
+      pill(writer, status, centerX - width / 2, centerY - 78, statusColor(item.status, item.score));
+    });
+    writer.y = centerY - 92;
+    writer.text("Google Ads and Meta Ads are scored separately and are not combined into one number.", { size: 8.5, color: COLORS.slate });
   }
   if (data.dataConfidence) {
-    writer.space(2);
-    writer.text(
-      `Data confidence: ${data.dataConfidence.level} (${formatNumber(data.dataConfidence.confidence, 0)}/100), ${formatPercent(data.dataConfidence.coverageRatio, 0)} of days known` +
-        (data.lastSuccessfulSync ? `. Last successful sync ${data.lastSuccessfulSync.slice(0, 16).replace("T", " ")} UTC.` : "."),
-      { x: textX, size: 9, color: COLORS.slate, lineHeight: 12 },
-    );
-  }
-  const platforms = Object.entries(data.platformScores);
-  if (platforms.length > 0) {
+    writer.y = Math.min(writer.y, centerY - 70);
     writer.space(4);
     writer.text(
-      platforms.map(([platform, value]) => `${platform === "meta" ? "Meta Ads" : "Google Ads"}: ${formatNumber(value, 0)}/100`).join("     "),
-      { x: textX, size: 10, color: COLORS.slate },
+      `Data confidence (separate from performance): ${data.dataConfidence.level} (${formatNumber(data.dataConfidence.confidence, 0)}/100), ${formatPercent(data.dataConfidence.coverageRatio, 0)} of days known` +
+        (data.lastSuccessfulSync ? `. Last successful sync ${data.lastSuccessfulSync.slice(0, 16).replace("T", " ")} UTC.` : "."),
+      { size: 8.5, color: COLORS.slate, lineHeight: 12 },
     );
+  }
+  const provisionalPlatforms = platforms.filter((item) => item.score !== null && item.status === "provisional");
+  if (provisionalPlatforms.length > 0) {
+    writer.space(4);
+    const width = CONTENT_WIDTH;
+    const lines = writer.wrap("PROVISIONAL: the data behind this score is incomplete or not fully verified. " + provisionalPlatforms.map((item) => item.reason ?? "").join(" "), writer.bold, 8.5, width - 16);
+    const height = lines.length * 12 + 10;
+    page.drawRectangle({ x: MARGIN, y: writer.y - height, width, height, color: rgb(1, 0.96, 0.86), borderColor: COLORS.high, borderWidth: 1 });
+    let y = writer.y - 14;
+    for (const line of lines) {
+      page.drawText(line, { x: MARGIN + 8, y, size: 8.5, font: writer.bold, color: COLORS.ink });
+      y -= 12;
+    }
+    writer.y -= height + 4;
   }
 
   const counts = data.findings.reduce<Record<string, number>>((acc, finding) => {
     acc[finding.severity] = (acc[finding.severity] ?? 0) + 1;
     return acc;
   }, {});
-  writer.y = centerY - 110;
+  writer.y = Math.min(writer.y - 8, centerY - 150);
   let x = MARGIN;
   for (const severity of ["critical", "high", "medium", "low"] as const) {
     page.drawRectangle({ x, y: writer.y - 52, width: 116, height: 52, color: COLORS.faint, borderColor: COLORS.light, borderWidth: 0.5 });
@@ -342,21 +382,25 @@ function drawSummary(writer: Writer) {
   }
 
   writer.space(14);
-  writer.text("SCORE BY AREA", { size: 8, font: writer.bold, color: COLORS.accent });
-  writer.space(6);
-  if (Object.keys(data.categoryScores).length === 0) {
-    writer.text("No area had enough evidence to be scored.", { size: 9, color: COLORS.slate });
-  }
-  for (const [category, value] of Object.entries(data.categoryScores)) {
-    writer.ensure(22);
-    const y = writer.y - 10;
-    writer.page.drawText(toPdfSafeText(CATEGORY_LABEL[category] ?? category), { x: MARGIN, y, size: 9, font: writer.regular, color: COLORS.ink });
-    const barX = MARGIN + 150;
-    const barWidth = CONTENT_WIDTH - 190;
-    writer.page.drawRectangle({ x: barX, y: y - 1, width: barWidth, height: 8, color: COLORS.light });
-    writer.page.drawRectangle({ x: barX, y: y - 1, width: Math.max(2, (barWidth * Math.min(Math.max(value, 0), 100)) / 100), height: 8, color: scoreColor(value) });
-    writer.page.drawText(formatNumber(value, 0), { x: barX + barWidth + 10, y, size: 9, font: writer.bold, color: COLORS.ink });
-    writer.y -= 20;
+  const groups: Array<[string, Record<string, number>]> = data.platformCategoryScores && Object.keys(data.platformCategoryScores).length > 0
+    ? Object.entries(data.platformCategoryScores)
+    : [["", data.categoryScores]];
+  for (const [provider, scores] of groups) {
+    writer.text(`SCORE BY AREA${provider ? ` - ${provider === "meta" ? "META ADS" : "GOOGLE ADS"}` : ""}`, { size: 8, font: writer.bold, color: COLORS.accent });
+    writer.space(6);
+    if (Object.keys(scores).length === 0) writer.text("No area had enough evidence to be scored.", { size: 9, color: COLORS.slate });
+    for (const [category, value] of Object.entries(scores)) {
+      writer.ensure(22);
+      const y = writer.y - 10;
+      writer.page.drawText(toPdfSafeText(CATEGORY_LABEL[category] ?? category), { x: MARGIN, y, size: 9, font: writer.regular, color: COLORS.ink });
+      const barX = MARGIN + 150;
+      const barWidth = CONTENT_WIDTH - 190;
+      writer.page.drawRectangle({ x: barX, y: y - 1, width: barWidth, height: 8, color: COLORS.light });
+      writer.page.drawRectangle({ x: barX, y: y - 1, width: Math.max(2, (barWidth * Math.min(Math.max(value, 0), 100)) / 100), height: 8, color: scoreColor(value) });
+      writer.page.drawText(formatNumber(value, 0), { x: barX + barWidth + 10, y, size: 9, font: writer.bold, color: COLORS.ink });
+      writer.y -= 20;
+    }
+    writer.space(6);
   }
 
   writer.space(14);

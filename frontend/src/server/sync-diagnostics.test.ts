@@ -66,7 +66,7 @@ describe("Google provider (v24 fields)", () => {
       [/googleAds:search/, () => ({ body: { results: [] } })],
     ]);
     const diagnostics = await createGoogleProvider(config, fetcher).fetchDiagnostics!("token", account, "2026-10-26", "2026-11-24");
-    expect(Object.keys(diagnostics.sections).sort()).toEqual(["ads", "conversion_actions", "keywords", "search_impression_share", "search_terms"]);
+    expect(Object.keys(diagnostics.sections).sort()).toEqual(["ads", "asset_groups", "conversion_actions", "keywords", "pmax_search_terms", "search_impression_share", "search_terms"]);
     expect(diagnostics.sections.keywords).toMatchObject({ status: "unavailable" });
     expect(diagnostics.sections.conversion_actions).toMatchObject({ status: "ok", rows: [{ id: "5", status: "ENABLED", primary_for_goal: true, counting_type: "ONE_PER_CLICK" }] });
     const share = calls.map(query).find((text) => text.includes("search_impression_share"))!;
@@ -202,7 +202,7 @@ describe("report output for engine 2.0", () => {
     accounts: [{ id: "acc", provider: "google", name: "Cleanwell Solutions", currency: "INR" }],
     campaigns: [{ id: "c", adAccountId: "acc", provider: "google", name: "App Campaign", objective: "MULTI_CHANNEL", status: "ENABLED", channelType: "MULTI_CHANNEL", bidStrategy: "TARGET_CPA", dailyBudget: 700, impressions: 0, reach: 0, clicks: 0, spend: 0, conversions: 0, conversionValue: 0, activeDays: 0 }],
     daily: [],
-    syncRuns: [{ adAccountId: "acc", connectionId: "x", jobType: "manual_sync", status: "succeeded", completedAt: "2026-11-25T11:35:23Z", since: "2026-08-27", until: "2026-11-24", invalidValues: 0, unavailableFields: [], error: null, legacy: false }],
+    syncRuns: [{ adAccountId: "acc", connectionId: "x", jobType: "manual_sync", status: "succeeded", completedAt: "2026-11-25T11:35:23Z", since: "2026-08-27", until: "2026-11-24", invalidValues: 0, unavailableFields: [], error: null, legacy: false, zeroDaysVerified: true, reconciliation: "matched" }],
     generatedAt: "2026-11-26T00:00:00Z",
   });
   const payload = toSaveAuditPayload(result, { title: "Audit", periodStart: "2026-10-26", periodEnd: "2026-11-24", adAccountIds: ["acc"] });

@@ -16,7 +16,8 @@ import { EmptyState, PageHeader, QueryView } from "../../components/ui/States";
 import { formatDate, slugify } from "../../lib/analytics";
 import { queryKeys, useApi } from "../../lib/api/ApiProvider";
 import { errorMessage } from "../../lib/api/errors";
-import type { TenantInput } from "../../lib/api/types";
+import type { AuditRun, TenantInput } from "../../lib/api/types";
+import { RunScore } from "../../features/audits/AuditComponents";
 
 const optional = (schema: z.ZodString) => z.union([schema, z.literal("")]).transform((value) => (value === "" ? null : value));
 
@@ -41,9 +42,11 @@ export function ClientsPage() {
   const [search, setSearch] = useState("");
   const tenants = useQuery({ queryKey: queryKeys.tenants, queryFn: () => api.listTenants() });
   const runs = useQuery({ queryKey: queryKeys.auditRuns(), queryFn: () => api.listAuditRuns() });
-  const latestScore = new Map<string, number | null>();
+  // Latest published audit per client. Scores are shown per platform; an
+  // unscored audit reads "Not scored", never 0.
+  const latestRun = new Map<string, AuditRun>();
   for (const run of runs.data ?? []) {
-    if (run.status === "published" && !latestScore.has(run.tenant_id)) latestScore.set(run.tenant_id, run.overall_score);
+    if (run.status === "published" && !latestRun.has(run.tenant_id)) latestRun.set(run.tenant_id, run);
   }
 
   return (
@@ -83,7 +86,7 @@ export function ClientsPage() {
                         </td>
                         <td className="px-3 py-3 text-slate-600">{tenant.industry ?? "–"}</td>
                         <td className="px-3 py-3"><StatusBadge status={tenant.status} /></td>
-                        <td className="px-3 py-3 text-right font-semibold tabular-nums">{latestScore.has(tenant.id) ? Math.round(latestScore.get(tenant.id) ?? 0) : "–"}</td>
+                        <td className="px-3 py-3 text-right font-semibold tabular-nums">{latestRun.has(tenant.id) ? <RunScore run={latestRun.get(tenant.id)!} /> : "–"}</td>
                         <td className="px-3 py-3 text-slate-600">{formatDate(tenant.created_at)}</td>
                         <td className="px-5 py-3 text-right">
                           <Link to={`/admin/clients/${tenant.id}`} className="inline-flex items-center gap-1 font-medium text-accent-700">Manage <ArrowUpRight aria-hidden="true" className="h-4 w-4" /></Link>

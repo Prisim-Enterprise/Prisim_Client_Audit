@@ -18,9 +18,87 @@ import { queryKeys, useApi } from "../../lib/api/ApiProvider";
 import { errorMessage } from "../../lib/api/errors";
 import type { AuditFinding, AuditRun, FindingPatch, FindingStatus, Severity, Tenant } from "../../lib/api/types";
 
-/** Engine 2.0 stores the score status; for 1.0 runs it is derived from the score. */
-export function scoreStatusOf(run: AuditRun): "scored" | "provisional" | "unscored" {
-  return run.kpis?.score_status ?? (run.overall_score === null ? "unscored" : "scored");
+type ScoreState = "scored" | "provisional" | "unscored";
+type Platform = "google" | "meta";
+const PLATFORM_LABEL: Record<Platform, string> = { google: "Google Ads", meta: "Meta Ads" };
+
+/** Engine 2.x stores the score status; for 1.0 runs it is derived from the score. */
+export function scoreStatusOf(run: AuditRun): ScoreState {
+  return run.kpis?.score_status ?? (run.overall_score === null && Object.keys(run.platform_scores ?? {}).length === 0 ? "unscored" : "scored");
+}
+
+/**
+ * Per-platform scores. Engine 2.1 stores status and reason per platform; older
+ * runs only have platform_scores (treated as final, as they were published).
+ */
+export function platformScoresOf(run: AuditRun): Array<{ provider: Platform; score: number | null; status: ScoreState; reason: string | null }> {
+  const platforms = run.kpis?.scoring?.platforms;
+  if (platforms && Object.keys(platforms).length > 0) {
+    return (["google", "meta"] as const).flatMap((provider) => {
+      const item = platforms[provider];
+      return item ? [{ provider, score: item.score, status: item.status, reason: item.reason }] : [];
+    });
+  }
+  return (["google", "meta"] as const)
+    .filter((provider) => run.platform_scores?.[provider] !== undefined)
+    .map((provider) => ({ provider, score: run.platform_scores[provider] ?? null, status: scoreStatusOf(run), reason: null }));
+}
+
+/** Compact text for tables: platform scores separately, never a combined number. */
+export function RunScore({ run }: { run: AuditRun }) {
+  const platforms = platformScoresOf(run);
+  if (platforms.length === 0) {
+    return run.overall_score === null ? <span className="text-slate-500">Not scored</span> : <span>{Math.round(run.overall_score)}</span>;
+  }
+  return (
+    <span className="inline-flex flex-wrap justify-end gap-x-3 gap-y-1">
+      {platforms.map((item) => (
+        <span key={item.provider} className="whitespace-nowrap">
+          <span className="text-xs font-normal text-slate-500">{item.provider === "google" ? "Google" : "Meta"} </span>
+          {item.score === null ? <span className="text-slate-500">Not scored</span> : Math.round(item.score)}
+          {item.score !== null && item.status === "provisional" && <span className="ml-1 rounded bg-amber-100 px-1 text-[10px] font-semibold uppercase text-amber-900">Provisional</span>}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** One ring per platform; Google and Meta are never shown as one number. */
+export function PlatformScoreRings({ run, size = 120 }: { run: AuditRun; size?: number }) {
+  const platforms = platformScoresOf(run);
+  if (platforms.length === 0) return <ScoreRing score={run.overall_score} size={size} status={scoreStatusOf(run)} />;
+  return (
+    <div className="flex flex-wrap justify-center gap-6">
+      {platforms.map((item) => (
+        <div key={item.provider} className="flex flex-col items-center gap-2">
+          <ProviderBadge provider={item.provider} />
+          <ScoreRing score={item.score} size={size} status={item.score === null ? "unscored" : item.status} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Prominent banner for provisional and unscored audits. */
+export function ScoreStatusBanner({ run }: { run: AuditRun }) {
+  const platforms = platformScoresOf(run);
+  const provisional = platforms.filter((item) => item.score !== null && item.status === "provisional");
+  const unscored = platforms.filter((item) => item.score === null);
+  if (provisional.length === 0 && unscored.length === 0 && !(platforms.length === 0 && run.overall_score === null)) return null;
+  const reasons = [...provisional, ...unscored].map((item) => `${PLATFORM_LABEL[item.provider]}: ${item.reason ?? (item.score === null ? "not scored" : "provisional")}`);
+  const allUnscored = platforms.length === 0 ? run.overall_score === null : unscored.length === platforms.length;
+  return (
+    <div role="status" className={`rounded-xl border-2 p-4 ${allUnscored ? "border-slate-300 bg-slate-50" : "border-amber-400 bg-amber-50"}`}>
+      <p className={`text-sm font-semibold ${allUnscored ? "text-slate-800" : "text-amber-900"}`}>
+        {allUnscored ? "Not scored: there is not enough verified data for a performance score." : "Provisional score: the data behind it is incomplete or not fully verified."}
+      </p>
+      {reasons.length > 0 && (
+        <ul className="mt-1 list-disc space-y-0.5 pl-5 text-xs leading-5 text-slate-700">
+          {reasons.map((reason) => <li key={reason}>{reason}</li>)}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 const CONFIDENCE_TONE: Record<string, string> = {
@@ -30,38 +108,84 @@ const CONFIDENCE_TONE: Record<string, string> = {
   none: "bg-slate-100 text-slate-700",
 };
 
+function money(value: number | null | undefined, currency: string | null, digits = 2) {
+  return formatMoney(value ?? null, currency, digits);
+}
+
+function PlatformKpis({ provider, run }: { provider: Platform; run: AuditRun }) {
+  const totals = run.kpis.platformTotals?.[provider] ?? (platformScoresOf(run).length <= 1 ? run.kpis.totals ?? null : null);
+  const accounts = (run.kpis.accounts ?? []).filter((account) => account.provider === provider);
+  const currencies = new Set(accounts.map((account) => account.currency ?? ""));
+  const currency = currencies.size === 1 ? accounts[0]?.currency ?? null : null;
+  if (!totals) {
+    return <p className="text-sm text-slate-500">{PLATFORM_LABEL[provider]} accounts use different currencies, so totals are shown per account below.</p>;
+  }
+  const meta = provider === "meta";
+  // Meta platform KPIs are summed per account; only shown when every account reports them.
+  const sum = (key: string) => {
+    let total = 0;
+    for (const account of accounts) {
+      const value = account.platformKpis?.[key];
+      if (value === null || value === undefined) return null;
+      total += value;
+    }
+    return accounts.length > 0 ? total : null;
+  };
+  const tiles: Array<[string, string]> = meta
+    ? [
+      ["Spend", money(totals.spend, currency, 0)],
+      ["Impressions", formatNumber(totals.impressions)],
+      ["CPM", money(totals.cpm, currency)],
+      ["Link clicks", sum("link_clicks") === null ? "Unavailable" : formatNumber(sum("link_clicks"))],
+      ["Link CTR", sum("link_clicks") === null ? "Unavailable" : formatPercent((sum("link_clicks") as number) / Math.max(totals.impressions, 1))],
+      ["Purchases", sum("purchases") === null ? "Unavailable" : formatNumber(sum("purchases"), 0)],
+      ["Leads", sum("leads") === null ? "Unavailable" : formatNumber(sum("leads"), 0)],
+      ["App installs", sum("app_installs") === null ? "Unavailable" : formatNumber(sum("app_installs"), 0)],
+    ]
+    : [
+      ["Spend", money(totals.spend, currency, 0)],
+      ["Impressions", formatNumber(totals.impressions)],
+      ["Clicks", formatNumber(totals.clicks)],
+      ["CTR", formatPercent(totals.ctr)],
+      ["Avg. CPC", money(totals.cpc, currency)],
+      ["Conversions", formatNumber(totals.conversions, 0)],
+      ["Cost / conversion", money(totals.cpa, currency)],
+      ["ROAS", totals.conversionValue > 0 ? formatMultiple(totals.roas) : "No value reported"],
+    ];
+  return (
+    <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+      {tiles.map(([label, value]) => <Kpi key={label} label={label} value={value} />)}
+    </div>
+  );
+}
+
 export function AuditOverview({ run }: { run: AuditRun }) {
-  const totals = run.kpis.totals ?? null;
-  const currency = run.kpis.currency ?? null;
-  const categories = Object.entries(run.category_scores ?? {});
-  const status = scoreStatusOf(run);
   const quality = run.kpis.dataQuality;
   const scoring = run.kpis.scoring;
-  const notAssessed = scoring
-    ? Object.entries(scoring.accounts[0]?.categories ?? {}).filter(([category]) => !(category in (run.category_scores ?? {}))).map(([category]) => category)
-    : [];
+  const platforms = platformScoresOf(run);
+  const providers: Platform[] = platforms.length > 0 ? platforms.map((item) => item.provider) : [];
+  const categoriesFor = (provider: Platform | null) =>
+    Object.entries(provider ? run.kpis.platformCategoryScores?.[provider] ?? (providers.length === 1 ? run.category_scores ?? {} : {}) : run.category_scores ?? {});
+  const notAssessedFor = (provider: Platform) => {
+    const scored = new Set(categoriesFor(provider).map(([category]) => category));
+    const account = scoring?.accounts.find((item) => item.provider === provider);
+    return account ? Object.keys(account.categories).filter((category) => !scored.has(category)) : [];
+  };
   const accounts = run.kpis.accounts ?? [];
   const campaigns = run.kpis.campaigns ?? [];
   return (
     <div className="space-y-5">
-      <div className="grid gap-5 lg:grid-cols-[300px_1fr]">
+      <ScoreStatusBanner run={run} />
+      <div className="grid gap-5 lg:grid-cols-[320px_1fr]">
         <div className="space-y-5">
           <Card className="flex flex-col items-center p-6">
-            <p className="self-start text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Account health</p>
-            <div className="mt-4"><ScoreRing score={run.overall_score} status={status} /></div>
-            {scoring && status !== "scored" && <p className="mt-3 text-center text-xs leading-5 text-slate-500">{scoring.reason}</p>}
-            <div className="mt-5 grid w-full grid-cols-2 gap-3">
-              {(["meta", "google"] as const).filter((platform) => run.platform_scores?.[platform] !== undefined).map((platform) => (
-                <div key={platform} className="rounded-lg border border-slate-200 p-3 text-center">
-                  <ProviderBadge provider={platform} />
-                  <p className="mt-1 text-xl font-semibold text-ink-950">{Math.round(run.platform_scores[platform] ?? 0)}</p>
-                </div>
-              ))}
-            </div>
+            <p className="self-start text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Account health by platform</p>
+            <div className="mt-4"><PlatformScoreRings run={run} /></div>
+            {providers.length > 1 && <p className="mt-3 text-center text-xs text-slate-500">Google Ads and Meta Ads are scored separately and not combined.</p>}
           </Card>
           {quality && (
             <Card className="p-5">
-              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Data confidence</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Data confidence (not a performance score)</p>
               <div className="mt-2 flex items-baseline gap-2">
                 <span className="text-2xl font-semibold text-ink-950">{Math.round(quality.confidence)}</span>
                 <span className="text-xs text-slate-400">/ 100</span>
@@ -83,37 +207,35 @@ export function AuditOverview({ run }: { run: AuditRun }) {
               <p className="mt-2 whitespace-pre-line text-sm leading-6 text-slate-700">{run.summary}</p>
             </Card>
           )}
-          {totals && (
-            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-              <Kpi label="Spend" value={formatMoney(totals.spend, currency, 0)} />
-              <Kpi label="Impressions" value={formatNumber(totals.impressions)} />
-              <Kpi label="Clicks" value={formatNumber(totals.clicks)} />
-              <Kpi label="CTR" value={formatPercent(totals.ctr)} />
-              <Kpi label="Avg. CPC" value={formatMoney(totals.cpc, currency)} />
-              <Kpi label="Conversions" value={formatNumber(totals.conversions, 0)} />
-              <Kpi label="Cost / conversion" value={formatMoney(totals.cpa, currency)} />
-              <Kpi label="ROAS" value={totals.conversionValue > 0 ? formatMultiple(totals.roas) : "No value reported"} />
-            </div>
-          )}
-          {categories.length > 0 && (
-            <Card className="p-5 sm:p-6">
-              <div className="grid gap-4 sm:grid-cols-2">
-                {categories.map(([category, score]) => (
-                  <ScoreBar key={category} label={CATEGORY_LABELS[category] ?? category} score={Number(score)} />
-                ))}
-              </div>
-              {notAssessed.length > 0 && (
-                <p className="mt-4 text-xs text-slate-500">
-                  Not assessed (not enough data): {notAssessed.map((category) => CATEGORY_LABELS[category] ?? category).join(", ")}.
-                </p>
-              )}
-            </Card>
-          )}
+          {(providers.length > 0 ? providers : [null]).map((provider) => {
+            const categories = categoriesFor(provider);
+            return (
+              <Card key={provider ?? "all"} className="space-y-4 p-5 sm:p-6">
+                {provider && <p className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-slate-400"><ProviderBadge provider={provider} /> Performance</p>}
+                {provider ? <PlatformKpis provider={provider} run={run} /> : run.kpis.totals && (
+                  <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <Kpi label="Spend" value={money(run.kpis.totals.spend, run.kpis.currency ?? null, 0)} />
+                    <Kpi label="Conversions" value={formatNumber(run.kpis.totals.conversions, 0)} />
+                    <Kpi label="Cost / conversion" value={money(run.kpis.totals.cpa, run.kpis.currency ?? null)} />
+                    <Kpi label="CTR" value={formatPercent(run.kpis.totals.ctr)} />
+                  </div>
+                )}
+                {categories.length > 0 && (
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    {categories.map(([category, score]) => <ScoreBar key={category} label={CATEGORY_LABELS[category] ?? category} score={Number(score)} />)}
+                  </div>
+                )}
+                {provider && notAssessedFor(provider).length > 0 && (
+                  <p className="text-xs text-slate-500">Not assessed (not enough data): {notAssessedFor(provider).map((category) => CATEGORY_LABELS[category] ?? category).join(", ")}.</p>
+                )}
+              </Card>
+            );
+          })}
         </div>
       </div>
       {accounts.length > 0 && accounts[0].coverage && (
         <Card className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-left text-sm">
+          <table className="w-full min-w-[760px] text-left text-sm">
             <caption className="px-5 pt-4 text-left text-xs font-semibold uppercase tracking-[0.14em] text-slate-400">Accounts reviewed</caption>
             <thead className="text-xs uppercase tracking-wide text-slate-500">
               <tr>
@@ -121,26 +243,33 @@ export function AuditOverview({ run }: { run: AuditRun }) {
                 <th scope="col" className="px-3 py-2 font-medium">Known days</th>
                 <th scope="col" className="px-3 py-2 font-medium">Confidence</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">Spend</th>
-                <th scope="col" className="px-3 py-2 text-right font-medium">Conv.</th>
+                <th scope="col" className="px-3 py-2 text-right font-medium">Key result</th>
                 <th scope="col" className="px-5 py-2 text-right font-medium">Score</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {accounts.map((account) => (
-                <tr key={account.adAccountId}>
-                  <td className="px-5 py-2"><span className="font-medium text-ink-950">{account.name}</span> <ProviderBadge provider={account.provider} /></td>
-                  <td className="px-3 py-2 text-slate-600">
-                    {account.coverage ? `${account.coverage.periodDays - account.coverage.missingDays}/${account.coverage.periodDays}` : "–"}
-                    {account.coverage && account.coverage.missingDays > 0 && <span className="text-rose-700"> ({account.coverage.missingDays} missing)</span>}
-                  </td>
-                  <td className="px-3 py-2 capitalize text-slate-600">{account.confidenceLevel ?? "–"}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(account.spend, account.currency, 0)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(account.conversions, 0)}</td>
-                  <td className="px-5 py-2 text-right tabular-nums" title={account.scoreReason}>
-                    {account.score === null || account.score === undefined ? "Not scored" : `${Math.round(account.score)}${account.scoreStatus === "provisional" ? " (provisional)" : ""}`}
-                  </td>
-                </tr>
-              ))}
+              {accounts.map((account) => {
+                const unknown = (account.coverage?.missingDays ?? 0) + (account.coverage?.unverifiedDays ?? 0);
+                const meta = account.provider === "meta";
+                const result = meta
+                  ? ["purchases", "leads", "app_installs"].map((key) => [key, account.platformKpis?.[key]] as const).filter(([, value]) => typeof value === "number" && value > 0).map(([key, value]) => `${formatNumber(value as number, 0)} ${key.replace("_", " ")}`).join(", ") || (account.platformKpis?.link_clicks === null || account.platformKpis?.link_clicks === undefined ? "Unavailable" : `${formatNumber(account.platformKpis.link_clicks)} link clicks`)
+                  : `${formatNumber(account.conversions, 0)} conversions`;
+                return (
+                  <tr key={account.adAccountId}>
+                    <td className="px-5 py-2"><span className="font-medium text-ink-950">{account.name}</span> <ProviderBadge provider={account.provider} /></td>
+                    <td className="px-3 py-2 text-slate-600">
+                      {account.coverage ? `${account.coverage.periodDays - unknown}/${account.coverage.periodDays}` : "–"}
+                      {unknown > 0 && <span className="text-rose-700"> ({unknown} unknown)</span>}
+                    </td>
+                    <td className="px-3 py-2 capitalize text-slate-600">{account.confidenceLevel ?? "–"}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{money(account.spend, account.currency, 0)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{result}</td>
+                    <td className="px-5 py-2 text-right tabular-nums" title={account.scoreReason}>
+                      {account.score === null || account.score === undefined ? "Not scored" : `${Math.round(account.score)}${account.scoreStatus === "provisional" ? " (provisional)" : ""}`}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </Card>
@@ -152,28 +281,32 @@ export function AuditOverview({ run }: { run: AuditRun }) {
             <thead className="text-xs uppercase tracking-wide text-slate-500">
               <tr>
                 <th scope="col" className="px-5 py-2 font-medium">Campaign</th>
+                <th scope="col" className="px-3 py-2 font-medium">Type / objective</th>
                 <th scope="col" className="px-3 py-2 font-medium">Status at sync</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">Spend</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">Impr.</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">CTR</th>
                 <th scope="col" className="px-3 py-2 text-right font-medium">Conv.</th>
-                <th scope="col" className="px-3 py-2 text-right font-medium">CPA</th>
                 <th scope="col" className="px-5 py-2 text-right font-medium">Daily budget</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {campaigns.slice(0, 15).map((campaign) => (
-                <tr key={campaign.campaignId}>
-                  <td className="max-w-[260px] truncate px-5 py-2 font-medium text-ink-950" title={campaign.name}>{campaign.name}</td>
-                  <td className="px-3 py-2 text-slate-600">{campaign.status ?? "–"}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(campaign.spend, campaign.currency, 0)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(campaign.impressions)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatPercent(campaign.ctr)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatNumber(campaign.conversions, 0)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums">{formatMoney(campaign.cpa, campaign.currency)}</td>
-                  <td className="px-5 py-2 text-right tabular-nums">{formatMoney(campaign.dailyBudget, campaign.currency, 0)}</td>
-                </tr>
-              ))}
+              {campaigns.slice(0, 15).map((campaign) => {
+                const meta = campaign.provider === "meta";
+                const linkCtr = campaign.platformKpis?.link_ctr;
+                return (
+                  <tr key={campaign.campaignId}>
+                    <td className="max-w-[260px] truncate px-5 py-2 font-medium text-ink-950" title={campaign.name}>{campaign.name}</td>
+                    <td className="px-3 py-2 capitalize text-slate-600">{campaign.kind.replace("_", " ")}</td>
+                    <td className="px-3 py-2 text-slate-600">{campaign.status ?? "–"}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{money(campaign.spend, campaign.currency, 0)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{formatNumber(campaign.impressions)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums" title={meta ? "Link CTR" : "CTR"}>{meta ? (typeof linkCtr === "number" ? formatPercent(linkCtr) : "Unavailable") : formatPercent(campaign.ctr)}</td>
+                    <td className="px-3 py-2 text-right tabular-nums">{meta ? "See objective" : formatNumber(campaign.conversions, 0)}</td>
+                    <td className="px-5 py-2 text-right tabular-nums">{money(campaign.dailyBudget, campaign.currency, 0)}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </Card>
@@ -422,7 +555,7 @@ export function AuditRunTable({
               {tenants && <td className="px-3 py-3 text-slate-600">{names.get(run.tenant_id) ?? "–"}</td>}
               <td className="px-3 py-3 text-slate-600">{formatDate(run.period_start)} – {formatDate(run.period_end)}</td>
               <td className="px-3 py-3 text-right font-semibold tabular-nums text-ink-950">
-                {run.overall_score === null ? "Not scored" : `${Math.round(run.overall_score)}${scoreStatusOf(run) === "provisional" ? "*" : ""}`}
+                <RunScore run={run} />
               </td>
               <td className="px-3 py-3"><StatusBadge status={run.status} /></td>
               <td className="px-5 py-3 text-right">
@@ -434,9 +567,6 @@ export function AuditRunTable({
           ))}
         </tbody>
       </table>
-      {runs.some((run) => scoreStatusOf(run) === "provisional") && (
-        <p className="px-5 py-2 text-xs text-slate-500">* Provisional score: the data behind it is incomplete or not fully verified.</p>
-      )}
     </div>
   );
 }

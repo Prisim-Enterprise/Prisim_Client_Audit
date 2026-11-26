@@ -13,6 +13,7 @@ import type {
   AuditDailyRow,
   AuditInput,
   Benchmark,
+  CampaignDailyRow,
   BusinessTarget,
   CampaignContext,
   DataIssue,
@@ -69,6 +70,55 @@ export type AccountRow = {
   last_synced_at?: string | null;
 };
 
+/** public.daily_metrics campaign rows (platform_metrics is NULL for rows synced before engine 2.1). */
+export type CampaignDailyMetricRow = {
+  campaign_id: string;
+  ad_account_id: string;
+  metric_date: string;
+  impressions: number | string;
+  reach: number | string;
+  clicks: number | string;
+  spend: number | string;
+  conversions: number | string;
+  conversion_value: number | string;
+  platform_metrics?: Record<string, unknown> | null;
+};
+
+/** Keys written by the Meta sync; a campaign without rows has all of them at 0. */
+export const PLATFORM_METRIC_KEYS = ["link_clicks", "purchases", "leads", "registrations", "app_installs", "landing_page_views", "purchase_value"];
+
+function platformMetrics(value: Record<string, unknown> | null | undefined): Record<string, number> | null {
+  if (!value || typeof value !== "object") return null;
+  const result: Record<string, number> = {};
+  for (const [key, item] of Object.entries(value)) {
+    const parsed = typeof item === "number" ? item : Number(item);
+    if (Number.isFinite(parsed) && parsed >= 0) result[key] = parsed;
+  }
+  return result;
+}
+
+/**
+ * Per-campaign platform metric totals. A campaign's totals are available only
+ * when every one of its rows in the period carries platform metrics; a
+ * campaign without rows has proven-or-unknown zero delivery and gets zeros.
+ */
+export function aggregatePlatformMetrics(rows: CampaignDailyMetricRow[]): Map<string, Record<string, number> | null> {
+  const result = new Map<string, Record<string, number> | null>();
+  for (const row of rows) {
+    const metrics = platformMetrics(row.platform_metrics);
+    const current = result.get(row.campaign_id);
+    if (current === null) continue;
+    if (!metrics) {
+      result.set(row.campaign_id, null);
+      continue;
+    }
+    const total = current ?? {};
+    for (const [key, value] of Object.entries(metrics)) total[key] = (total[key] ?? 0) + value;
+    result.set(row.campaign_id, total);
+  }
+  return result;
+}
+
 /** public.campaigns (id, details) for the selected accounts. */
 export type CampaignDetailsRow = { id: string; details: Record<string, unknown> | null };
 
@@ -78,6 +128,7 @@ export type SyncJobRow = {
   connection_id: string | null;
   job_type: string;
   status: string;
+  started_at?: string | null;
   completed_at: string | null;
   error_message: string | null;
   stats: Record<string, unknown> | null;
@@ -193,8 +244,11 @@ export function toAuditDaily(row: DailyPerformanceRow): AuditDailyRow {
 /**
  * sync_jobs -> per-account sync outcomes. Jobs written by sync 2.0 carry
  * stats.account_results; older jobs only know the connection, the window and
- * the number of failed accounts, so they count as a success for every
- * selected account of the connection only when no account failed.
+ * the number of failed accounts. Such a job proves coverage for an account
+ * only when no account failed AND the account's last_synced_at (written by
+ * the ingest RPC) falls inside the job's run, i.e. this exact account was
+ * stored by this job. Days without rows stay unknown for legacy records:
+ * pagination and totals were not recorded.
  */
 export function toSyncRuns(jobs: SyncJobRow[], accounts: AuditAccount[]): SyncRunRecord[] {
   const runs: SyncRunRecord[] = [];
@@ -223,6 +277,13 @@ export function toSyncRuns(jobs: SyncJobRow[], accounts: AuditAccount[]): SyncRu
             : [],
           error: stringOrNull(result.error),
           legacy: false,
+          reconciliation: result.reconciliation === "matched" || result.reconciliation === "mismatch" ? result.reconciliation : "unverified",
+          unresolvedCampaigns: num(result.unresolved_campaigns as number),
+          zeroDaysVerified: result.status === "succeeded"
+            && result.pagination === "complete"
+            && result.reconciliation === "matched"
+            && typeof result.fetched_rows === "number"
+            && result.fetched_rows === result.persisted_rows,
         });
       }
       continue;
@@ -231,6 +292,12 @@ export function toSyncRuns(jobs: SyncJobRow[], accounts: AuditAccount[]): SyncRu
     const succeeded = job.status === "completed" && failedAccounts === 0;
     for (const account of accounts) {
       if (!account.connectionId || account.connectionId !== job.connection_id) continue;
+      const stored = account.lastSyncedAt ? Date.parse(account.lastSyncedAt) : Number.NaN;
+      const started = job.started_at ? Date.parse(job.started_at) : Number.NaN;
+      const completed = job.completed_at ? Date.parse(job.completed_at) : Number.NaN;
+      const provenInJob = Number.isFinite(stored) && Number.isFinite(started) && Number.isFinite(completed) && stored >= started && stored <= completed;
+      // A successful legacy job proves nothing for an account it cannot be shown to have stored.
+      if (succeeded && !provenInJob) continue;
       runs.push({
         adAccountId: account.id,
         connectionId: job.connection_id,
@@ -243,6 +310,8 @@ export function toSyncRuns(jobs: SyncJobRow[], accounts: AuditAccount[]): SyncRu
         unavailableFields: [],
         error: succeeded ? null : (job.error_message ?? (failedAccounts > 0 ? `${failedAccounts} account(s) failed; which ones was not recorded` : "Sync failed")),
         legacy: true,
+        reconciliation: "unverified",
+        zeroDaysVerified: false,
       });
     }
   }
@@ -287,6 +356,8 @@ export function buildAuditInput(options: {
   campaigns: CampaignPerformanceRow[];
   daily: DailyPerformanceRow[];
   campaignDetails?: CampaignDetailsRow[];
+  /** Campaign/day rows; enables per-type trends and Meta platform metrics. */
+  campaignDaily?: CampaignDailyMetricRow[];
   syncJobs?: SyncJobRow[];
   diagnostics?: DiagnosticsRow[];
   targets?: BusinessTarget[];
@@ -349,13 +420,34 @@ export function buildAuditInput(options: {
     return copy as T;
   };
 
+  const dailyCampaignRows = options.campaignDaily?.filter((row) => selected.has(row.ad_account_id) && row.metric_date >= options.periodStart && row.metric_date <= options.periodEnd);
+  const platform = dailyCampaignRows ? aggregatePlatformMetrics(dailyCampaignRows) : null;
+  const zeros = Object.fromEntries(PLATFORM_METRIC_KEYS.map((key) => [key, 0]));
+  const campaignDaily: CampaignDailyRow[] | undefined = dailyCampaignRows?.map((row) => ({
+    campaignId: row.campaign_id,
+    adAccountId: row.ad_account_id,
+    date: row.metric_date,
+    impressions: Math.max(num(row.impressions), 0),
+    reach: Math.max(num(row.reach), 0),
+    clicks: Math.max(num(row.clicks), 0),
+    spend: Math.max(num(row.spend), 0),
+    conversions: Math.max(num(row.conversions), 0),
+    conversionValue: Math.max(num(row.conversion_value), 0),
+    platformMetrics: platformMetrics(row.platform_metrics),
+  }));
+
   return {
     tenantName: options.tenantName,
     periodStart: options.periodStart,
     periodEnd: options.periodEnd,
     accounts,
-    campaigns: campaignRows.map((row) => clamp(toAuditCampaign(row, details.get(row.campaign_id)))),
+    campaigns: campaignRows.map((row) => {
+      const campaign = clamp(toAuditCampaign(row, details.get(row.campaign_id)));
+      if (platform) campaign.platformMetrics = platform.has(row.campaign_id) ? platform.get(row.campaign_id) ?? null : { ...zeros };
+      return campaign;
+    }),
     daily: dailyRows.map((row) => clamp(toAuditDaily(row))),
+    campaignDaily,
     syncRuns: options.syncJobs ? toSyncRuns(options.syncJobs, accounts) : undefined,
     diagnostics: options.diagnostics ? toDiagnostics(options.diagnostics).filter((item) => selected.has(item.adAccountId)) : undefined,
     targets: options.targets?.filter((target) => selected.has(target.adAccountId)),

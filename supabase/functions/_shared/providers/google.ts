@@ -11,6 +11,7 @@ import {
   type CampaignRecord,
   checkedNumber,
   diagnosticSection,
+  MAX_METRIC_ROWS,
   type DiscoveredAccount,
   type FetchLike,
   type MetricRecord,
@@ -83,6 +84,45 @@ export function microsToUnits(value: unknown): number {
 
 type SearchRow = Record<string, Record<string, unknown> | undefined>;
 
+const CAMPAIGN_SELECT =
+  "SELECT campaign.id, campaign.name, campaign.status, campaign.serving_status, campaign.primary_status, " +
+  "campaign.primary_status_reasons, campaign.advertising_channel_type, campaign.advertising_channel_sub_type, " +
+  "campaign.bidding_strategy_type, campaign.start_date_time, campaign.end_date_time, campaign_budget.id, " +
+  "campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, " +
+  "campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign";
+
+function toCampaignRecord(row: SearchRow, capturedAt: string): CampaignRecord {
+  const campaign = row.campaign ?? {};
+  const budget = row.campaignBudget;
+  const reasons = Array.isArray(campaign.primaryStatusReasons)
+    ? (campaign.primaryStatusReasons as unknown[]).filter((reason): reason is string => typeof reason === "string")
+    : [];
+  const details: CampaignDetails = {
+    channel_sub_type: text(campaign.advertisingChannelSubType),
+    serving_status: text(campaign.servingStatus),
+    primary_status: text(campaign.primaryStatus),
+    primary_status_reasons: reasons,
+    start: text(campaign.startDateTime),
+    end: text(campaign.endDateTime),
+    budget_id: budget?.id === undefined ? null : String(budget.id),
+    budget_shared: typeof budget?.explicitlyShared === "boolean" ? budget.explicitlyShared : null,
+    budget_period: text(budget?.period),
+    budget_reference_count: budget?.referenceCount === undefined ? null : toNumber(budget.referenceCount),
+    lifetime_budget: budget?.totalAmountMicros === undefined ? null : microsToUnits(budget.totalAmountMicros),
+    captured_at: capturedAt,
+  };
+  return {
+    external_id: String(campaign.id),
+    name: text(campaign.name),
+    objective: text(campaign.advertisingChannelType),
+    status: text(campaign.status),
+    daily_budget: budget?.amountMicros === undefined ? null : microsToUnits(budget.amountMicros),
+    bid_strategy: text(campaign.biddingStrategyType),
+    channel_type: text(campaign.advertisingChannelType),
+    details,
+  };
+}
+
 function text(value: unknown): string | null {
   return typeof value === "string" && value !== "" ? value : null;
 }
@@ -125,7 +165,12 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
     return result;
   }
 
-  async function search(accessToken: string, customerId: string, query: string, loginCustomerId?: string, limit = 50000) {
+  /**
+   * Reads result pages (Search returns fixed pages of up to 10,000 rows) until
+   * no next_page_token remains or `limit` rows were read. `complete` is false
+   * when a page token is left, i.e. the result was cut off.
+   */
+  async function searchPages(accessToken: string, customerId: string, query: string, loginCustomerId: string | undefined, limit: number) {
     const rows: SearchRow[] = [];
     let pageToken: string | undefined;
     do {
@@ -139,6 +184,15 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
       rows.push(...(body.results ?? []));
       pageToken = body.nextPageToken || undefined;
     } while (pageToken && rows.length < limit);
+    return { rows, complete: !pageToken };
+  }
+
+  /** All pages or an "incomplete" error: never a silently truncated result. */
+  async function search(accessToken: string, customerId: string, query: string, loginCustomerId?: string, limit = MAX_METRIC_ROWS) {
+    const { rows, complete } = await searchPages(accessToken, customerId, query, loginCustomerId, limit);
+    if (!complete) {
+      throw new ProviderError("incomplete", `Google Ads returned more than ${limit} rows; the result was not read completely.`, `google rows>${limit}`);
+    }
     return rows;
   }
 
@@ -211,7 +265,7 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
         const customer = rows[0]?.customer;
         if (!customer) continue;
         if (customer.manager === true) {
-          const clients = await search(
+          const { rows: clients } = await searchPages(
             accessToken,
             id,
             "SELECT customer_client.id, customer_client.descriptive_name, customer_client.currency_code, customer_client.time_zone, customer_client.manager, customer_client.status FROM customer_client WHERE customer_client.level <= 1 AND customer_client.manager = FALSE",
@@ -247,54 +301,45 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
     },
 
     async fetchCampaigns(accessToken, account): Promise<CampaignRecord[]> {
-      // Fields checked against the v24 field reference (campaign and the
-      // attributed campaign_budget resource). campaign.start_date/end_date do
-      // not exist in v24; start_date_time/end_date_time are in the customer's
-      // time zone ("yyyy-MM-dd HH:mm:ss").
+      // Fields checked against the v24 and v26 field references (campaign and
+      // the attributed campaign_budget resource). campaign.start_date/end_date
+      // do not exist; start_date_time/end_date_time are in the customer's time
+      // zone ("yyyy-MM-dd HH:mm:ss"). Removed campaigns are fetched by id when
+      // they still have metrics in the sync window (fetchCampaignsById).
+      const rows = await search(accessToken, account.external_account_id, `${CAMPAIGN_SELECT} WHERE campaign.status != 'REMOVED'`, loginId(account));
+      const capturedAt = new Date().toISOString();
+      return rows.filter((row) => row.campaign?.id !== undefined).map((row) => toCampaignRecord(row, capturedAt));
+    },
+
+    async fetchCampaignsById(accessToken, account, ids): Promise<CampaignRecord[]> {
+      const valid = [...new Set(ids)].filter((id) => /^\d{1,19}$/.test(id));
+      const capturedAt = new Date().toISOString();
+      const records: CampaignRecord[] = [];
+      for (let index = 0; index < valid.length; index += 500) {
+        const chunk = valid.slice(index, index + 500);
+        // GAQL has no OR; IN takes a number list. No status filter: removed campaigns are included.
+        const rows = await search(accessToken, account.external_account_id, `${CAMPAIGN_SELECT} WHERE campaign.id IN (${chunk.join(",")})`, loginId(account));
+        records.push(...rows.filter((row) => row.campaign?.id !== undefined).map((row) => toCampaignRecord(row, capturedAt)));
+      }
+      return records;
+    },
+
+    async fetchAccountTotals(accessToken, account, since, until) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(since) || !/^\d{4}-\d{2}-\d{2}$/.test(until)) {
+        throw new ProviderError("provider_error", "Invalid sync window.");
+      }
+      // Unsegmented (segments.date only in WHERE): one row with the window totals.
       const rows = await search(
         accessToken,
         account.external_account_id,
-        "SELECT campaign.id, campaign.name, campaign.status, campaign.serving_status, campaign.primary_status, " +
-          "campaign.primary_status_reasons, campaign.advertising_channel_type, campaign.advertising_channel_sub_type, " +
-          "campaign.bidding_strategy_type, campaign.start_date_time, campaign.end_date_time, campaign_budget.id, " +
-          "campaign_budget.amount_micros, campaign_budget.total_amount_micros, campaign_budget.period, " +
-          "campaign_budget.explicitly_shared, campaign_budget.reference_count FROM campaign WHERE campaign.status != 'REMOVED'",
+        `SELECT metrics.impressions, metrics.cost_micros FROM customer WHERE segments.date BETWEEN '${since}' AND '${until}'`,
         loginId(account),
       );
-      const capturedAt = new Date().toISOString();
-      return rows
-        .filter((row) => row.campaign?.id !== undefined)
-        .map((row) => {
-          const campaign = row.campaign ?? {};
-          const budget = row.campaignBudget;
-          const reasons = Array.isArray(campaign.primaryStatusReasons)
-            ? (campaign.primaryStatusReasons as unknown[]).filter((reason): reason is string => typeof reason === "string")
-            : [];
-          const details: CampaignDetails = {
-            channel_sub_type: text(campaign.advertisingChannelSubType),
-            serving_status: text(campaign.servingStatus),
-            primary_status: text(campaign.primaryStatus),
-            primary_status_reasons: reasons,
-            start: text(campaign.startDateTime),
-            end: text(campaign.endDateTime),
-            budget_id: budget?.id === undefined ? null : String(budget.id),
-            budget_shared: typeof budget?.explicitlyShared === "boolean" ? budget.explicitlyShared : null,
-            budget_period: text(budget?.period),
-            budget_reference_count: budget?.referenceCount === undefined ? null : toNumber(budget.referenceCount),
-            lifetime_budget: budget?.totalAmountMicros === undefined ? null : microsToUnits(budget.totalAmountMicros),
-            captured_at: capturedAt,
-          };
-          return {
-            external_id: String(campaign.id),
-            name: text(campaign.name),
-            objective: text(campaign.advertisingChannelType),
-            status: text(campaign.status),
-            daily_budget: budget?.amountMicros === undefined ? null : microsToUnits(budget.amountMicros),
-            bid_strategy: text(campaign.biddingStrategyType),
-            channel_type: text(campaign.advertisingChannelType),
-            details,
-          };
-        });
+      const invalid: string[] = [];
+      const impressions = rows.reduce((sum, row) => sum + checkedNumber(row.metrics?.impressions, "impressions", invalid), 0);
+      const spend = rows.reduce((sum, row) => sum + checkedNumber(row.metrics?.costMicros, "cost_micros", invalid), 0) / 1_000_000;
+      if (invalid.length > 0) throw new ProviderError("incomplete", "Google Ads returned non-numeric account totals.");
+      return { impressions, spend };
     },
 
     async fetchMetrics(accessToken, account, since, until): Promise<MetricRecord[]> {
@@ -304,11 +349,13 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
       const rows = await search(
         accessToken,
         account.external_account_id,
-        `SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}' AND campaign.status != 'REMOVED'`,
+        // No status filter: a campaign removed after the window still has history.
+        `SELECT campaign.id, segments.date, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.conversions_value FROM campaign WHERE segments.date BETWEEN '${since}' AND '${until}'`,
         loginId(account),
       );
-      // Google omits campaign/day rows without activity, so an absent day in a
-      // successfully synced window means no reported delivery, not missing data.
+      // Google documents that rows whose selected metrics are all zero are not
+      // returned when segmenting, so an absent day in a completely read window
+      // is a day without reported delivery (the sync also reconciles totals).
       return rows
         .filter((row) => row.campaign?.id !== undefined && typeof row.segments?.date === "string")
         .map((row) => {
@@ -335,10 +382,12 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
       const id = account.external_account_id;
       const login = loginId(account);
       const during = `segments.date BETWEEN '${since}' AND '${until}'`;
+      // Diagnostics read at most `limit` rows; a remaining page token or a
+      // full LIMIT marks the section as truncated (reported, never zero).
       const run = (query: string, map: (row: SearchRow) => Record<string, unknown>, limit: number) =>
         diagnosticSection(async () => {
-          const rows = await search(accessToken, id, query, login, limit);
-          return { rows: rows.slice(0, limit).map(map), truncated: rows.length >= limit };
+          const { rows, complete } = await searchPages(accessToken, id, query, login, limit);
+          return { rows: rows.slice(0, limit).map(map), truncated: !complete || rows.length >= limit };
         });
       // Every field below was checked against the v24 field reference.
       const sections: AccountDiagnostics["sections"] = {
@@ -444,6 +493,37 @@ export function createGoogleProvider(config: GoogleConfig, fetcher: FetchLike = 
             conversions: toNumber(row.metrics?.conversions),
           }),
           300,
+        ),
+        // Performance Max search terms (campaign_search_term_view, v24 and v26).
+        // Keyword-related segments would exclude PMax data, so none are used.
+        pmax_search_terms: await run(
+          "SELECT campaign.id, campaign_search_term_view.search_term, metrics.impressions, metrics.clicks, " +
+            "metrics.cost_micros, metrics.conversions FROM campaign_search_term_view " +
+            `WHERE campaign.advertising_channel_type = 'PERFORMANCE_MAX' AND metrics.cost_micros > 0 AND ${during} ` +
+            "ORDER BY metrics.cost_micros DESC LIMIT 300",
+          (row) => ({
+            campaign_id: String(row.campaign?.id ?? ""),
+            search_term: text(row.campaignSearchTermView?.searchTerm),
+            impressions: toNumber(row.metrics?.impressions),
+            clicks: toNumber(row.metrics?.clicks),
+            cost: microsToUnits(row.metrics?.costMicros),
+            conversions: toNumber(row.metrics?.conversions),
+          }),
+          300,
+        ),
+        // Performance Max has no ad_group_ad; ad strength is on asset_group.
+        asset_groups: await run(
+          "SELECT campaign.id, asset_group.id, asset_group.name, asset_group.status, asset_group.primary_status, asset_group.ad_strength " +
+            "FROM asset_group WHERE asset_group.status != 'REMOVED' AND campaign.status != 'REMOVED'",
+          (row) => ({
+            campaign_id: String(row.campaign?.id ?? ""),
+            asset_group_id: row.assetGroup?.id === undefined ? null : String(row.assetGroup.id),
+            name: text(row.assetGroup?.name),
+            status: text(row.assetGroup?.status),
+            primary_status: text(row.assetGroup?.primaryStatus),
+            ad_strength: text(row.assetGroup?.adStrength),
+          }),
+          2000,
         ),
       };
       return { provider: "google", window: { since, until }, captured_at: new Date().toISOString(), sections };
